@@ -31,7 +31,12 @@ dependencies = [
     "scipy>=1.10,<3.0",
 ]
 
-# Optional groups (e.g., dev, tests, docs)
+[project.urls]
+Homepage = "https://github.com/jsidhu06/derivatives-pricing/"
+Repository = "https://github.com/jsidhu06/derivatives-pricing/"
+Issues = "https://github.com/jsidhu06/derivatives-pricing/issues"
+
+# Optional groups
 [project.optional-dependencies]
 dev = [
     "pytest>=9,<10",
