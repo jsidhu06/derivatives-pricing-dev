@@ -1,0 +1,165 @@
+# derivatives-pricing
+
+A Python package for options pricing and Greeks computation, with a unified API
+across analytical, tree, PDE, and Monte Carlo methods.
+
+Built for teaching, research, and production-adjacent workflows.
+
+---
+
+## Features
+
+### Pricing Coverage
+
+| | Vanilla | | Asian | | Custom | |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Method** | **European** | **American** | **European** | **American** | **European** | **American** |
+| BSM | ✅ | — | ✅ | — | — | — |
+| Binomial | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| PDE | ✅ | ✅ | — | — | — | — |
+| Monte Carlo | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+**Method details:** BSM uses closed-form Black-Scholes-Merton; Binomial uses Cox-Ross-Rubinstein trees;
+PDE supports implicit, explicit, and Crank-Nicolson finite difference schemes;
+Monte Carlo uses Longstaff-Schwartz for American-style exercise.
+Asian analytical pricing uses Turnbull-Wakeman (arithmetic) and Kemna-Vorst (geometric),
+with Hull averaging on binomial trees.
+
+---
+
+### Additional Capabilities
+
+- **Greeks** — analytical, tree, grid, pathwise, likelihood-ratio, and numerical bump-and-revalue (delta, gamma, vega, theta, rho)
+- **Implied volatility** — Newton-Raphson, Bisection, and Brent solvers with arbitrage-bounds checking
+- **Stochastic processes** — Geometric Brownian Motion, Jump Diffusion (Merton), Square-Root Diffusion (CIR)
+- **Discount curves** — log-linear interpolation on arbitrary term structures; deterministic time-varying forward rate and dividend curves
+- **Discrete dividends** — supported across all pricing methods
+- **Control variates** — European analytical control variates for American pricing variance reduction
+- **Custom payoffs** — user-defined payoff functions via `PayoffSpec`
+
+---
+
+## Why derivatives-pricing?
+
+- Consistent API across analytical, tree, PDE, and Monte Carlo methods  
+- Designed for transparency and clarity of implementation  
+- Suitable for teaching, experimentation, research, and production-adjacent workflows  
+- Extensible architecture for new models and payoffs  
+
+---
+
+## Installation
+
+Install from PyPI:
+
+```bash
+pip install derivatives-pricing
+```
+
+For development:
+
+```bash
+pip install -r requirements/dev.txt   
+pip install -e . --no-deps                                                                         
+pip install -e ".[jupyter]"           # optional, for running notebooks
+```
+
+Requires Python 3.10 – 3.13
+
+## Quick Start
+
+```python
+import datetime as dt
+import derivatives_pricing as dp
+
+pricing_date = dt.datetime(2025, 1, 1)
+maturity = dt.datetime(2025, 7, 1)
+
+dc = dp.DiscountCurve.flat(rate=0.05, end_time=1.0)
+md = dp.MarketData(pricing_date=pricing_date, discount_curve=dc, currency="USD")
+
+underlying = dp.UnderlyingData(initial_value=100.0, volatility=0.20, market_data=md)
+
+spec = dp.VanillaSpec(
+    option_type=dp.OptionType.CALL,
+    exercise_type=dp.ExerciseType.EUROPEAN,
+    strike=105.0,
+    maturity=maturity,
+)
+
+val = dp.OptionValuation(underlying=underlying, spec=spec, pricing_method=dp.PricingMethod.BSM)
+print(f"{'PV:':<8} {val.present_value():>10.4f}")
+print(f"{'Delta:':<8} {val.delta():>10.4f}")
+```
+
+## Examples & Tutorials
+
+The repo includes two companion directories:
+
+- **`examples/`** — concise notebooks showing how to call the public API for each feature
+  (European options, Americans, PDE, Asian, Greeks, jump diffusion, discount curves).
+- **`tutorials/`** — deeper walkthroughs that teach the theory behind each pricing method
+  (binomial trees, finite differences, Monte Carlo, Asian averaging).
+  Tutorials may access private/internal classes for demonstration purposes.
+
+## Tests
+
+```bash
+pytest -q
+```
+
+## Project Structure
+
+```
+src/derivatives_pricing/
+├── enums.py                  # OptionType, ExerciseType, PricingMethod, …
+├── exceptions.py             # Custom exception hierarchy
+├── market_environment.py     # MarketData, CorrelationContext
+├── rates.py                  # DiscountCurve (log-linear interpolation)
+├── stochastic_processes.py   # GBM, JDProcess, SRD, PathSimulation
+├── utils.py                  # Day-count, forward price, put-call parity
+├── valuation/
+│   ├── asian_analytical.py   # Turnbull-Wakeman, Kemna-Vorst
+│   ├── binomial.py           # Cox-Ross-Rubinstein tree
+│   ├── bsm.py                # Closed-form Black-Scholes-Merton
+│   ├── contracts.py          # VanillaSpec, PayoffSpec, AsianSpec
+│   ├── core.py               # OptionValuation facade, UnderlyingData
+│   ├── implied_volatility.py # IV solver
+│   ├── monte_carlo.py        # Monte Carlo with Longstaff-Schwartz
+│   ├── params.py             # MonteCarloParams, BinomialParams, PDEParams
+│   └── pde.py                # Finite difference (implicit, explicit, Crank-Nicolson)
+tests/                        # Test suite
+examples/                     # API usage notebooks
+tutorials/                    # Theory deep-dive notebooks
+```
+
+## Disclaimer
+
+This library is provided for educational, research, and exploratory use.
+While care has been taken in implementation and testing, it has not undergone
+the independent audit or regulatory validation expected of production trading
+systems. Users are responsible for verifying results before use in financial
+decision-making.
+
+## License
+
+This repository uses a **dual-license model**.
+
+| Component | License | SPDX |
+|-----------|---------|------|
+| `src/derivatives_pricing/` | [MIT](https://opensource.org/licenses/MIT) | `MIT` |
+| `examples/` | [MIT](https://opensource.org/licenses/MIT) | `MIT` |
+| `tutorials/` | [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) | `CC-BY-NC-SA-4.0` |
+
+**Library code and examples** are released under the **MIT License** and may be
+freely used, modified, and redistributed.
+
+The **PyPI distribution** contains the MIT-licensed library package. Tutorial
+materials are separately hosted in the GitHub repository and are not part of
+the published package.
+
+**Tutorial notebooks** in `tutorials/` are licensed under **Creative Commons
+Attribution-NonCommercial-ShareAlike 4.0 (CC BY-NC-SA 4.0)**. You may share and
+adapt these materials for **non-commercial purposes with attribution**. See the
+[full license text](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode)
+for details.

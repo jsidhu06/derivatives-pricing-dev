@@ -1,0 +1,141 @@
+[project]
+name = "derivatives-pricing"
+version = "0.1.0"
+description = "Python package for options pricing and Greeks computation"
+authors = [
+    { name = "Jogi Sidhu" }
+]
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE.md"]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Education",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Typing :: Typed",
+]
+keywords = ["derivatives", "options", "pricing", "black-scholes", "monte-carlo", "quantitative-finance"]
+
+dependencies = [
+    "numpy>=1.24,<3.0",
+    "pandas>=1.5,<4.0",
+    "scipy>=1.10,<3.0",
+]
+
+# Optional groups (e.g., dev, tests, docs)
+[project.optional-dependencies]
+dev = [
+    "pytest>=9,<10",
+    "pytest-cov>=6,<7",
+    "pytest-xdist>=3.5,<4",
+    "ruff>=0.15",
+    "mypy>=1.19",
+    "pylint>=3.3,<4",
+    "pre-commit>=4.5,<5",
+    "pip-tools>=7.5,<8",
+]
+jupyter = [
+    "jupyterlab>=4.3,<5",
+    "nbconvert>=7.16,<8",
+    "ipykernel>=6.29,<7",
+    "matplotlib>=3.9,<4",
+    "plotly>=6,<7",
+]
+numba = [
+    "numba>=0.60,<0.65",
+]
+quantlib = [
+    "QuantLib>=1.36,<2",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+derivatives_pricing = ["py.typed"]
+
+# Ruff (linter)
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+# Ruff (formatter)
+[tool.ruff.format]
+quote-style = "double"
+
+# Pytest
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+log_cli = true
+log_cli_level = "INFO"
+markers = [
+  "slow: marks tests as slow (need --runslow to run)",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["derivatives_pricing"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+# Mypy (very relaxed / developer-friendly)
+[tool.mypy]
+python_version = "3.10"
+files = ["src/derivatives_pricing"]
+
+# Only check annotated functions
+check_untyped_defs = false
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+# Be permissive with imports and third-party libs
+ignore_missing_imports = true
+follow_imports = "skip"
+
+# Be permissive with Optional / Any
+strict_optional = false
+warn_return_any = false
+warn_no_return = false
+warn_unreachable = false
+
+# Reduce stylistic nags
+warn_redundant_casts = false
+warn_unused_ignores = false
+no_implicit_reexport = false
+
+[tool.pylint.messages_control]
+disable = [
+  "missing-module-docstring",      # C0114
+  "missing-class-docstring",       # C0115
+  "missing-function-docstring",    # C0116
+  "invalid-name",                  # C0103 (includes non-snake-case variable names)
+  "too-many-arguments",            # R0913
+  "too-many-positional-arguments", # R0917
+  "too-few-public-methods",        # R0903 (common "too few ..." class warning)
+  "too-many-locals",               # R0914
+  "wrong-import-position"          # C0413
+]
+
+[tool.pylint.main]
+ignore-paths = [
+  ".*/tests/.*",
+  ".*/tutorials/.*",
+  ".*/examples/.*",
+  ".*\\.ipynb$",
+]

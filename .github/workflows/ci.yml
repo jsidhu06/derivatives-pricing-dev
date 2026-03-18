@@ -1,0 +1,184 @@
+name: ci
+
+on:
+  workflow_call:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-lint:
+    name: Dev CI (locked, lint + tests)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install (locked dev toolchain)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements/dev.txt
+          python -m pip install -e . --no-deps
+
+      - name: Verify lockfile is up to date
+        shell: bash
+        run: |
+          python -m piptools compile \
+            --extra dev \
+            --extra quantlib \
+            --extra numba \
+            --no-strip-extras \
+            -c requirements/dev.txt \
+            pyproject.toml \
+            -o /tmp/dev.txt
+          diff -u <(grep -vE '^\s*#' requirements/dev.txt) <(grep -vE '^\s*#' /tmp/dev.txt)
+
+      - name: Ruff
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Mypy
+        run: mypy
+
+      - name: Smoke import
+        run: |
+          python -c "import derivatives_pricing; print('import ok')"
+
+      - name: Pytest
+        run: |
+          pytest \
+              --cov=derivatives_pricing \
+              --cov-report=term-missing \
+              --cov-report=xml \
+              --cov-branch \
+              -q --runslow
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          
+  notebooks:
+    name: Notebooks (execute)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install (resolver-based notebook runtime)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[jupyter]"
+
+      - name: Execute notebooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTEBOOK_DIRS=("tutorials" "examples")
+
+          found_any=0
+          for d in "${NOTEBOOK_DIRS[@]}"; do
+            if [[ -d "$d" ]]; then
+              while IFS= read -r nb; do
+                found_any=1
+                echo "=== Executing: $nb ==="
+                jupyter nbconvert \
+                  --execute \
+                  --to notebook \
+                  --output-dir /tmp/nb-out \
+                  --ExecutePreprocessor.kernel_name=python3 \
+                  --ExecutePreprocessor.timeout=600 \
+                  "$nb"
+              done < <(find "$d" -type f -name "*.ipynb" | sort)
+            fi
+          done
+
+          if [[ "$found_any" -eq 0 ]]; then
+            echo "No notebooks found in: ${NOTEBOOK_DIRS[*]} (skipping)"
+          fi
+
+  cross-platform:
+    name: Cross-platform
+    runs-on: ${{ matrix.os }} 
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install (resolver-based)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[jupyter]"
+          python -m pip install pytest pytest-xdist
+
+      - name: Smoke import
+        run: |
+          python -c "import derivatives_pricing; print('import ok')"
+
+      - name: Pytest
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            pytest -q -n auto
+          else
+            pytest -q -k "bsm or binomial or mcs"
+          fi
+
+      - name: Execute one notebook
+        shell: bash
+        run: |
+          NOTEBOOK_PATH="$(find tutorials -maxdepth 1 -type f -name '*_asian_options.ipynb' | sort | head -n 1)"
+          if [[ -z "$NOTEBOOK_PATH" ]]; then
+            echo "No Asian tutorial notebook found"
+            exit 1
+          fi
+          jupyter nbconvert \
+            --execute \
+            --to notebook \
+            --output-dir /tmp/nb-out \
+            --ExecutePreprocessor.kernel_name=python3 \
+            --ExecutePreprocessor.timeout=600 \
+            "$NOTEBOOK_PATH"
+
+  # Single required check for branch protection (gates all matrix jobs)
+  ci-pass:
+    name: CI
+    if: always()
+    needs: [test-lint, notebooks, cross-platform]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          if [[ "${{ needs.test-lint.result }}" != "success" ||
+                "${{ needs.notebooks.result }}" != "success" ||
+                "${{ needs.cross-platform.result }}" != "success" ]]; then
+            echo "One or more required jobs failed"
+            exit 1
+          fi

@@ -1,0 +1,23 @@
+# Virtual environment
+.venv/
+venv/
+
+# Docs build output
+site/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment variables
+.env
+
+# Egg artifacts
+*.egg-info/
+*.egg
+.eggs/
+
+.mypy
+
+**/tutorials/*.py
+**/examples/*.py
