@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/jsidhu06/derivatives-pricing/actions/workflows/ci.yml/badge.svg)](https://github.com/jsidhu06/derivatives-pricing/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/jsidhu06/derivatives-pricing/branch/main/graph/badge.svg)](https://codecov.io/gh/jsidhu06/derivatives-pricing)
+[![PyPI version](https://img.shields.io/pypi/v/derivatives_pricing)](https://pypi.org/project/derivatives-pricing/)
+[![Python versions](https://img.shields.io/pypi/pyversions/derivatives_pricing)](https://pypi.org/project/derivatives-pricing/)
 
 A Python package for options pricing and Greeks computation, with a unified API
 across analytical, tree, PDE, and Monte Carlo methods.
