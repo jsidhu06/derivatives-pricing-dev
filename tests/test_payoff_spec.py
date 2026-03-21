@@ -1,7 +1,7 @@
 """Integration-style tests for ``PayoffSpec`` custom payoff contracts.
 
 Scope:
-- Present value sanity checks for non-trivial custom payoffs (binomial and MC)
+- Present value sanity checks for non-trivial custom payoffs (binomial, MC, PDE)
 - American-vs-European monotonicity for engines that support both styles
 - Greek behavior for PayoffSpec:
     - Numerical bump-and-revalue Greeks are supported
@@ -9,7 +9,9 @@ Scope:
     - MC PATHWISE and LIKELIHOOD_RATIO methods are rejected for non-vanilla specs
 - Engine guardrails:
     - BSM rejects PayoffSpec (requires vanilla CALL/PUT)
-    - PDE_FD rejects PayoffSpec (requires vanilla CALL/PUT)
+- PDE custom payoff pricing:
+    - Asymptote-based boundary conditions: inferred and explicit
+    - Cross-engine consistency (PDE vs binomial / MC)
 - Cross-checks against replication / cross-engine consistency where appropriate
 """
 
@@ -36,6 +38,8 @@ from derivatives_pricing.valuation import (
     MonteCarloParams,
     OptionValuation,
     PayoffSpec,
+    PayoffAsymptotes,
+    WingAsymptote,
     PDEParams,
     UnderlyingData,
     VanillaSpec,
@@ -346,25 +350,18 @@ class TestPayoffSpecGreeks:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Rejection — BSM and PDE
+# Rejection — BSM only
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 class TestPayoffSpecRejection:
-    """BSM and PDE should reject PayoffSpec."""
+    """BSM should reject PayoffSpec."""
 
     def test_bsm_rejects_payoff_spec(self):
         """BSM requires CALL/PUT option_type, unavailable for PayoffSpec."""
         spec = _payoff_spec(_bull_call_spread)
         with pytest.raises(UnsupportedFeatureError, match="BSM"):
             OptionValuation(_ud(), spec, PricingMethod.BSM)
-
-    def test_pde_rejects_payoff_spec(self):
-        """PDE solver requires strike and option_type; PayoffSpec has neither."""
-        spec = _payoff_spec(_bull_call_spread)
-        params = PDEParams()
-        with pytest.raises(UnsupportedFeatureError, match="PDE_FD pricing requires a CALL or PUT"):
-            OptionValuation(_ud(), spec, PricingMethod.PDE_FD, params=params)
 
     def test_mc_pathwise_rejects_payoff_spec(self):
         """MC pathwise/LR greeks require VanillaSpec."""
@@ -428,3 +425,160 @@ class TestPayoffSpecReplication:
         assert np.isclose(payoff_pv, replication_pv, rtol=0.005), (
             f"PayoffSpec={payoff_pv:.4f} vs replication={replication_pv:.4f}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PDE pricing for custom payoffs
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Reference PDEParams with enough resolution for good accuracy.
+_PDE_PARAMS = PDEParams(spot_steps=400, time_steps=400)
+_PDE_PARAMS_AM = PDEParams(spot_steps=400, time_steps=400, omega=1.2, tol=1e-8, max_iter=2000)
+_BINOM_PARAMS = BinomialParams(num_steps=500)
+
+
+class TestPayoffSpecPDE:
+    """PDE finite-difference pricing with asymptote-based boundary conditions."""
+
+    @pytest.mark.parametrize(
+        "payoff_fn, label, exercise",
+        [
+            (_bull_call_spread, "bull_spread", ExerciseType.EUROPEAN),
+            (_bull_call_spread, "bull_spread", ExerciseType.AMERICAN),
+            (_capped_strangle, "capped_strangle", ExerciseType.EUROPEAN),
+            (_capped_strangle, "capped_strangle", ExerciseType.AMERICAN),
+        ],
+        ids=[
+            "bull_spread-european",
+            "bull_spread-american",
+            "capped_strangle-european",
+            "capped_strangle-american",
+        ],
+    )
+    def test_pde_matches_binomial(self, payoff_fn, label, exercise):
+        """PDE should agree with a high-step binomial for various payoffs."""
+        ud = _ud()
+        spec = _payoff_spec(payoff_fn, exercise_type=exercise)
+        is_american = exercise is ExerciseType.AMERICAN
+
+        pde_pv = OptionValuation(
+            ud,
+            spec,
+            PricingMethod.PDE_FD,
+            params=_PDE_PARAMS_AM if is_american else _PDE_PARAMS,
+        ).present_value()
+        binom_pv = OptionValuation(
+            ud,
+            spec,
+            PricingMethod.BINOMIAL,
+            params=_BINOM_PARAMS,
+        ).present_value()
+
+        assert np.isclose(pde_pv, binom_pv, rtol=0.01), (
+            f"PDE={pde_pv:.4f} vs binomial={binom_pv:.4f} [{label}, {exercise.value}]"
+        )
+
+    def test_pde_digital_call_matches_binomial(self):
+        """Digital call: discontinuous payoff needs looser tolerance.
+
+        Both PDE and binomial converge slowly for step-function payoffs,
+        so we allow a wider 5% tolerance here.
+        """
+        ud = _ud()
+        spec = _payoff_spec(_digital_call)
+        pde_pv = OptionValuation(ud, spec, PricingMethod.PDE_FD, params=_PDE_PARAMS).present_value()
+        binom_pv = OptionValuation(
+            ud, spec, PricingMethod.BINOMIAL, params=_BINOM_PARAMS
+        ).present_value()
+
+        assert np.isclose(pde_pv, binom_pv, rtol=0.05), (
+            f"PDE={pde_pv:.4f} vs binomial={binom_pv:.4f}"
+        )
+
+    def test_pde_digital_call_bounded(self):
+        """Digital call: PDE should produce a positive value below the payout."""
+        ud = _ud()
+        spec = _payoff_spec(_digital_call)
+        pv = OptionValuation(ud, spec, PricingMethod.PDE_FD, params=_PDE_PARAMS).present_value()
+
+        assert pv > 0.0
+        # Digital pays 1 max, so PV ≤ exp(-rT) * 1
+        assert pv < 1.0
+
+    def test_pde_bull_spread_explicit_asymptotes(self):
+        """Explicit asymptotes on PayoffSpec should give same result as inferred."""
+        ud = _ud()
+
+        # Inferred
+        spec_inferred = _payoff_spec(_bull_call_spread)
+        pv_inferred = OptionValuation(
+            ud, spec_inferred, PricingMethod.PDE_FD, params=_PDE_PARAMS
+        ).present_value()
+
+        # Explicit: left (0, 0), right (0, 20) since spread caps at 115-95=20
+        spec_explicit = PayoffSpec(
+            exercise_type=ExerciseType.EUROPEAN,
+            maturity=MATURITY,
+            payoff_fn=_bull_call_spread,
+            currency=CURRENCY,
+            asymptotes=PayoffAsymptotes(
+                left=WingAsymptote(slope=0.0, intercept=0.0),
+                right=WingAsymptote(slope=0.0, intercept=20.0),
+            ),
+        )
+        pv_explicit = OptionValuation(
+            ud, spec_explicit, PricingMethod.PDE_FD, params=_PDE_PARAMS
+        ).present_value()
+
+        assert np.isclose(pv_inferred, pv_explicit, rtol=1e-4), (
+            f"inferred={pv_inferred:.6f} vs explicit={pv_explicit:.6f}"
+        )
+
+    def test_pde_bull_spread_replication_vs_vanilla_pde(self):
+        """PDE PayoffSpec bull spread should match sum of vanilla PDE calls."""
+        ud = _ud()
+        pde_params = _PDE_PARAMS
+
+        spec_pv = OptionValuation(
+            ud, _payoff_spec(_bull_call_spread), PricingMethod.PDE_FD, params=pde_params
+        ).present_value()
+
+        long_95c = VanillaSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=95.0,
+            maturity=MATURITY,
+            currency=CURRENCY,
+        )
+        short_115c = VanillaSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=115.0,
+            maturity=MATURITY,
+            currency=CURRENCY,
+        )
+        replication_pv = (
+            OptionValuation(ud, long_95c, PricingMethod.PDE_FD, params=pde_params).present_value()
+            - OptionValuation(
+                ud, short_115c, PricingMethod.PDE_FD, params=pde_params
+            ).present_value()
+        )
+
+        assert np.isclose(spec_pv, replication_pv, rtol=0.01), (
+            f"PayoffSpec PDE={spec_pv:.4f} vs vanilla replication PDE={replication_pv:.4f}"
+        )
+
+    def test_pde_american_ge_european(self):
+        """American PDE price should be >= European PDE price."""
+        ud = _ud()
+        spec_eu = _payoff_spec(_bull_call_spread, exercise_type=ExerciseType.EUROPEAN)
+        spec_am = _payoff_spec(_bull_call_spread, exercise_type=ExerciseType.AMERICAN)
+
+        pv_eu = OptionValuation(
+            ud, spec_eu, PricingMethod.PDE_FD, params=_PDE_PARAMS
+        ).present_value()
+        pv_am = OptionValuation(
+            ud, spec_am, PricingMethod.PDE_FD, params=_PDE_PARAMS_AM
+        ).present_value()
+
+        assert pv_am >= pv_eu - 1e-8, f"American={pv_am:.4f} < European={pv_eu:.4f}"

@@ -77,6 +77,27 @@ class VanillaSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class WingAsymptote:
+    """Affine asymptotic payoff on one wing: ``payoff(S) ~ slope * S + intercept``."""
+
+    slope: float
+    intercept: float
+
+
+@dataclass(frozen=True, slots=True)
+class PayoffAsymptotes:
+    """Left (S → 0) and right (S → ∞) affine asymptotes for a custom payoff.
+
+    Used by the PDE solver to set boundary conditions.  If not supplied on
+    ``PayoffSpec``, the PDE engine will infer asymptotes numerically from the
+    payoff callable.
+    """
+
+    left: WingAsymptote
+    right: WingAsymptote
+
+
+@dataclass(frozen=True, slots=True)
 class PayoffSpec:
     """Contract specification for a single-contract custom payoff.
 
@@ -100,6 +121,9 @@ class PayoffSpec:
         Contract multiplier (default 100).  Not applied by ``OptionValuation``
         (which returns per-unit values); intended for portfolio-level position
         sizing.
+    asymptotes
+        Optional explicit affine asymptotes for PDE boundary conditions.
+        If ``None``, the PDE solver will infer them numerically from ``payoff_fn``.
 
     Notes
     -----
@@ -112,6 +136,7 @@ class PayoffSpec:
     payoff_fn: Callable[[np.ndarray | float], np.ndarray]
     currency: str | None = None
     contract_size: int | float = 100
+    asymptotes: PayoffAsymptotes | None = None
 
     # Kept for compatibility with vanilla valuation interfaces
     strike: None = None
@@ -129,6 +154,10 @@ class PayoffSpec:
             )
         if not callable(self.payoff_fn):
             raise ConfigurationError("payoff_fn must be callable")
+        if self.asymptotes is not None and not isinstance(self.asymptotes, PayoffAsymptotes):
+            raise ConfigurationError(
+                f"asymptotes must be PayoffAsymptotes or None, got {type(self.asymptotes).__name__}"
+            )
 
     def payoff(self, spot: np.ndarray | float) -> np.ndarray:
         """Vectorized payoff as a function of spot."""
