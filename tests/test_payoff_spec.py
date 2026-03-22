@@ -38,7 +38,7 @@ from derivatives_pricing.valuation import (
     MonteCarloParams,
     OptionValuation,
     PayoffSpec,
-    PayoffAsymptotes,
+    PayoffBoundaryModel,
     WingAsymptote,
     PDEParams,
     UnderlyingData,
@@ -479,19 +479,23 @@ class TestPayoffSpecPDE:
         )
 
     def test_pde_digital_call_matches_binomial(self):
-        """Digital call: discontinuous payoff needs looser tolerance.
-
-        Both PDE and binomial converge slowly for step-function payoffs,
-        so we allow a wider 5% tolerance here.
-        """
+        """Digital call: higher-resolution PDE/binomial runs should agree tightly."""
         ud = _ud()
         spec = _payoff_spec(_digital_call)
-        pde_pv = OptionValuation(ud, spec, PricingMethod.PDE_FD, params=_PDE_PARAMS).present_value()
+        pde_pv = OptionValuation(
+            ud,
+            spec,
+            PricingMethod.PDE_FD,
+            params=PDEParams(spot_steps=400, time_steps=400),
+        ).present_value()
         binom_pv = OptionValuation(
-            ud, spec, PricingMethod.BINOMIAL, params=_BINOM_PARAMS
+            ud,
+            spec,
+            PricingMethod.BINOMIAL,
+            params=BinomialParams(num_steps=2000),
         ).present_value()
 
-        assert np.isclose(pde_pv, binom_pv, rtol=0.05), (
+        assert np.isclose(pde_pv, binom_pv, rtol=0.02), (
             f"PDE={pde_pv:.4f} vs binomial={binom_pv:.4f}"
         )
 
@@ -506,7 +510,7 @@ class TestPayoffSpecPDE:
         assert pv < 1.0
 
     def test_pde_bull_spread_explicit_asymptotes(self):
-        """Explicit asymptotes on PayoffSpec should give same result as inferred."""
+        """Explicit boundary model on PayoffSpec should give same result as fitted."""
         ud = _ud()
 
         # Inferred
@@ -521,7 +525,7 @@ class TestPayoffSpecPDE:
             maturity=MATURITY,
             payoff_fn=_bull_call_spread,
             currency=CURRENCY,
-            asymptotes=PayoffAsymptotes(
+            boundary_model=PayoffBoundaryModel(
                 left=WingAsymptote(slope=0.0, intercept=0.0),
                 right=WingAsymptote(slope=0.0, intercept=20.0),
             ),

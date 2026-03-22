@@ -44,7 +44,7 @@ from ..exceptions import (
     UnsupportedFeatureError,
     ValidationError,
 )
-from .contracts import PayoffAsymptotes, WingAsymptote
+from .contracts import PayoffBoundaryModel, WingAsymptote
 from .params import PDEParams
 
 if TYPE_CHECKING:
@@ -183,46 +183,42 @@ def _apply_dividend_jump(
 
 
 # ---------------------------------------------------------------------------
-# Affine asymptote helpers for custom-payoff boundary conditions
+# Affine boundary-model helpers for custom-payoff boundary conditions
 # ---------------------------------------------------------------------------
 
 
-def _infer_affine_asymptote(
+def _fit_affine_boundary_model(
     payoff_fn: Callable,
     *,
     wing: str,
-    smin: float,
-    smax: float,
+    spot_samples: np.ndarray,
 ) -> WingAsymptote:
-    """Infer affine asymptote ``payoff(S) ~ slope * S + intercept`` on a boundary wing.
+    """Fit affine boundary model ``payoff(S) ~ slope * S + intercept``.
 
     Parameters
     ----------
     payoff_fn
         Vectorized payoff callable.
     wing
-        ``"left"`` (S → smin) or ``"right"`` (S → smax).
-    smin
-        PDE lower spot boundary (0 for spot grid, >0 for log-spot).
-    smax
-        PDE upper spot boundary.
+        ``"left"`` or ``"right"`` boundary label for logging.
+    spot_samples
+        Spot samples taken directly from the PDE grid near the relevant
+        boundary. Using the actual grid nodes makes the fitted affine model
+        consistent with the truncated domain the PDE solver uses.
 
     Returns
     -------
     WingAsymptote
-        Estimated slope / intercept pair.
+        Fitted slope / intercept pair.
     """
-    if wing == "left":
-        if smin > 0:
-            # Log-spot grid: sample near the actual left boundary.
-            span = smax - smin
-            x = smin + span * np.array([0.00, 0.01, 0.02, 0.05], dtype=float)
-        else:
-            # Spot grid: sample near zero.
-            x = smax * np.array([1e-6, 2e-6, 5e-6, 1e-5], dtype=float)
-    else:
-        # Sample near the upper boundary where the payoff should be asymptotic.
-        x = smax * np.array([0.90, 0.95, 0.98, 1.00], dtype=float)
+    if wing not in {"left", "right"}:
+        raise ConfigurationError(f"wing must be 'left' or 'right', got {wing!r}")
+
+    x = np.asarray(spot_samples, dtype=float)
+    if x.ndim != 1 or x.size < 3:
+        raise ConfigurationError("spot_samples must be a 1D array with at least three points")
+    if np.any(np.diff(x) <= 0.0):
+        raise ConfigurationError("spot_samples must be strictly increasing")
 
     y = np.asarray(payoff_fn(x), dtype=float)
 
@@ -238,8 +234,8 @@ def _infer_affine_asymptote(
         r_squared = 1.0 - ss_res / ss_tot
         if r_squared < 0.99:
             logger.warning(
-                "Affine asymptote fit on %s wing has R²=%.4f; boundary values "
-                "may be inaccurate. Consider providing explicit PayoffAsymptotes.",
+                "Affine boundary fit on %s wing has R²=%.4f; boundary values "
+                "may be inaccurate. Consider providing explicit PayoffBoundaryModel.",
                 wing,
                 r_squared,
             )
@@ -247,7 +243,7 @@ def _infer_affine_asymptote(
     return WingAsymptote(slope=float(slope), intercept=float(intercept))
 
 
-def _continuation_from_affine_asymptote(
+def _continuation_from_affine_boundary_model(
     *,
     spot: float,
     slope: float,
@@ -255,9 +251,13 @@ def _continuation_from_affine_asymptote(
     df_tT: float,
     dq_tT: float,
 ) -> float:
-    """Continuation value implied by an affine payoff asymptote.
+    """Continuation value implied by an affine boundary model.
 
-    If  payoff(S_T) ~ slope * S_T + intercept  then under risk-neutral pricing:
+    If the boundary payoff is approximated by
+
+        payoff(S_T) ~ slope * S_T + intercept
+
+    then under risk-neutral pricing:
 
         V(S, t) ~ slope * S * dq_tT + intercept * df_tT
 
@@ -277,13 +277,13 @@ def _boundary_values(
     dq_tT: float,
     early_exercise: bool,
     payoff_fn: Callable | None = None,
-    payoff_asymptotes: PayoffAsymptotes | None = None,
+    payoff_boundary_model: PayoffBoundaryModel | None = None,
 ) -> tuple[float, float]:
     """Dirichlet boundary values for PDE at S=smin (left) and S=smax (right).
 
     For vanilla call/put, uses standard analytical asymptotics.
 
-    For custom payoffs, uses affine wing asymptotes::
+    For custom payoffs, uses affine wing boundary models::
 
         payoff(S) ~ slope * S + intercept
         => V(S, t) ~ slope * S * dq_tT + intercept * df_tT
@@ -296,22 +296,22 @@ def _boundary_values(
     # Custom payoff branch
     # ------------------------------------------------------------------
     if payoff_fn is not None:
-        if payoff_asymptotes is None:
+        if payoff_boundary_model is None:
             raise ConfigurationError(
-                "_boundary_values requires resolved payoff_asymptotes for custom payoffs"
+                "_boundary_values requires a resolved payoff_boundary_model for custom payoffs"
             )
 
-        left_cont = _continuation_from_affine_asymptote(
+        left_cont = _continuation_from_affine_boundary_model(
             spot=smin,
-            slope=payoff_asymptotes.left.slope,
-            intercept=payoff_asymptotes.left.intercept,
+            slope=payoff_boundary_model.left.slope,
+            intercept=payoff_boundary_model.left.intercept,
             df_tT=df_tT,
             dq_tT=dq_tT,
         )
-        right_cont = _continuation_from_affine_asymptote(
+        right_cont = _continuation_from_affine_boundary_model(
             spot=smax,
-            slope=payoff_asymptotes.right.slope,
-            intercept=payoff_asymptotes.right.intercept,
+            slope=payoff_boundary_model.right.slope,
+            intercept=payoff_boundary_model.right.intercept,
             df_tT=df_tT,
             dq_tT=dq_tT,
         )
@@ -801,7 +801,7 @@ def _vanilla_fd_core(
     tol: float | None = None,
     max_iter: int | None = None,
     payoff_fn: Callable | None = None,
-    payoff_asymptotes: PayoffAsymptotes | None = None,
+    payoff_boundary_model: PayoffBoundaryModel | None = None,
 ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
     """Core finite-difference solver for option valuation.
 
@@ -861,14 +861,14 @@ def _vanilla_fd_core(
     else:
         payoff = np.maximum(S - strike, 0.0)
 
-    # Resolve affine wing asymptotes once (used for boundary conditions
-    # on every time step).  Prefer explicit metadata; fall back to
-    # numerical inference from the payoff callable.
+    # Resolve affine wing boundary models once (used for boundary
+    # conditions on every time step). Prefer explicit metadata; fall back
+    # to a local affine fit on the actual PDE boundary nodes.
     smin = float(S[0])
-    if payoff_fn is not None and payoff_asymptotes is None:
-        payoff_asymptotes = PayoffAsymptotes(
-            left=_infer_affine_asymptote(payoff_fn, wing="left", smin=smin, smax=smax),
-            right=_infer_affine_asymptote(payoff_fn, wing="right", smin=smin, smax=smax),
+    if payoff_fn is not None and payoff_boundary_model is None:
+        payoff_boundary_model = PayoffBoundaryModel(
+            left=_fit_affine_boundary_model(payoff_fn, wing="left", spot_samples=S[:4]),
+            right=_fit_affine_boundary_model(payoff_fn, wing="right", spot_samples=S[-4:]),
         )
 
     V = payoff.copy()  # V at tau=0 (maturity)
@@ -972,7 +972,7 @@ def _vanilla_fd_core(
             dq_tT=dq_tT,
             early_exercise=early_exercise,
             payoff_fn=payoff_fn,
-            payoff_asymptotes=payoff_asymptotes,
+            payoff_boundary_model=payoff_boundary_model,
         )
 
         V_prev = V.copy()
@@ -1185,10 +1185,10 @@ class _FDValuationBase(_FDGridGreeksMixin):
         spot_steps = int(params.spot_steps)
         time_steps = int(params.time_steps)
 
-        # Custom payoff support: extract payoff callable and asymptotes from PayoffSpec
+        # Custom payoff support: extract payoff callable and boundary model from PayoffSpec
         spec = self.valuation_ctx.spec
         custom_payoff = getattr(spec, "payoff", None) if strike is None else None
-        custom_asymptotes = getattr(spec, "asymptotes", None) if strike is None else None
+        custom_boundary_model = getattr(spec, "boundary_model", None) if strike is None else None
 
         return _vanilla_fd_core(
             spot=spot,
@@ -1213,7 +1213,7 @@ class _FDValuationBase(_FDGridGreeksMixin):
             tol=float(params.tol) if self._early_exercise else None,
             max_iter=int(params.max_iter) if self._early_exercise else None,
             payoff_fn=custom_payoff,
-            payoff_asymptotes=custom_asymptotes,
+            payoff_boundary_model=custom_boundary_model,
         )
 
     def present_value(self) -> float:
