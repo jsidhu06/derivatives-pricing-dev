@@ -339,6 +339,7 @@ class OptionValuation:
 
     def delta(
         self,
+        *,
         epsilon: float | None = None,
         greek_calc_method: GreekCalculationMethod | None = None,
     ) -> float:
@@ -385,6 +386,7 @@ class OptionValuation:
 
     def gamma(
         self,
+        *,
         epsilon: float | None = None,
         greek_calc_method: GreekCalculationMethod | None = None,
     ) -> float:
@@ -434,6 +436,7 @@ class OptionValuation:
 
     def vega(
         self,
+        *,
         epsilon: float = 0.01,
         greek_calc_method: GreekCalculationMethod | None = None,
     ) -> float:
@@ -477,8 +480,9 @@ class OptionValuation:
 
     def theta(
         self,
-        greek_calc_method: GreekCalculationMethod | None = None,
+        *,
         time_bump_days: float = 1.0,
+        greek_calc_method: GreekCalculationMethod | None = None,
     ) -> float:
         """Compute option theta.
 
@@ -530,8 +534,9 @@ class OptionValuation:
 
     def rho(
         self,
-        greek_calc_method: GreekCalculationMethod | None = None,
+        *,
         rate_bump: float = 0.01,
+        greek_calc_method: GreekCalculationMethod | None = None,
     ) -> float:
         """Compute option rho.
 
