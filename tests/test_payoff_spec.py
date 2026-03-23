@@ -629,23 +629,29 @@ class TestPayoffSpecReplication:
         ],
         ids=["binomial", "pde"],
     )
-    def test_bear_spread_replication(self, engine, params):
-        """Bear spread PayoffSpec should match long 105P - short 85P."""
+    def test_capped_strangle_replication(self, engine, params):
+        """Capped strangle should match long 90P + long 110C, short 50P + short 150C."""
         ud = _ud()
         spec_pv = OptionValuation(
             ud,
-            _payoff_spec(_bear_put_spread),
+            _payoff_spec(_capped_strangle),
             engine,
             params=params,
         ).present_value()
 
+        def _pv(option_type, strike):
+            return OptionValuation(
+                ud,
+                self._vanilla(option_type, strike),
+                engine,
+                params=params,
+            ).present_value()
+
         replication_pv = (
-            OptionValuation(
-                ud, self._vanilla(OptionType.PUT, 105.0), engine, params=params
-            ).present_value()
-            - OptionValuation(
-                ud, self._vanilla(OptionType.PUT, 85.0), engine, params=params
-            ).present_value()
+            _pv(OptionType.PUT, 90.0)  # long 90 put
+            - _pv(OptionType.PUT, 50.0)  # short 50 put (caps put wing at 40)
+            + _pv(OptionType.CALL, 110.0)  # long 110 call
+            - _pv(OptionType.CALL, 150.0)  # short 150 call (caps call wing at 40)
         )
 
         assert np.isclose(spec_pv, replication_pv, rtol=0.01), (
