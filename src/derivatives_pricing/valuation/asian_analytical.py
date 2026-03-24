@@ -15,7 +15,7 @@ Implements two analytical pricing approaches for Asian options:
 Current scope
 -------------
 - European average-price Asian call/put (geometric & arithmetic)
-- N equally spaced observation dates over [t_start, T]
+- Equally spaced or arbitrary observation dates
 - Continuous dividend yield via dividend_curve
 
 References
@@ -62,23 +62,25 @@ def _asian_geometric_analytical(
     risk_free_rate: float,
     dividend_yield: float,
     option_type: OptionType,
-    num_observations: int,
+    num_observations: int | None = None,
     averaging_start: float = 0.0,
+    observation_times: np.ndarray | None = None,
 ) -> float:
     """Kemna-Vorst closed-form price for a geometric average-price Asian option.
 
     The geometric average G = (∏ S(tᵢ))^(1/M) of GBM prices is lognormal.
-    Given ``num_observations = M`` equally spaced observation points,
-    the average is taken over M prices at tᵢ = t_s + i·Δ
-    (i = 0, 1, …, N) where N = M - 1 and Δ = (T − t_s)/N.
-    The observation at
-    t₀ = t_s includes the current spot price S₀, matching the convention
-    used by the binomial and Monte Carlo engines.
+
+    Observation times can be specified in two ways:
+
+    1. ``observation_times`` — explicit year-fraction array (arbitrary spacing).
+    2. ``num_observations`` + ``averaging_start`` — M equally spaced points
+       from ``averaging_start`` to ``time_to_maturity``.
 
         E[ln G] = ln S₀ + (r − q − σ²/2) · t̄
-        Var[ln G] = σ² · [t_s + Δ·N·(2N+1) / (6·M)]
+        Var[ln G] = (σ²/M²) · ΣΣ min(tᵢ, tⱼ)
 
-    where t̄ = t_s + N·Δ/2 is the mean observation time and M = N + 1.
+    where t̄ = mean(tᵢ) is the mean observation time and M is the number
+    of observations.
 
     The option price is then the standard Black-Scholes formula applied to the
     lognormal variable G.
@@ -99,11 +101,16 @@ def _asian_geometric_analytical(
         Continuously compounded dividend yield q
     option_type : OptionType
         CALL or PUT
-    num_observations : int
-        Number of equally spaced observation points M (≥ 2), including S_t at t_s.
+    num_observations : int | None
+        Number of equally spaced observation points M (≥ 2).
+        Mutually exclusive with ``observation_times``.
     averaging_start : float
         Year fraction from pricing date to the start of the averaging window
-        (default 0.0 = averaging starts at pricing date)
+        (default 0.0 = averaging starts at pricing date).
+        Only used with ``num_observations``.
+    observation_times : np.ndarray | None
+        Explicit observation year fractions (sorted, non-negative).
+        Mutually exclusive with ``num_observations``.
 
     Returns
     -------
@@ -114,39 +121,46 @@ def _asian_geometric_analytical(
         raise ValidationError("time_to_maturity must be positive")
     if volatility <= 0:
         raise ValidationError("volatility must be positive")
-    if num_observations < 2:
-        raise ValidationError("num_observations must be >= 2")
     if strike < 0:
         raise ValidationError("strike must be >= 0")
-    if averaging_start < 0:
-        raise ValidationError("averaging_start must be >= 0")
-    if averaging_start >= time_to_maturity:
-        raise ValidationError("averaging_start must be < time_to_maturity")
+
+    if (observation_times is None) == (num_observations is None):
+        raise ValidationError("Provide exactly one of observation_times or num_observations.")
 
     T = time_to_maturity
-    M = num_observations  # total observation prices (including S0 at t_s)
-    N = M - 1  # number of time steps
     sigma = volatility
     r = risk_free_rate
     q = dividend_yield
     S0 = spot
     K = strike
-    t_s = averaging_start
-    delta_t = (T - t_s) / N
 
-    # Mean observation time: t̄ = t_s + N·Δ/2
-    t_bar = t_s + N * delta_t / 2.0
+    # Build observation-time array
+    if observation_times is not None:
+        t = np.asarray(observation_times, dtype=float)
+        if t.size < 2:
+            raise ValidationError("observation_times must have >= 2 entries")
+        M = t.size
+    else:
+        if num_observations < 2:
+            raise ValidationError("num_observations must be >= 2")
+        if averaging_start < 0:
+            raise ValidationError("averaging_start must be >= 0")
+        if averaging_start >= time_to_maturity:
+            raise ValidationError("averaging_start must be < time_to_maturity")
+        M = num_observations
+        N = M - 1
+        t_s = averaging_start
+        delta_t = (T - t_s) / N
+        t = t_s + np.arange(M, dtype=float) * delta_t
+
+    # Mean observation time
+    t_bar = np.mean(t)
 
     # First moment: E[ln G]
     M1 = np.log(S0) + (r - q - 0.5 * sigma**2) * t_bar
 
-    # Second moment: Var[ln G]
-    # Cov(ln S(tᵢ), ln S(tⱼ)) = σ² min(tᵢ, tⱼ) where tᵢ = t_s + i·Δ.
-    # (1/M²)·ΣΣ min(tᵢ,tⱼ) for i,j ∈ {0,...,N}
-    #   = t_s + Δ·N·(2N+1) / (6·M)
-    # Note: the i=0, j=0 term contributes t_s (not 0), which is why the
-    # t_s summand persists even though min(0,0)=0 in the *index* sum.
-    M2 = sigma**2 * (t_s + delta_t * N * (2 * N + 1) / (6.0 * M))
+    # Var[ln G] = (σ²/M²) · ΣΣ min(tᵢ, tⱼ)
+    M2 = sigma**2 * np.mean(np.minimum.outer(t, t))
 
     # Forward of geometric average: E[G] = exp(M₁ + M₂/2)
     F_G = np.exp(M1 + 0.5 * M2)
@@ -182,8 +196,9 @@ def _asian_arithmetic_analytical(
     risk_free_rate: float,
     dividend_yield: float,
     option_type: OptionType,
-    num_observations: int,
+    num_observations: int | None = None,
     averaging_start: float = 0.0,
+    observation_times: np.ndarray | None = None,
 ) -> float:
     """Turnbull-Wakeman moment-matching price for an arithmetic average Asian option.
 
@@ -191,11 +206,11 @@ def _asian_arithmetic_analytical(
     its first two moments can be computed exactly under GBM.  A lognormal
     distribution is fitted to those moments and Black's model is applied.
 
-    Given ``num_observations = M`` equally spaced observation points,
-    the average is taken over M prices at tᵢ = t_s + i·Δ  (i = 0, 1, …, N)
-    where N = M - 1 and Δ = (T − t_s)/N.  The observation at t₀ = t_s includes the
-    current spot price S₀, matching the convention used by the binomial
-    and Monte Carlo engines.
+    Observation times can be specified in two ways:
+
+    1. ``observation_times`` — explicit year-fraction array (arbitrary spacing).
+    2. ``num_observations`` + ``averaging_start`` — M equally spaced points
+       from ``averaging_start`` to ``time_to_maturity``.
 
     Moment formulas (Hull equations 26.3–26.4 for discrete observations)
     --------------------------------------------------------------------
@@ -228,11 +243,16 @@ def _asian_arithmetic_analytical(
         Continuously compounded dividend yield q
     option_type : OptionType
         CALL or PUT
-    num_observations : int
-        Number of equally spaced observation points M (≥ 2), including S_t at t_s.
+    num_observations : int | None
+        Number of equally spaced observation points M (≥ 2).
+        Mutually exclusive with ``observation_times``.
     averaging_start : float
         Year fraction from pricing date to the start of the averaging window
-        (default 0.0 = averaging starts at pricing date)
+        (default 0.0 = averaging starts at pricing date).
+        Only used with ``num_observations``.
+    observation_times : np.ndarray | None
+        Explicit observation year fractions (sorted, non-negative).
+        Mutually exclusive with ``num_observations``.
 
     Returns
     -------
@@ -243,28 +263,38 @@ def _asian_arithmetic_analytical(
         raise ValidationError("time_to_maturity must be positive")
     if volatility <= 0:
         raise ValidationError("volatility must be positive")
-    if num_observations < 2:
-        raise ValidationError("num_observations must be >= 2")
     if strike < 0:
         raise ValidationError("strike must be >= 0")
-    if averaging_start < 0:
-        raise ValidationError("averaging_start must be >= 0")
-    if averaging_start >= time_to_maturity:
-        raise ValidationError("averaging_start must be < time_to_maturity")
+
+    if (observation_times is None) == (num_observations is None):
+        raise ValidationError("Provide exactly one of observation_times or num_observations.")
 
     T = time_to_maturity
-    M = num_observations  # total observation prices (including S0 at t_s)
-    N = M - 1
     sigma = volatility
     r = risk_free_rate
     q = dividend_yield
     S0 = spot
     K = strike
-    t_s = averaging_start
-    delta_t = (T - t_s) / N
 
-    # Observation times and forward prices
-    t = t_s + np.arange(M, dtype=float) * delta_t  # t[i] = t_s + i·Δ
+    # Build observation-time array
+    if observation_times is not None:
+        t = np.asarray(observation_times, dtype=float)
+        if t.size < 2:
+            raise ValidationError("observation_times must have >= 2 entries")
+        M = t.size
+    else:
+        if num_observations < 2:
+            raise ValidationError("num_observations must be >= 2")
+        if averaging_start < 0:
+            raise ValidationError("averaging_start must be >= 0")
+        if averaging_start >= time_to_maturity:
+            raise ValidationError("averaging_start must be < time_to_maturity")
+        M = num_observations
+        N = M - 1
+        t_s = averaging_start
+        delta_t = (T - t_s) / N
+        t = t_s + np.arange(M, dtype=float) * delta_t  # t[i] = t_s + i·Δ
+
     F = S0 * np.exp((r - q) * t)  # Fᵢ = S₀ exp((r-q) tᵢ)
 
     # ── First moment: M₁ = E[S_avg] = (1/M) Σ Fᵢ ──
@@ -325,15 +355,6 @@ class _AnalyticalAsianValuation:
             raise UnsupportedFeatureError(
                 "Analytical (BSM) Asian pricing requires GEOMETRIC or ARITHMETIC averaging."
             )
-        if spec.fixing_dates is not None:
-            raise UnsupportedFeatureError(
-                "Analytical (BSM) Asian pricing currently does not support fixing_dates. "
-                "Provide num_observations and use equally spaced observations."
-            )
-        if spec.num_observations is None:
-            raise ValidationError(
-                "num_observations is required on AsianSpec for analytical (BSM) pricing."
-            )
 
     def _extract_rates(self, time_to_maturity: float) -> tuple[float, float]:
         """Extract effective continuously compounded rates from discount/dividend curves."""
@@ -393,7 +414,34 @@ class _AnalyticalAsianValuation:
 
         r, q = self._extract_rates(time_to_maturity)
 
-        # Determine averaging start
+        pricer = (
+            _asian_geometric_analytical
+            if spec.averaging is AsianAveraging.GEOMETRIC
+            else _asian_arithmetic_analytical
+        )
+
+        if spec.fixing_dates is not None:
+            day_count = self.valuation_ctx.day_count_convention
+            pricing_date = self.valuation_ctx.pricing_date
+            obs_times = np.array(
+                [
+                    calculate_year_fraction(pricing_date, d, day_count_convention=day_count)
+                    for d in spec.fixing_dates
+                ],
+                dtype=float,
+            )
+            return pricer(
+                spot=spot,
+                strike=strike,
+                time_to_maturity=time_to_maturity,
+                volatility=volatility,
+                risk_free_rate=r,
+                dividend_yield=q,
+                option_type=self.valuation_ctx.option_type,
+                observation_times=obs_times,
+            )
+
+        # Equally spaced mode
         averaging_start_frac = 0.0
         if (
             spec.averaging_start is not None
@@ -404,12 +452,6 @@ class _AnalyticalAsianValuation:
                 spec.averaging_start,
                 day_count_convention=self.valuation_ctx.day_count_convention,
             )
-
-        pricer = (
-            _asian_geometric_analytical
-            if spec.averaging is AsianAveraging.GEOMETRIC
-            else _asian_arithmetic_analytical
-        )
 
         return pricer(
             spot=spot,
@@ -457,7 +499,7 @@ class _AnalyticalAsianValuation:
             )
 
         n1 = spec.observed_count
-        n2 = spec.num_observations  # future observations
+        n2 = spec.num_observations if spec.num_observations is not None else len(spec.fixing_dates)
         n_total = n1 + n2
         S_bar = spec.observed_average
         K = spec.strike
