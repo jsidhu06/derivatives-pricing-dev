@@ -1714,15 +1714,16 @@ class TestContinuousLimit:
         continuous_call = np.exp(-r * T) * (F_G * norm.cdf(d1) - K * norm.cdf(d2))
 
         # Discrete with N=10000
+        N = 10_000
+        t = np.linspace(0, T, N)
+        F = S0 * np.exp((r - q) * t)
         discrete_call = _asian_geometric_analytical(
-            spot=S0,
             strike=K,
-            time_to_maturity=T,
             volatility=sigma,
-            risk_free_rate=r,
-            dividend_yield=q,
+            discount_factor_T=np.exp(-r * T),
+            forward_prices=F,
+            observation_times=t,
             option_type=OptionType.CALL,
-            num_observations=10_000,
         )
 
         assert np.isclose(discrete_call, continuous_call, rtol=1e-4)
@@ -2502,38 +2503,34 @@ class TestValidation:
             )
 
     def test_pure_function_validation(self):
-        with pytest.raises(Exception, match="time_to_maturity"):
+        # observation_times must have >= 2 entries
+        with pytest.raises(Exception, match="observation_times"):
             _asian_geometric_analytical(
-                spot=100,
                 strike=100,
-                time_to_maturity=-1,
                 volatility=0.2,
-                risk_free_rate=0.05,
-                dividend_yield=0.0,
+                discount_factor_T=np.exp(-0.05),
+                forward_prices=np.array([100.0]),
+                observation_times=np.array([0.5]),
                 option_type=OptionType.CALL,
-                num_observations=12,
             )
         with pytest.raises(Exception, match="volatility"):
             _asian_geometric_analytical(
-                spot=100,
                 strike=100,
-                time_to_maturity=1,
                 volatility=-0.2,
-                risk_free_rate=0.05,
-                dividend_yield=0.0,
+                discount_factor_T=np.exp(-0.05),
+                forward_prices=np.array([100.0, 102.0]),
+                observation_times=np.array([0.5, 1.0]),
                 option_type=OptionType.CALL,
-                num_observations=12,
             )
-        with pytest.raises(Exception, match="num_observations"):
+        # observation_times must have >= 2 entries (single element)
+        with pytest.raises(Exception, match="observation_times"):
             _asian_geometric_analytical(
-                spot=100,
                 strike=100,
-                time_to_maturity=1,
                 volatility=0.2,
-                risk_free_rate=0.05,
-                dividend_yield=0.0,
+                discount_factor_T=np.exp(-0.05),
+                forward_prices=np.array([100.0]),
+                observation_times=np.array([1.0]),
                 option_type=OptionType.CALL,
-                num_observations=1,
             )
 
 
@@ -2833,15 +2830,17 @@ class TestHullExample26_3:
         S0, K, r, q, sigma, T = 50.0, 50.0, 0.1, 0.0, 0.4, 1.0
 
         # Large N approximates continuous average
+        N = 10_000
+        t = np.linspace(0, T, N)
+        F = S0 * np.exp((r - q) * t)
         price = _asian_arithmetic_analytical(
-            spot=S0,
             strike=K,
             time_to_maturity=T,
             volatility=sigma,
-            risk_free_rate=r,
-            dividend_yield=q,
+            discount_factor_T=np.exp(-r * T),
+            forward_prices=F,
+            observation_times=t,
             option_type=OptionType.CALL,
-            num_observations=10_000,
         )
         assert np.isclose(price, 5.62, atol=0.02), f"price={price:.4f} expected ~5.62"
 
@@ -2856,16 +2855,17 @@ class TestHullExample26_3:
 
         for m, hull_price in [(12, 6.00), (52, 5.70), (250, 5.63)]:
             # averaging_start = T/m skips S₀, giving m obs at T/m, ..., T
+            t_s = T / m
+            t = t_s + np.arange(m, dtype=float) * (T - t_s) / (m - 1)
+            F = S0 * np.exp((r - q) * t)
             price = _asian_arithmetic_analytical(
-                spot=S0,
                 strike=K,
                 time_to_maturity=T,
                 volatility=sigma,
-                risk_free_rate=r,
-                dividend_yield=q,
+                discount_factor_T=np.exp(-r * T),
+                forward_prices=F,
+                observation_times=t,
                 option_type=OptionType.CALL,
-                num_observations=m,
-                averaging_start=T / m,
             )
 
             logger.info(
