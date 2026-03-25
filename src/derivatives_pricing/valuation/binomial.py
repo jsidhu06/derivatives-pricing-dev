@@ -231,7 +231,7 @@ class _BinomialValuationBase:
         return option_lattice
 
     # ------------------------------------------------------------------
-    # Tree Greeks (Hull Ch. 13)
+    # Tree Greeks (Hull Ch. 21)
     # ------------------------------------------------------------------
 
     def _tree_greeks_data(self) -> tuple[np.ndarray, np.ndarray, float]:
@@ -257,7 +257,7 @@ class _BinomialValuationBase:
         return option_lattice, spot_lattice, dt
 
     def delta(self) -> float:
-        """Extract delta from the binomial tree (Hull Ch. 13).
+        """Extract delta from the binomial tree (Hull Ch. 21).
 
         .. math::
 
@@ -270,7 +270,7 @@ class _BinomialValuationBase:
         return float((f[0, 1] - f[1, 1]) / (S[0, 1] - S[1, 1]))
 
     def gamma(self) -> float:
-        """Extract gamma from the binomial tree (Hull Ch. 13).
+        """Extract gamma from the binomial tree (Hull Ch. 21).
 
         Uses the three nodes at step 2:
 
@@ -291,7 +291,7 @@ class _BinomialValuationBase:
         return float((delta_up - delta_down) / h)
 
     def theta(self) -> float:
-        """Extract theta from the binomial tree (Hull Ch. 13).
+        """Extract theta from the binomial tree (Hull Ch. 21).
 
         .. math::
 
