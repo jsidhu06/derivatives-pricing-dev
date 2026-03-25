@@ -59,6 +59,7 @@ Install from PyPI:
 
 ```bash
 pip install derivatives-pricing
+# or pip install derivatives-pricing[numba] for optional PDE solver acceleration
 ```
 
 For development:
