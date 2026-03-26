@@ -10,16 +10,20 @@ import pytest
 
 from derivatives_pricing.enums import (
     AsianAveraging,
+    BarrierAction,
+    BarrierDirection,
     DayCountConvention,
     ExerciseType,
     OptionType,
     PricingMethod,
+    RebateTiming,
 )
 from derivatives_pricing.market_environment import MarketData
 from derivatives_pricing.rates import DiscountCurve
 from helpers import flat_curve
 from derivatives_pricing.valuation import (
     AsianSpec,
+    BarrierSpec,
     VanillaSpec,
     OptionValuation,
     UnderlyingData,
@@ -857,6 +861,358 @@ def test_asian_geometric_put_nonflat_curves_vs_quantlib():
     assert np.isclose(dp_analytical, ql_mc, rtol=0.015), (
         f"DP_AN {dp_analytical:.6f} vs QL_MC {ql_mc:.6f}"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Barrier options — DP analytical vs QuantLib analytical
+# ═══════════════════════════════════════════════════════════════════════════
+
+_BARRIER_SPOT = 100.0
+_BARRIER_VOL = 0.25
+_BARRIER_RATE = 0.05
+_BARRIER_DIV = 0.02
+_BARRIER_MATURITY = dt.datetime(2026, 1, 1)
+
+_QL_BARRIER_TYPE = {
+    (BarrierDirection.DOWN, BarrierAction.IN): ql.Barrier.DownIn,
+    (BarrierDirection.DOWN, BarrierAction.OUT): ql.Barrier.DownOut,
+    (BarrierDirection.UP, BarrierAction.IN): ql.Barrier.UpIn,
+    (BarrierDirection.UP, BarrierAction.OUT): ql.Barrier.UpOut,
+}
+
+
+def _barrier_nonflat_curves() -> tuple[DiscountCurve, DiscountCurve]:
+    """Non-flat rate and dividend curves for barrier tests."""
+    ttm = calculate_year_fraction(PRICING_DATE, _BARRIER_MATURITY)
+    r_times = np.array([0.0, 0.25, 0.5, ttm])
+    r_forwards = np.array([0.03, 0.06, 0.04])
+    q_times = np.array([0.0, 0.25, 0.5, ttm])
+    q_forwards = np.array([0.01, 0.03, 0.005])
+    return (
+        DiscountCurve.from_forwards(times=r_times, forwards=r_forwards),
+        DiscountCurve.from_forwards(times=q_times, forwards=q_forwards),
+    )
+
+
+def _ql_barrier_price(
+    *,
+    direction: BarrierDirection,
+    action: BarrierAction,
+    barrier: float,
+    option_type: OptionType,
+    strike: float,
+    rebate: float = 0.0,
+    r_curve: DiscountCurve | None = None,
+    q_curve: DiscountCurve | None = None,
+) -> float:
+    eval_date = ql.Date(PRICING_DATE.day, PRICING_DATE.month, PRICING_DATE.year)
+    ql.Settings.instance().evaluationDate = eval_date
+    ql_dc = ql.Actual365Fixed()
+
+    spot_h = ql.QuoteHandle(ql.SimpleQuote(_BARRIER_SPOT))
+
+    if r_curve is not None:
+        rf_h = _ql_curve_from_times(times=r_curve.times, dfs=r_curve.dfs)
+    else:
+        rf_h = ql.YieldTermStructureHandle(ql.FlatForward(eval_date, _BARRIER_RATE, ql_dc))
+
+    if q_curve is not None:
+        div_h = _ql_curve_from_times(times=q_curve.times, dfs=q_curve.dfs)
+    else:
+        div_h = ql.YieldTermStructureHandle(ql.FlatForward(eval_date, _BARRIER_DIV, ql_dc))
+
+    vol_h = ql.BlackVolTermStructureHandle(
+        ql.BlackConstantVol(eval_date, ql.TARGET(), _BARRIER_VOL, ql_dc)
+    )
+    proc = ql.BlackScholesMertonProcess(spot_h, div_h, rf_h, vol_h)
+
+    ql_type = ql.Option.Put if option_type is OptionType.PUT else ql.Option.Call
+    payoff = ql.PlainVanillaPayoff(ql_type, strike)
+    exercise = ql.EuropeanExercise(
+        ql.Date(_BARRIER_MATURITY.day, _BARRIER_MATURITY.month, _BARRIER_MATURITY.year)
+    )
+    bt = _QL_BARRIER_TYPE[(direction, action)]
+    opt = ql.BarrierOption(bt, barrier, rebate, payoff, exercise)
+    opt.setPricingEngine(ql.AnalyticBarrierEngine(proc))
+    return opt.NPV()
+
+
+def _dp_barrier_price(
+    *,
+    direction: BarrierDirection,
+    action: BarrierAction,
+    barrier: float,
+    option_type: OptionType,
+    strike: float,
+    rebate: float = 0.0,
+    rebate_timing: RebateTiming = RebateTiming.AT_HIT,
+    r_curve: DiscountCurve | None = None,
+    q_curve: DiscountCurve | None = None,
+) -> float:
+    ttm = calculate_year_fraction(PRICING_DATE, _BARRIER_MATURITY)
+    rc = r_curve if r_curve is not None else DiscountCurve.flat(_BARRIER_RATE, end_time=ttm)
+    qc = q_curve if q_curve is not None else DiscountCurve.flat(_BARRIER_DIV, end_time=ttm)
+    md = MarketData(PRICING_DATE, rc, currency=CURRENCY)
+    ud = UnderlyingData(
+        initial_value=_BARRIER_SPOT,
+        volatility=_BARRIER_VOL,
+        market_data=md,
+        dividend_curve=qc,
+    )
+    spec = BarrierSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=strike,
+        maturity=_BARRIER_MATURITY,
+        barrier=barrier,
+        direction=direction,
+        action=action,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+    )
+    return OptionValuation(ud, spec, PricingMethod.BSM).present_value()
+
+
+# 8 scenarios covering all 4 barrier types × call/put, mixed flat/non-flat curves
+_BARRIER_SCENARIOS = [
+    # Flat curves
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        0.0,
+        None,
+        None,
+        id="down_out_call_flat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.CALL,
+        105.0,
+        115.0,
+        0.0,
+        None,
+        None,
+        id="up_in_call_flat",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        85.0,
+        0.0,
+        None,
+        None,
+        id="down_in_put_flat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        95.0,
+        125.0,
+        0.0,
+        None,
+        None,
+        id="up_out_put_flat",
+    ),
+    # Non-flat curves
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        105.0,
+        90.0,
+        0.0,
+        *_barrier_nonflat_curves(),
+        id="down_out_put_nonflat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        120.0,
+        0.0,
+        *_barrier_nonflat_curves(),
+        id="up_out_call_nonflat",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.CALL,
+        95.0,
+        80.0,
+        0.0,
+        *_barrier_nonflat_curves(),
+        id="down_in_call_nonflat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        110.0,
+        0.0,
+        *_barrier_nonflat_curves(),
+        id="up_in_put_nonflat",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "direction,action,option_type,strike,barrier,rebate,r_curve,q_curve",
+    _BARRIER_SCENARIOS,
+)
+def test_barrier_analytical_vs_quantlib(
+    direction, action, option_type, strike, barrier, rebate, r_curve, q_curve
+):
+    """European barrier option: DP analytical vs QuantLib analytical."""
+    dp_pv = _dp_barrier_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        rebate=rebate,
+        r_curve=r_curve,
+        q_curve=q_curve,
+    )
+    ql_pv = _ql_barrier_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        rebate=rebate,
+        r_curve=r_curve,
+        q_curve=q_curve,
+    )
+    logger.info(
+        "Barrier %s-%s %s K=%.0f H=%.0f | DP=%.6f QL=%.6f",
+        direction.value,
+        action.value,
+        option_type.value,
+        strike,
+        barrier,
+        dp_pv,
+        ql_pv,
+    )
+    assert np.isclose(dp_pv, ql_pv, rtol=1e-10), f"DP {dp_pv:.6f} vs QL {ql_pv:.6f}"
+
+
+# Rebate tests: KO at-hit (matches QL), KI at-expiry (known small difference)
+_BARRIER_REBATE_SCENARIOS = [
+    # KO at-hit — should match QL exactly
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        3.0,
+        RebateTiming.AT_HIT,
+        None,
+        None,
+        id="down_out_call_rebate_hit_flat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        95.0,
+        125.0,
+        3.0,
+        RebateTiming.AT_HIT,
+        *_barrier_nonflat_curves(),
+        id="up_out_put_rebate_hit_nonflat",
+    ),
+    # KI at-expiry — known ~0.3% difference vs QL
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        85.0,
+        3.0,
+        RebateTiming.AT_EXPIRY,
+        None,
+        None,
+        id="down_in_put_rebate_expiry_flat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.CALL,
+        105.0,
+        115.0,
+        3.0,
+        RebateTiming.AT_EXPIRY,
+        *_barrier_nonflat_curves(),
+        id="up_in_call_rebate_expiry_nonflat",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "direction,action,option_type,strike,barrier,rebate,rebate_timing,r_curve,q_curve",
+    _BARRIER_REBATE_SCENARIOS,
+)
+def test_barrier_rebate_vs_quantlib(
+    direction,
+    action,
+    option_type,
+    strike,
+    barrier,
+    rebate,
+    rebate_timing,
+    r_curve,
+    q_curve,
+):
+    """Barrier rebate pricing: KO at-hit should match QL; KI at-expiry has known diff."""
+    dp_pv = _dp_barrier_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+        r_curve=r_curve,
+        q_curve=q_curve,
+    )
+    ql_pv = _ql_barrier_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        rebate=rebate,
+        r_curve=r_curve,
+        q_curve=q_curve,
+    )
+    # KO at-hit matches QL exactly; KI at-expiry differs because QL mixes
+    # at-hit/at-expiry timing in its complementary rebate calculation.
+    if action is BarrierAction.OUT:
+        tol = 1e-10
+    else:
+        tol = 0.005  # ~0.3–0.4% expected
+    logger.info(
+        "Barrier rebate %s-%s %s K=%.0f H=%.0f R=%.1f | DP=%.6f QL=%.6f",
+        direction.value,
+        action.value,
+        option_type.value,
+        strike,
+        barrier,
+        rebate,
+        dp_pv,
+        ql_pv,
+    )
+    assert np.isclose(dp_pv, ql_pv, rtol=tol), f"DP {dp_pv:.6f} vs QL {ql_pv:.6f}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

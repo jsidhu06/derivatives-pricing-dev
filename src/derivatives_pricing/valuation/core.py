@@ -48,10 +48,11 @@ from .binomial import (
 )
 from .bsm import _BSMEuropeanValuation
 from .asian_analytical import _AnalyticalAsianValuation
+from .barrier_analytical import _AnalyticalBarrierValuation
 from .pde import _FDEuropeanValuation, _FDAmericanValuation
 from ..rates import DiscountCurve
 from ..market_environment import MarketData
-from .contracts import AsianSpec, PayoffSpec, VanillaSpec
+from .contracts import AsianSpec, BarrierSpec, PayoffSpec, VanillaSpec
 from .params import BinomialParams, MonteCarloParams, PDEParams, ValuationParams
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,11 @@ _ASIAN_REGISTRY: dict[tuple[PricingMethod, ExerciseType], type] = {
     (PricingMethod.BINOMIAL, ExerciseType.EUROPEAN): _BinomialAsianValuation,
     (PricingMethod.BINOMIAL, ExerciseType.AMERICAN): _BinomialAsianValuation,
     (PricingMethod.BSM, ExerciseType.EUROPEAN): _AnalyticalAsianValuation,
+}
+
+# Maps (PricingMethod, ExerciseType) → implementation class for barrier option specs.
+_BARRIER_REGISTRY: dict[tuple[PricingMethod, ExerciseType], type] = {
+    (PricingMethod.BSM, ExerciseType.EUROPEAN): _AnalyticalBarrierValuation,
 }
 
 # Maps GreekCalculationMethod → (required PricingMethod, capability_flag_name,
@@ -235,7 +241,7 @@ class OptionValuation:
     def __init__(
         self,
         underlying: UnderlyingData | PathSimulation,
-        spec: VanillaSpec | PayoffSpec | AsianSpec,
+        spec: VanillaSpec | PayoffSpec | AsianSpec | BarrierSpec,
         pricing_method: PricingMethod,
         params: ValuationParams | None = None,
     ) -> None:
@@ -612,7 +618,7 @@ class OptionValuation:
         return self._underlying
 
     @property
-    def spec(self) -> VanillaSpec | PayoffSpec | AsianSpec:
+    def spec(self) -> VanillaSpec | PayoffSpec | AsianSpec | BarrierSpec:
         """Contract specification object for the valued instrument."""
         return self._spec
 
@@ -697,6 +703,15 @@ class OptionValuation:
 
     def _build_impl(self):
         spec = self._spec
+
+        if isinstance(spec, BarrierSpec):
+            impl_cls = _BARRIER_REGISTRY.get((self._pricing_method, spec.exercise_type))
+            if impl_cls is None:
+                raise UnsupportedFeatureError(
+                    f"Barrier options with {spec.exercise_type.name} exercise "
+                    f"do not support {self._pricing_method.name} pricing."
+                )
+            return impl_cls(self)
 
         if isinstance(spec, AsianSpec):
             impl_cls = _ASIAN_REGISTRY.get((self._pricing_method, spec.exercise_type))
@@ -983,13 +998,14 @@ class OptionValuation:
 
         # --- validate explicit choice ---
 
-        # Asian options only support NUMERICAL — no engine-native Greeks.
+        # Asian/Barrier options only support NUMERICAL — no engine-native Greeks.
         if (
-            isinstance(self._spec, AsianSpec)
+            isinstance(self._spec, (AsianSpec, BarrierSpec))
             and greek_calc_method is not GreekCalculationMethod.NUMERICAL
         ):
+            spec_name = "Asian" if isinstance(self._spec, AsianSpec) else "Barrier"
             raise UnsupportedFeatureError(
-                f"Asian options only support GreekCalculationMethod.NUMERICAL "
+                f"{spec_name} options only support GreekCalculationMethod.NUMERICAL "
                 f"(bump-and-revalue), got {greek_calc_method.name}."
             )
 
@@ -1028,8 +1044,8 @@ class OptionValuation:
         grid_capable: bool,
     ) -> GreekCalculationMethod:
         """Choose the best Greek method for the current pricing engine."""
-        # Asian options: no engine-native Greeks implemented — always bump-and-revalue.
-        if isinstance(self._spec, AsianSpec):
+        # Asian/Barrier options: no engine-native Greeks implemented — always bump-and-revalue.
+        if isinstance(self._spec, (AsianSpec, BarrierSpec)):
             return GreekCalculationMethod.NUMERICAL
         if self._pricing_method is PricingMethod.BSM:
             return GreekCalculationMethod.ANALYTICAL
@@ -1136,7 +1152,7 @@ class OptionValuation:
         self,
         *,
         underlying,
-        spec: VanillaSpec | PayoffSpec | AsianSpec | None = None,
+        spec: VanillaSpec | PayoffSpec | AsianSpec | BarrierSpec | None = None,
     ) -> OptionValuation:
         return OptionValuation(
             underlying=underlying,
