@@ -29,6 +29,7 @@ from ..stochastic_processes import PathSimulation, GBMProcess
 from ..exceptions import ConfigurationError, UnsupportedFeatureError, ValidationError
 from ..enums import (
     AsianAveraging,
+    BarrierMonitoring,
     DayCountConvention,
     OptionType,
     ExerciseType,
@@ -40,6 +41,8 @@ from .monte_carlo import (
     _MCAmericanValuation,
     _MCAsianEuropeanValuation,
     _MCAsianAmericanValuation,
+    _MCBarrierEuropeanValuation,
+    _MCBarrierAmericanValuation,
 )
 from .binomial import (
     _BinomialEuropeanValuation,
@@ -82,6 +85,8 @@ _ASIAN_REGISTRY: dict[tuple[PricingMethod, ExerciseType], type] = {
 # Maps (PricingMethod, ExerciseType) → implementation class for barrier option specs.
 _BARRIER_REGISTRY: dict[tuple[PricingMethod, ExerciseType], type] = {
     (PricingMethod.BSM, ExerciseType.EUROPEAN): _AnalyticalBarrierValuation,
+    (PricingMethod.MONTE_CARLO, ExerciseType.EUROPEAN): _MCBarrierEuropeanValuation,
+    (PricingMethod.MONTE_CARLO, ExerciseType.AMERICAN): _MCBarrierAmericanValuation,
 }
 
 # Maps GreekCalculationMethod → (required PricingMethod, capability_flag_name,
@@ -328,6 +333,17 @@ class OptionValuation:
                         sim_config,
                         observation_dates=underlying.observation_dates | extra,
                     )
+
+            # Inject barrier monitoring dates into the copy's sim_config.
+            if isinstance(spec, BarrierSpec):
+                mon_dates = self._barrier_monitoring_dates()
+                if mon_dates is not None:
+                    extra = set(mon_dates) - underlying.observation_dates
+                    if extra:
+                        sim_config = dc_replace(
+                            sim_config,
+                            observation_dates=underlying.observation_dates | extra,
+                        )
 
             underlying = type(underlying)(
                 market_data=underlying.market_data,
@@ -788,6 +804,31 @@ class OptionValuation:
         return tuple(
             pd.date_range(
                 start=averaging_start,
+                end=self.maturity,
+                periods=spec.num_observations,
+            ).to_pydatetime()
+        )
+
+    def _barrier_monitoring_dates(
+        self,
+    ) -> tuple[dt.datetime, ...] | None:
+        """Resolve the barrier monitoring schedule as datetimes.
+
+        Returns ``None`` for continuous monitoring (all grid points are used).
+        """
+        if not isinstance(self._spec, BarrierSpec):
+            raise ConfigurationError("Barrier monitoring schedule requested for non-Barrier spec.")
+
+        spec = self._spec
+        if spec.monitoring is BarrierMonitoring.CONTINUOUS:
+            return None
+
+        if spec.monitoring_dates is not None:
+            return tuple(spec.monitoring_dates)
+
+        return tuple(
+            pd.date_range(
+                start=self.pricing_date,
                 end=self.maturity,
                 periods=spec.num_observations,
             ).to_pydatetime()

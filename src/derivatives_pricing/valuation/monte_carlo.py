@@ -3,17 +3,32 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 import logging
+import datetime as dt
 import numpy as np
 
 from ..utils import calculate_year_fraction, log_timing
-from ..stochastic_processes import PathSimulation
-from ..enums import AsianAveraging, DayCountConvention, OptionType
-from ..exceptions import ConfigurationError, NumericalError, ValidationError
+from ..stochastic_processes import PathSimulation, GBMProcess
+from ..enums import (
+    AsianAveraging,
+    BarrierAction,
+    BarrierDirection,
+    BarrierMonitoring,
+    DayCountConvention,
+    OptionType,
+    RebateTiming,
+)
+from ..exceptions import (
+    ConfigurationError,
+    NumericalError,
+    UnsupportedFeatureError,
+    ValidationError,
+)
 from .params import MonteCarloParams
+from .barrier_analytical import _initial_barrier_state
 
 
 if TYPE_CHECKING:
-    from .core import OptionValuation, AsianSpec
+    from .core import OptionValuation, AsianSpec, BarrierSpec
 
 
 logger = logging.getLogger(__name__)
@@ -1038,3 +1053,604 @@ class _MCAsianAmericanValuation(_MCAsianBase):
 
         df0 = discount_factors[1] / discount_factors[0]
         return df0 * values[1]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Barrier MC helpers
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _brownian_bridge_hit_prob(
+    S_i: np.ndarray,
+    S_next: np.ndarray,
+    barrier: float,
+    sigma: float,
+    dt_step: float,
+    direction: BarrierDirection,
+) -> np.ndarray:
+    """Conditional probability of barrier crossing between two GBM endpoints.
+
+    Uses the Brownian bridge formula for log-normal diffusion.  Given that
+    ``log S`` is Brownian with drift, the maximum (or minimum) between two
+    observed values follows the reflection-principle result.
+
+    Parameters
+    ----------
+    S_i, S_next
+        Spot prices at the start/end of the interval, shape ``(num_paths,)``.
+    barrier
+        Barrier level *H*.
+    sigma
+        Instantaneous volatility.
+    dt_step
+        Year-fraction length of the interval.
+    direction
+        UP or DOWN.
+
+    Returns
+    -------
+    np.ndarray
+        Per-path hit probabilities, shape ``(num_paths,)``, clamped to [0, 1].
+    """
+    p = np.zeros_like(S_i)
+
+    if direction is BarrierDirection.UP:
+        crossed = (S_i >= barrier) | (S_next >= barrier)
+        both_below = ~crossed
+        if np.any(both_below):
+            log_a = np.log(barrier / S_i[both_below])
+            log_b = np.log(barrier / S_next[both_below])
+            p[both_below] = np.exp(-2.0 * log_a * log_b / (sigma**2 * dt_step))
+    else:
+        crossed = (S_i <= barrier) | (S_next <= barrier)
+        both_above = ~crossed
+        if np.any(both_above):
+            log_a = np.log(S_i[both_above] / barrier)
+            log_b = np.log(S_next[both_above] / barrier)
+            p[both_above] = np.exp(-2.0 * log_a * log_b / (sigma**2 * dt_step))
+
+    p[crossed] = 1.0
+    return np.clip(p, 0.0, 1.0)
+
+
+def _resolve_monitoring_indices(
+    time_grid: np.ndarray,
+    spec: BarrierSpec,
+    pricing_date: dt.datetime,
+    day_count_convention: DayCountConvention,
+) -> np.ndarray:
+    """Map barrier monitoring schedule to simulation time-grid indices.
+
+    Parameters
+    ----------
+    time_grid
+        Array of datetime objects from :class:`PathSimulation`.
+    spec
+        Barrier specification with monitoring mode and schedule.
+    pricing_date
+        Valuation date.
+    day_count_convention
+        Convention used by the simulation.
+
+    Returns
+    -------
+    np.ndarray
+        Sorted, deduplicated integer indices into *time_grid*.
+    """
+    import pandas as pd  # local import — not needed elsewhere in module
+
+    if spec.monitoring is BarrierMonitoring.CONTINUOUS:
+        return np.arange(len(time_grid))
+
+    if spec.monitoring_dates is not None:
+        indices = [
+            _resolve_time_index(
+                time_grid,
+                d,
+                "monitoring date",
+                day_count_convention=day_count_convention,
+            )
+            for d in spec.monitoring_dates
+        ]
+    elif spec.num_observations is not None:
+        dates = pd.date_range(
+            start=pricing_date,
+            end=spec.maturity,
+            periods=spec.num_observations,
+        )
+        indices = [
+            _resolve_time_index(
+                time_grid,
+                d.to_pydatetime(),
+                "monitoring date",
+                day_count_convention=day_count_convention,
+            )
+            for d in dates
+        ]
+    else:
+        raise ValidationError(
+            "Discrete barrier monitoring requires num_observations or monitoring_dates."
+        )
+    return np.unique(np.array(indices, dtype=int))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Barrier MC engine classes
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class _MCBarrierBase(_MCValuationBase):
+    """Shared infrastructure for European and American MC barrier valuations."""
+
+    def __init__(self, valuation_ctx: OptionValuation) -> None:
+        super().__init__(valuation_ctx)
+        self.spec: BarrierSpec = valuation_ctx.spec  # type: ignore[assignment]
+        if self.spec.monitoring is BarrierMonitoring.CONTINUOUS and not isinstance(
+            self.underlying, GBMProcess
+        ):
+            raise UnsupportedFeatureError(
+                "Continuous barrier monitoring requires GBMProcess (log-normal paths). "
+                "Use DISCRETE monitoring for non-GBM processes."
+            )
+
+    def _monitoring_idx(self, time_grid: np.ndarray) -> np.ndarray:
+        return _resolve_monitoring_indices(
+            time_grid,
+            self.spec,
+            self.valuation_ctx.pricing_date,
+            self.underlying.day_count_convention,
+        )
+
+
+class _MCBarrierEuropeanValuation(_MCBarrierBase):
+    """European barrier option valuation using Monte Carlo.
+
+    Supports discrete monitoring (pathwise check) and continuous monitoring
+    (Brownian bridge survival-weighting for knock-out, complementary for
+    knock-in).  Rebates are handled for AT_HIT and AT_EXPIRY timing.
+    """
+
+    def solve(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """Simulate paths and compute barrier-adjusted payoffs and rebates.
+
+        Returns
+        -------
+        tuple of (payoff, weight, rebate_pv, ttm)
+            payoff : (num_paths,) undiscounted terminal vanilla payoff
+            weight : (num_paths,) barrier weight (0/1 or survival probability)
+            rebate_pv : (num_paths,) already-discounted rebate PV
+            ttm : float, time-to-maturity in years
+        """
+        paths = self.underlying.simulate(random_seed=self.mc_params.random_seed)
+        time_grid = self.underlying.time_grid
+        time_index_end = _resolve_time_index(
+            time_grid,
+            self.valuation_ctx.maturity,
+            "maturity",
+            day_count_convention=self.underlying.day_count_convention,
+        )
+
+        ttm = self._maturity_year_fraction()
+        K = self.valuation_ctx.strike
+        H = float(self.spec.barrier)
+        direction = self.spec.direction
+        action = self.spec.action
+        sigma = float(self.underlying.volatility)
+        spot0 = float(self.underlying.initial_value)
+        n_paths = paths.shape[1]
+
+        payoff = _vanilla_payoff(self.spec.option_type, K, paths[time_index_end])
+
+        t_grid = _year_fractions(
+            self.valuation_ctx.pricing_date,
+            time_grid,
+            day_count_convention=self.underlying.day_count_convention,
+        )
+        discount_factors = self.valuation_ctx.discount_curve.df(t_grid)
+
+        inception_hit = _initial_barrier_state(spot0, H, direction)
+
+        monitoring_idx = self._monitoring_idx(time_grid)
+        monitoring_idx = monitoring_idx[monitoring_idx <= time_index_end]
+
+        is_continuous = self.spec.monitoring is BarrierMonitoring.CONTINUOUS
+        time_deltas = self.underlying._time_deltas()
+
+        if is_continuous:
+            weight, rebate_pv = self._continuous_weights(
+                paths,
+                time_index_end,
+                time_deltas,
+                discount_factors,
+                H,
+                sigma,
+                direction,
+                action,
+                inception_hit,
+                n_paths,
+            )
+        else:
+            weight, rebate_pv = self._discrete_weights(
+                paths,
+                monitoring_idx,
+                time_index_end,
+                discount_factors,
+                H,
+                direction,
+                action,
+                inception_hit,
+                n_paths,
+            )
+
+        return payoff, weight, rebate_pv, ttm
+
+    def _discrete_weights(
+        self,
+        paths: np.ndarray,
+        monitoring_idx: np.ndarray,
+        time_index_end: int,
+        discount_factors: np.ndarray,
+        H: float,
+        direction: BarrierDirection,
+        action: BarrierAction,
+        inception_hit: bool,
+        n_paths: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Discrete monitoring: pathwise barrier check at monitoring dates."""
+        rebate = float(self.spec.rebate)
+        rebate_timing = self.spec.rebate_timing
+
+        ever_hit = np.zeros(n_paths, dtype=bool)
+        first_hit_step = np.full(n_paths, -1, dtype=int)
+
+        if inception_hit:
+            ever_hit[:] = True
+            first_hit_step[:] = 0
+
+        for idx in monitoring_idx:
+            if idx == 0:
+                continue
+            spots = paths[idx]
+            if direction is BarrierDirection.UP:
+                step_hit = spots >= H
+            else:
+                step_hit = spots <= H
+            newly_hit = step_hit & ~ever_hit
+            first_hit_step[newly_hit] = idx
+            ever_hit |= step_hit
+
+        if action is BarrierAction.OUT:
+            weight = (~ever_hit).astype(float)
+        else:
+            weight = ever_hit.astype(float)
+
+        rebate_pv = np.zeros(n_paths)
+        if rebate > 0.0:
+            if action is BarrierAction.OUT:
+                knocked_out = ever_hit
+                if rebate_timing is RebateTiming.AT_HIT:
+                    hit_mask = knocked_out & (first_hit_step >= 0)
+                    rebate_pv[hit_mask] = rebate * discount_factors[first_hit_step[hit_mask]]
+                else:
+                    rebate_pv[knocked_out] = rebate * float(discount_factors[time_index_end])
+            else:
+                never_in = ~ever_hit
+                rebate_pv[never_in] = rebate * float(discount_factors[time_index_end])
+
+        return weight, rebate_pv
+
+    def _continuous_weights(
+        self,
+        paths: np.ndarray,
+        time_index_end: int,
+        time_deltas: np.ndarray,
+        discount_factors: np.ndarray,
+        H: float,
+        sigma: float,
+        direction: BarrierDirection,
+        action: BarrierAction,
+        inception_hit: bool,
+        n_paths: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Continuous monitoring: Brownian bridge survival-weighting."""
+        rebate = float(self.spec.rebate)
+        rebate_timing = self.spec.rebate_timing
+
+        if inception_hit:
+            if action is BarrierAction.OUT:
+                weight = np.zeros(n_paths)
+            else:
+                weight = np.ones(n_paths)
+            rebate_pv = np.zeros(n_paths)
+            if rebate > 0.0:
+                if action is BarrierAction.OUT and rebate_timing is RebateTiming.AT_HIT:
+                    rebate_pv[:] = rebate
+                elif action is BarrierAction.OUT and rebate_timing is RebateTiming.AT_EXPIRY:
+                    rebate_pv[:] = rebate * float(discount_factors[time_index_end])
+            return weight, rebate_pv
+
+        surv = np.ones(n_paths)
+        rebate_pv = np.zeros(n_paths)
+
+        for t in range(1, time_index_end + 1):
+            dt_t = float(time_deltas[t - 1])
+            p_hit = _brownian_bridge_hit_prob(
+                paths[t - 1],
+                paths[t],
+                H,
+                sigma,
+                dt_t,
+                direction,
+            )
+            p_surv_step = 1.0 - p_hit
+
+            if (
+                rebate > 0.0
+                and action is BarrierAction.OUT
+                and rebate_timing is RebateTiming.AT_HIT
+            ):
+                rebate_pv += surv * p_hit * float(discount_factors[t]) * rebate
+
+            surv *= p_surv_step
+
+        if action is BarrierAction.OUT:
+            weight = surv
+        else:
+            weight = 1.0 - surv
+
+        if rebate > 0.0:
+            if action is BarrierAction.OUT and rebate_timing is RebateTiming.AT_EXPIRY:
+                rebate_pv = (1.0 - surv) * rebate * float(discount_factors[time_index_end])
+            elif action is BarrierAction.IN:
+                rebate_pv = surv * rebate * float(discount_factors[time_index_end])
+
+        return weight, rebate_pv
+
+    def present_value_pathwise(self) -> np.ndarray:
+        """Return per-path discounted barrier option values."""
+        payoff, weight, rebate_pv, ttm = self.solve()
+        df = float(self.valuation_ctx.discount_curve.df(ttm))
+        return df * payoff * weight + rebate_pv
+
+    def present_value(self) -> float:
+        """Calculate PV using Monte Carlo for European barrier option."""
+        with log_timing(logger, "MC Barrier European present_value", self.mc_params.log_timings):
+            pv_pathwise = self.present_value_pathwise()
+            pv = float(np.mean(pv_pathwise))
+        logger.debug(
+            "MC Barrier European paths=%d time_steps=%d",
+            pv_pathwise.size,
+            len(self.underlying.time_grid) - 1,
+        )
+        _warn_if_high_std_error(
+            pv_pathwise=pv_pathwise,
+            pv_mean=pv,
+            params=self.mc_params,
+            label="Barrier European",
+        )
+        return pv
+
+
+class _MCBarrierAmericanValuation(_MCBarrierBase):
+    """American barrier option valuation using Longstaff-Schwartz MC.
+
+    Knock-out: regress on alive+ITM paths; dead paths get zero.
+    Knock-in: regress on active+ITM paths only; inactive paths carry
+    discounted actual continuation pathwise (no separate regression).
+    """
+
+    def solve(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
+        """Generate paths, intrinsic payoffs, and barrier state.
+
+        Returns
+        -------
+        tuple of (spot_paths, intrinsic, ever_hit, first_hit_step,
+                  time_index_start, time_index_end)
+            spot_paths : (num_exercise_dates, num_paths)
+            intrinsic : (num_exercise_dates, num_paths)
+            ever_hit : (num_exercise_dates, num_paths) bool — cumulative hit state
+            first_hit_step : (num_paths,) int — index within window (-1 if never)
+            time_index_start, time_index_end : int
+        """
+        paths = self.underlying.simulate(random_seed=self.mc_params.random_seed)
+        time_grid = self.underlying.time_grid
+        time_index_start = _resolve_time_index(
+            time_grid,
+            self.valuation_ctx.pricing_date,
+            "Pricing date",
+            day_count_convention=self.underlying.day_count_convention,
+        )
+        time_index_end = _resolve_time_index(
+            time_grid,
+            self.valuation_ctx.maturity,
+            "maturity",
+            day_count_convention=self.underlying.day_count_convention,
+        )
+
+        spot_paths = paths[time_index_start : time_index_end + 1]
+        n_times, n_paths = spot_paths.shape
+
+        K = self.valuation_ctx.strike
+        intrinsic = _vanilla_payoff(self.spec.option_type, K, spot_paths)
+
+        H = float(self.spec.barrier)
+        direction = self.spec.direction
+        sigma = float(self.underlying.volatility)
+        spot0 = float(self.underlying.initial_value)
+
+        is_continuous = self.spec.monitoring is BarrierMonitoring.CONTINUOUS
+        time_deltas = self.underlying._time_deltas()
+
+        assert time_index_start == 0, (
+            "time_grid must start at pricing_date; _build_time_grid enforces this"
+        )
+
+        monitoring_idx = self._monitoring_idx(time_grid)
+        monitoring_idx = monitoring_idx[monitoring_idx <= time_index_end]
+
+        # Build cumulative barrier state
+        ever_hit = np.zeros((n_times, n_paths), dtype=bool)
+        first_hit_step = np.full(n_paths, -1, dtype=int)
+
+        if _initial_barrier_state(spot0, H, direction):
+            ever_hit[0] = True
+            first_hit_step[:] = 0
+
+        # Independent RNG for Bernoulli bridge sampling
+        if is_continuous and self.mc_params.random_seed is not None:
+            bridge_rng = np.random.default_rng(
+                np.random.SeedSequence(self.mc_params.random_seed).spawn(1)[0]
+            )
+        elif is_continuous:
+            bridge_rng = np.random.default_rng()
+        else:
+            bridge_rng = None
+
+        monitoring_set = set(monitoring_idx.tolist())
+
+        for t in range(1, n_times):
+            ever_hit[t] = ever_hit[t - 1]
+
+            if not is_continuous and t not in monitoring_set:
+                continue
+
+            spots_prev = spot_paths[t - 1]
+            spots_curr = spot_paths[t]
+
+            if is_continuous:
+                dt_t = float(time_deltas[t - 1])
+                p_hit = _brownian_bridge_hit_prob(
+                    spots_prev,
+                    spots_curr,
+                    H,
+                    sigma,
+                    dt_t,
+                    direction,
+                )
+                assert bridge_rng is not None
+                step_hit = bridge_rng.uniform(size=n_paths) < p_hit
+            else:
+                if direction is BarrierDirection.UP:
+                    step_hit = spots_curr >= H
+                else:
+                    step_hit = spots_curr <= H
+
+            newly_hit = step_hit & ~ever_hit[t]
+            first_hit_step[newly_hit] = t
+            ever_hit[t] |= step_hit
+
+        return spot_paths, intrinsic, ever_hit, first_hit_step, time_index_start, time_index_end
+
+    def present_value_pathwise(self) -> np.ndarray:
+        """Return per-path discounted barrier option values via LSM backward induction."""
+        (
+            spot_paths,
+            intrinsic,
+            ever_hit,
+            first_hit_step,
+            time_index_start,
+            time_index_end,
+        ) = self.solve()
+
+        time_list = self.underlying.time_grid[time_index_start : time_index_end + 1]
+        t_grid = _year_fractions(
+            self.valuation_ctx.pricing_date,
+            time_list,
+            day_count_convention=self.underlying.day_count_convention,
+        )
+        discount_factors = self.valuation_ctx.discount_curve.df(t_grid)
+        n_times, n_paths = spot_paths.shape
+
+        is_ko = self.spec.action is BarrierAction.OUT
+        rebate = float(self.spec.rebate)
+        rebate_timing = self.spec.rebate_timing
+
+        values = np.zeros((n_times, n_paths))
+
+        # Terminal payoff
+        if is_ko:
+            alive_T = ~ever_hit[-1]
+            values[-1] = intrinsic[-1] * alive_T.astype(float)
+            if rebate > 0.0 and rebate_timing is RebateTiming.AT_EXPIRY:
+                values[-1] += rebate * (~alive_T).astype(float)
+        else:
+            active_T = ever_hit[-1]
+            values[-1] = intrinsic[-1] * active_T.astype(float)
+            if rebate > 0.0:
+                values[-1] += rebate * (~active_T).astype(float)
+
+        # Backward induction
+        for t in range(n_times - 2, 0, -1):
+            df_step = discount_factors[t + 1] / discount_factors[t]
+
+            if is_ko:
+                alive = ~ever_hit[t]
+                itm = (intrinsic[t] > 0) & alive
+
+                continuation = _ridge_lsm_continuation(
+                    S_t=spot_paths[t],
+                    Y=df_step * values[t + 1],
+                    itm=itm,
+                    strike=self.valuation_ctx.strike,
+                    deg=self.mc_params.deg,
+                    ridge_lambda=self.mc_params.ridge_lambda,
+                    min_itm=self.mc_params.min_itm,
+                )
+
+                values[t] = np.where(
+                    alive & (intrinsic[t] > continuation),
+                    intrinsic[t],
+                    np.where(alive, df_step * values[t + 1], 0.0),
+                )
+            else:
+                active = ever_hit[t]
+                itm_active = (intrinsic[t] > 0) & active
+
+                continuation = _ridge_lsm_continuation(
+                    S_t=spot_paths[t],
+                    Y=df_step * values[t + 1],
+                    itm=itm_active,
+                    strike=self.valuation_ctx.strike,
+                    deg=self.mc_params.deg,
+                    ridge_lambda=self.mc_params.ridge_lambda,
+                    min_itm=self.mc_params.min_itm,
+                )
+
+                values[t] = np.where(
+                    active & (intrinsic[t] > continuation),
+                    intrinsic[t],
+                    df_step * values[t + 1],
+                )
+
+        df0 = discount_factors[1] / discount_factors[0]
+        pv_pathwise = df0 * values[1]
+
+        # KO AT_HIT rebate for dead paths
+        if is_ko and rebate > 0.0 and rebate_timing is RebateTiming.AT_HIT:
+            hit_mask = first_hit_step >= 0
+            pv_pathwise[hit_mask] += rebate * discount_factors[first_hit_step[hit_mask]]
+
+        return pv_pathwise
+
+    def present_value(self) -> float:
+        """Calculate PV using Longstaff-Schwartz MC for American barrier option."""
+        with log_timing(logger, "MC Barrier American present_value", self.mc_params.log_timings):
+            pv_pathwise = self.present_value_pathwise()
+            pv = float(np.mean(pv_pathwise))
+        logger.debug(
+            "MC Barrier American paths=%d time_steps=%d deg=%d",
+            pv_pathwise.size,
+            len(self.underlying.time_grid) - 1,
+            self.mc_params.deg,
+        )
+        _warn_if_high_std_error(
+            pv_pathwise=pv_pathwise,
+            pv_mean=pv,
+            params=self.mc_params,
+            label="Barrier American",
+        )
+        return pv
