@@ -314,6 +314,11 @@ class OptionValuation:
                 f"got {type(underlying).__name__}."
             )
 
+        # Assign early so helper methods (_asian_fixing_dates,
+        # _barrier_monitoring_dates) can access self.pricing_date etc.
+        # Overwritten below with the defensive copy for PathSimulation.
+        self._underlying = underlying
+
         # Defensive copy: PathSimulation carries mutable simulation state
         # (time_grid, _last_normals) that is written during simulate().
         # Copying for thread-safety
@@ -322,7 +327,7 @@ class OptionValuation:
 
             # Inject Asian observation dates into the copy's sim_config.
             if isinstance(spec, AsianSpec):
-                fixing_dates = self._asian_fixing_dates(underlying.pricing_date)
+                fixing_dates = self._asian_fixing_dates()
                 if fixing_dates[0] < underlying.pricing_date:
                     raise ValidationError(
                         "Asian fixing schedule must not start before pricing_date."
@@ -345,7 +350,7 @@ class OptionValuation:
                             observation_dates=underlying.observation_dates | extra,
                         )
 
-            underlying = type(underlying)(
+            self._underlying = type(underlying)(
                 market_data=underlying.market_data,
                 process_params=underlying._process_params,
                 sim_config=sim_config,
@@ -354,11 +359,9 @@ class OptionValuation:
             )
 
         elif isinstance(spec, AsianSpec):
-            fixing_dates = self._asian_fixing_dates(underlying.pricing_date)
+            fixing_dates = self._asian_fixing_dates()
             if fixing_dates[0] < underlying.pricing_date:
                 raise ValidationError("Asian fixing schedule must not start before pricing_date.")
-
-        self._underlying = underlying
 
         # Dispatch to appropriate pricing method implementation
         self._impl = self._build_impl()
@@ -787,9 +790,7 @@ class OptionValuation:
             f"pricing_method={pricing_method.name} does not accept valuation params"
         )
 
-    def _asian_fixing_dates(
-        self, pricing_date: dt.datetime | None = None
-    ) -> tuple[dt.datetime, ...]:
+    def _asian_fixing_dates(self) -> tuple[dt.datetime, ...]:
         """Resolve the contractual Asian fixing schedule as datetimes."""
         if not isinstance(self._spec, AsianSpec):
             raise ConfigurationError("Asian fixing schedule requested for non-Asian spec.")
@@ -799,7 +800,7 @@ class OptionValuation:
             return tuple(spec.fixing_dates)
 
         assert spec.num_observations is not None
-        averaging_start = spec.averaging_start or (pricing_date or self.pricing_date)
+        averaging_start = spec.averaging_start or self.pricing_date
 
         return tuple(
             pd.date_range(
@@ -809,9 +810,7 @@ class OptionValuation:
             ).to_pydatetime()
         )
 
-    def _barrier_monitoring_dates(
-        self,
-    ) -> tuple[dt.datetime, ...] | None:
+    def _barrier_monitoring_dates(self) -> tuple[dt.datetime, ...] | None:
         """Resolve the barrier monitoring schedule as datetimes.
 
         Returns ``None`` for continuous monitoring (all grid points are used).
