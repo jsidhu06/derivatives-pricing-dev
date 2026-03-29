@@ -36,7 +36,18 @@ except ModuleNotFoundError:  # pragma: no cover
         return lambda fn: fn
 
 
-from ..enums import DayCountConvention, PDEEarlyExercise, PDEMethod, PDESpaceGrid, OptionType
+from ..enums import (
+    BarrierAction,
+    BarrierDirection,
+    BarrierMonitoring,
+    DayCountConvention,
+    ExerciseType,
+    PDEEarlyExercise,
+    PDEMethod,
+    PDESpaceGrid,
+    OptionType,
+    RebateTiming,
+)
 from ..rates import DiscountCurve
 from ..utils import calculate_year_fraction, log_timing
 from ..exceptions import (
@@ -45,7 +56,7 @@ from ..exceptions import (
     UnsupportedFeatureError,
     ValidationError,
 )
-from .contracts import PayoffSpec, PayoffBoundaryModel, WingBoundary
+from .contracts import BarrierSpec, PayoffSpec, PayoffBoundaryModel, WingBoundary
 from .params import PDEParams
 
 if TYPE_CHECKING:
@@ -1260,3 +1271,570 @@ class _FDAmericanValuation(_FDValuationBase):
     """American option valuation using PDE finite differences."""
 
     _early_exercise = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Barrier option PDE
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _barrier_monitoring_taus(
+    *,
+    monitoring_dates: Sequence[dt.datetime],
+    pricing_date: dt.datetime,
+    maturity: dt.datetime,
+    day_count_convention: DayCountConvention,
+) -> list[float]:
+    """Convert monitoring datetime schedule to tau-space values.
+
+    Returns sorted list of taus (time remaining from maturity perspective).
+    """
+    ttm = calculate_year_fraction(
+        pricing_date,
+        maturity,
+        day_count_convention=day_count_convention,
+    )
+    taus: list[float] = []
+    for d in monitoring_dates:
+        if pricing_date <= d <= maturity:
+            t = calculate_year_fraction(
+                pricing_date,
+                d,
+                day_count_convention=day_count_convention,
+            )
+            taus.append(round(ttm - t, 12))
+    taus.sort()
+    return taus
+
+
+def _fd_barrier_core(
+    *,
+    spot: float,
+    strike: float,
+    time_to_maturity: float,
+    volatility: float,
+    discount_curve: DiscountCurve,
+    dividend_curve: DiscountCurve | None,
+    dividend_schedule: list[tuple[float, float]] | None,
+    option_type: OptionType,
+    barrier: float,
+    direction: BarrierDirection,
+    action: BarrierAction,
+    monitoring: BarrierMonitoring,
+    rebate: float,
+    rebate_timing: RebateTiming,
+    monitoring_taus: list[float] | None,  # required (non-None) for DISCRETE
+    smax_mult: float,
+    spot_steps: int,
+    time_steps: int,
+    early_exercise: bool,
+    method: PDEMethod,
+    rannacher_steps: int,
+    space_grid: PDESpaceGrid,
+    american_solver: PDEEarlyExercise,
+    omega: float | None = None,
+    tol: float | None = None,
+    max_iter: int | None = None,
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
+    """Core finite-difference solver for barrier options.
+
+    For continuous knock-out barriers, the grid is truncated at the barrier
+    level so the barrier becomes a domain boundary.
+
+    For discrete knock-out barriers, the full grid is used and barrier
+    resets are applied at monitoring dates (analogous to dividend jumps).
+
+    Knock-in options are NOT handled here — they should be computed via
+    in-out parity at the caller level.
+
+    Returns
+    -------
+    tuple[float, np.ndarray, np.ndarray, np.ndarray, float]
+        ``(price, spot_grid, V_final, V_prev, last_dtau)``
+    """
+    if action is BarrierAction.IN:
+        raise UnsupportedFeatureError(
+            "_fd_barrier_core only handles knock-out barriers. "
+            "Knock-ins should use in-out parity at the caller level."
+        )
+
+    _validate_fd_inputs(
+        option_type=option_type,
+        time_to_maturity=time_to_maturity,
+        spot_steps=spot_steps,
+        time_steps=time_steps,
+        volatility=volatility,
+        discount_curve=discount_curve,
+        early_exercise=early_exercise,
+        method=method,
+        american_solver=american_solver,
+        omega=omega,
+        tol=tol,
+        max_iter=max_iter,
+    )
+
+    continuous = monitoring is BarrierMonitoring.CONTINUOUS
+
+    if not continuous and monitoring_taus is None:
+        raise ConfigurationError("monitoring_taus is required for discrete barrier monitoring.")
+
+    # ── Grid construction ─────────────────────────────────────────────
+    # For continuous KO, truncate the grid at the barrier.
+    # For discrete KO, use the standard full grid.
+    ref_price = max(spot, strike)
+
+    if continuous:
+        if direction is BarrierDirection.DOWN:
+            smin_target = barrier
+            smax_target = smax_mult * ref_price
+        else:
+            smin_target = max(ref_price / smax_mult, 1.0e-8)
+            smax_target = barrier
+    else:
+        smin_target = None
+        smax_target = None
+
+    if space_grid is PDESpaceGrid.LOG_SPOT:
+        if continuous:
+            # Build log grid with barrier as a boundary
+            dz_hull = volatility * np.sqrt(3.0 * (time_to_maturity / time_steps))
+            if direction is BarrierDirection.DOWN:
+                zmin = np.log(smin_target)
+                zmax_default = np.log(smax_target)
+                grid_width = spot_steps * dz_hull
+                if (zmax_default - zmin) > grid_width:
+                    dz = (zmax_default - zmin) / spot_steps
+                else:
+                    dz = dz_hull
+                    zmax_default = zmin + grid_width
+                Z = np.linspace(zmin, zmax_default, spot_steps + 1)
+            else:
+                zmax = np.log(smax_target)
+                zmin_default = np.log(max(ref_price / smax_mult, 1.0e-8))
+                grid_width = spot_steps * dz_hull
+                if (zmax - zmin_default) > grid_width:
+                    dz = (zmax - zmin_default) / spot_steps
+                else:
+                    dz = dz_hull
+                    zmin_default = zmax - grid_width
+                Z = np.linspace(zmin_default, zmax, spot_steps + 1)
+            S = np.exp(Z)
+            grid = Z
+        else:
+            grid, S, dz = _build_log_grid(
+                spot=spot,
+                strike=strike,
+                time_to_maturity=time_to_maturity,
+                volatility=volatility,
+                smax_mult=smax_mult,
+                spot_steps=spot_steps,
+                time_steps=time_steps,
+            )
+    else:
+        # Spot grid
+        if continuous:
+            grid = np.linspace(smin_target, smax_target, spot_steps + 1)
+            S = grid
+            dS = (smax_target - smin_target) / spot_steps
+        else:
+            smax = float(smax_mult * ref_price)
+            grid = np.linspace(0.0, smax, spot_steps + 1)
+            S = grid
+            dS = smax / spot_steps
+
+    smin = float(S[0])
+    smax = float(S[-1])
+
+    j = np.arange(1, spot_steps)  # interior indices
+
+    # ── Terminal payoff ───────────────────────────────────────────────
+    if option_type is OptionType.PUT:
+        payoff = np.maximum(strike - S, 0.0)
+    else:
+        payoff = np.maximum(S - strike, 0.0)
+
+    # For continuous KO: payoff is zero on the barrier side (already
+    # enforced by grid truncation since the barrier is at the boundary).
+    # For discrete KO: zero out the payoff on the knocked-out side at maturity
+    # only if maturity is a monitoring date (which it typically is).
+    if not continuous:
+        assert monitoring_taus is not None  # validated above
+        # tau=0 is maturity; if it's a monitoring tau, apply the reset
+        if any(abs(tau) < 1e-12 for tau in monitoring_taus):
+            if direction is BarrierDirection.DOWN:
+                payoff[S <= barrier] = 0.0
+            else:
+                payoff[S >= barrier] = 0.0
+
+    V = payoff.copy()
+    intrinsic = payoff if early_exercise else None
+
+    # ── Dividend schedule ─────────────────────────────────────────────
+    schedule = dividend_schedule or []
+    dividend_map = {round(tau, 12): amount for tau, amount in schedule}
+    mat_div = dividend_map.pop(0.0, None)
+    if mat_div is not None:
+        _apply_dividend_jump(V, grid, mat_div, space_grid=space_grid)
+        if early_exercise:
+            V[:] = np.maximum(V, payoff)
+
+    ttm_key = round(time_to_maturity, 12)
+    pricing_div = dividend_map.pop(ttm_key, None)
+
+    # ── Merge monitoring taus into grid ───────────────────────────────
+    dividend_taus = list(dividend_map.keys())
+    all_extra_taus = dividend_taus.copy()
+    monitoring_tau_set: set[float] | None = None
+    if not continuous:
+        assert monitoring_taus is not None  # validated above
+        all_extra_taus.extend(monitoring_taus)
+        monitoring_tau_set = {round(t, 12) for t in monitoring_taus}
+
+    tau_grid = _build_tau_grid(time_to_maturity, time_steps, all_extra_taus)
+
+    if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL) and space_grid is PDESpaceGrid.SPOT:
+        _check_explicit_spot_stability(
+            tau_grid=tau_grid,
+            volatility=volatility,
+            smax=smax,
+            dS=dS if space_grid is PDESpaceGrid.SPOT else (smax - smin) / spot_steps,
+            time_to_maturity=time_to_maturity,
+            discount_curve=discount_curve,
+            dividend_curve=dividend_curve,
+            hull_discounting=method is PDEMethod.EXPLICIT_HULL,
+        )
+
+    # ── Time-stepping ─────────────────────────────────────────────────
+    df_0T = float(discount_curve.df(time_to_maturity))
+    if dividend_curve is not None:
+        dq_0T = float(dividend_curve.df(time_to_maturity))
+    else:
+        dq_0T = None
+
+    psor_steps = 0
+    psor_total_iters = 0
+    psor_max_iters = 0
+    psor_not_converged = 0
+
+    steps = _build_time_step_schedule(tau_grid, method, rannacher_steps)
+
+    V_prev = V.copy()
+    last_dtau = 0.0
+
+    for tau_prev, tau_curr, method_used in steps:
+        d_tau = tau_curr - tau_prev
+        t_prev = time_to_maturity - tau_prev
+        t_curr = time_to_maturity - tau_curr
+
+        r = float(discount_curve.forward_rate(t_curr, t_prev))
+        if dividend_curve is not None:
+            q = float(dividend_curve.forward_rate(t_curr, t_prev))
+        else:
+            q = 0.0
+
+        hull_discounting = method_used is PDEMethod.EXPLICIT_HULL
+
+        if space_grid is PDESpaceGrid.SPOT:
+            gamma, beta, alpha = _spot_operator_coeffs(
+                spot_values=S[1:-1],
+                dS=(smax - smin) / spot_steps,
+                risk_free_rate=r,
+                dividend_rate=q,
+                volatility=volatility,
+                hull_discounting=hull_discounting,
+            )
+        else:
+            gamma, beta, alpha = _log_operator_coeffs(
+                dz=dz,
+                risk_free_rate=r,
+                dividend_rate=q,
+                volatility=volatility,
+                hull_discounting=hull_discounting,
+                size=spot_steps - 1,
+            )
+
+        # ── Barrier boundary conditions ───────────────────────────────
+        df_0t = float(discount_curve.df(t_curr))
+        df_tT: float = df_0T / df_0t
+        if dividend_curve is not None:
+            dq_0t = float(dividend_curve.df(t_curr))
+            dq_tT: float = dq_0T / dq_0t  # type: ignore[operator]
+        else:
+            dq_tT = 1.0
+
+        if continuous:
+            # Barrier is at a grid boundary; set its value
+            if rebate == 0.0:
+                barrier_bv = 0.0
+            elif rebate_timing is RebateTiming.AT_HIT:
+                barrier_bv = rebate
+            else:
+                # AT_EXPIRY: discounted from current time to maturity
+                barrier_bv = rebate * df_tT
+
+            if direction is BarrierDirection.DOWN:
+                # Barrier at left boundary, vanilla far-field at right
+                left = barrier_bv
+                if option_type is OptionType.PUT:
+                    right = 0.0
+                else:
+                    continuation = smax * dq_tT - strike * df_tT
+                    intrinsic_bv = smax - strike
+                    right = (
+                        max(continuation, intrinsic_bv)
+                        if early_exercise
+                        else max(continuation, 0.0)
+                    )
+            else:
+                # Barrier at right boundary, vanilla far-field at left
+                right = barrier_bv
+                if option_type is OptionType.PUT:
+                    left = strike if early_exercise else strike * df_tT
+                else:
+                    left = 0.0
+        else:
+            # Discrete monitoring: standard vanilla boundaries
+            left, right = _boundary_values(
+                option_type=option_type,
+                strike=strike,
+                smin=smin,
+                smax=smax,
+                df_tT=df_tT,
+                dq_tT=dq_tT,
+                early_exercise=early_exercise,
+            )
+
+        V_prev = V.copy()
+        last_dtau = d_tau
+
+        a, b, c = _scaled_operator_coeffs(gamma=gamma, beta=beta, alpha=alpha, d_tau=d_tau)
+
+        intrinsic_for_step = intrinsic if early_exercise else None
+
+        if method_used in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
+            V = _explicit_step(
+                V_prev,
+                j,
+                a,
+                b,
+                c,
+                left,
+                right,
+                intrinsic_for_step,
+                r_dt=r * d_tau if hull_discounting else 0.0,
+            )
+        else:
+            V, psor_iters = _implicit_cn_step(
+                V_prev,
+                V,
+                j,
+                a,
+                b,
+                c,
+                left,
+                right,
+                method_used,
+                intrinsic_for_step,
+                american_solver,
+                omega,
+                tol,
+                max_iter,
+            )
+            if psor_iters is not None:
+                psor_steps += 1
+                psor_total_iters += psor_iters
+                psor_max_iters = max(psor_max_iters, psor_iters)
+                if psor_iters == int(max_iter):
+                    psor_not_converged += 1
+
+        # ── Discrete dividend jump ────────────────────────────────────
+        if dividend_map:
+            amount = dividend_map.get(round(tau_curr, 12))
+            if amount is not None:
+                _apply_dividend_jump(V, grid, amount, space_grid=space_grid)
+                if early_exercise:
+                    V[:] = np.maximum(V, intrinsic)
+
+        # ── Discrete barrier reset ────────────────────────────────────
+        if monitoring_tau_set is not None:
+            tau_key = round(tau_curr, 12)
+            if tau_key in monitoring_tau_set:
+                if rebate == 0.0:
+                    reset_val = 0.0
+                elif rebate_timing is RebateTiming.AT_HIT:
+                    reset_val = rebate
+                else:
+                    reset_val = rebate * df_tT
+                if direction is BarrierDirection.DOWN:
+                    V[S <= barrier] = reset_val
+                else:
+                    V[S >= barrier] = reset_val
+                # Re-enforce early exercise on surviving nodes
+                if early_exercise and intrinsic is not None:
+                    alive = S > barrier if direction is BarrierDirection.DOWN else S < barrier
+                    mask = alive & (intrinsic > V)
+                    V[mask] = intrinsic[mask]
+
+    if psor_steps > 0:
+        avg_iters = psor_total_iters / psor_steps
+        logger.debug(
+            "PDE barrier PSOR steps=%d avg_iters=%.2f max_iters=%d not_converged=%d",
+            psor_steps,
+            avg_iters,
+            psor_max_iters,
+            psor_not_converged,
+        )
+
+    interp_spot = spot - pricing_div if pricing_div is not None else spot
+    price = float(np.interp(interp_spot, S, V))
+    return price, S, V, V_prev, last_dtau
+
+
+class _FDBarrierValuation(_FDGridGreeksMixin):
+    """PDE finite-difference valuation for barrier options.
+
+    Supports:
+    - Continuous and discrete knock-out (European and American)
+    - Continuous and discrete knock-in via in-out parity (European only)
+    - Rebates (at-hit and at-expiry)
+
+    American knock-ins are not supported (requires coupled PDE surfaces).
+    """
+
+    def __init__(self, valuation_ctx: OptionValuation) -> None:
+        self.valuation_ctx = valuation_ctx
+        self.underlying = valuation_ctx.underlying  # type: ignore[assignment]
+        self._spec: BarrierSpec = valuation_ctx.spec  # type: ignore[assignment]
+
+        if not isinstance(self._spec, BarrierSpec):
+            raise ConfigurationError("_FDBarrierValuation requires a BarrierSpec.")
+
+        if (
+            self._spec.action is BarrierAction.IN
+            and self._spec.exercise_type is ExerciseType.AMERICAN
+        ):
+            raise UnsupportedFeatureError(
+                "American knock-in barriers via PDE are not yet supported. "
+                "They require coupled active/inactive PDE surfaces."
+            )
+
+    def _ko_solve_args(self) -> dict:
+        """Build keyword arguments for _fd_barrier_core (knock-out)."""
+        params = self.valuation_ctx.params
+        if not isinstance(params, PDEParams):
+            raise ConfigurationError("PDE valuation requires PDEParams on OptionValuation")
+
+        spec = self._spec
+        ctx = self.valuation_ctx
+        early_exercise = spec.exercise_type is ExerciseType.AMERICAN
+
+        time_to_maturity = calculate_year_fraction(
+            ctx.pricing_date,
+            ctx.maturity,
+            day_count_convention=ctx.day_count_convention,
+        )
+
+        dividend_schedule = _dividend_tau_schedule(
+            discrete_dividends=self.underlying.discrete_dividends,
+            pricing_date=ctx.pricing_date,
+            maturity=ctx.maturity,
+            day_count_convention=ctx.day_count_convention,
+        )
+
+        # Resolve monitoring dates to taus
+        monitoring_taus: list[float] | None = None
+        if spec.monitoring is BarrierMonitoring.DISCRETE:
+            mon_dates = ctx._barrier_monitoring_dates()
+            monitoring_taus = _barrier_monitoring_taus(
+                monitoring_dates=mon_dates,
+                pricing_date=ctx.pricing_date,
+                maturity=ctx.maturity,
+                day_count_convention=ctx.day_count_convention,
+            )
+
+        return dict(
+            spot=float(self.underlying.initial_value),
+            strike=float(spec.strike),
+            time_to_maturity=float(time_to_maturity),
+            volatility=float(self.underlying.volatility),
+            discount_curve=ctx.discount_curve,
+            dividend_curve=self.underlying.dividend_curve,
+            dividend_schedule=dividend_schedule,
+            option_type=spec.option_type,
+            barrier=float(spec.barrier),
+            direction=spec.direction,
+            action=BarrierAction.OUT,  # always KO for the core solver
+            monitoring=spec.monitoring,
+            rebate=float(spec.rebate),
+            rebate_timing=spec.rebate_timing,
+            monitoring_taus=monitoring_taus,
+            smax_mult=float(params.smax_mult),
+            spot_steps=int(params.spot_steps),
+            time_steps=int(params.time_steps),
+            early_exercise=early_exercise,
+            method=params.method,
+            rannacher_steps=int(params.rannacher_steps),
+            space_grid=params.space_grid,
+            american_solver=(
+                params.american_solver if early_exercise else PDEEarlyExercise.INTRINSIC
+            ),
+            omega=float(params.omega) if early_exercise else None,
+            tol=float(params.tol) if early_exercise else None,
+            max_iter=int(params.max_iter) if early_exercise else None,
+        )
+
+    def _solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
+        """Run the PDE solve, handling KI via parity if needed."""
+        spec = self._spec
+
+        if spec.action is BarrierAction.OUT:
+            return _fd_barrier_core(**self._ko_solve_args())
+
+        # Knock-in via parity: V_KI = V_vanilla + R * df_T - V_KO(with R AT_EXPIRY)
+        # When R=0 this reduces to V_vanilla - V_KO.
+        ko_args = self._ko_solve_args()
+        ko_price, S_ko, V_ko, V_ko_prev, last_dtau_ko = _fd_barrier_core(**ko_args)
+
+        # Vanilla solve (same parameters, no barrier)
+        van_price, S_van, V_van, V_van_prev, last_dtau_van = _fd_core(
+            spot=ko_args["spot"],
+            strike=ko_args["strike"],
+            time_to_maturity=ko_args["time_to_maturity"],
+            volatility=ko_args["volatility"],
+            discount_curve=ko_args["discount_curve"],
+            dividend_curve=ko_args["dividend_curve"],
+            dividend_schedule=ko_args["dividend_schedule"],
+            option_type=spec.option_type,
+            smax_mult=ko_args["smax_mult"],
+            spot_steps=ko_args["spot_steps"],
+            time_steps=ko_args["time_steps"],
+            early_exercise=False,  # European parity
+            method=ko_args["method"],
+            rannacher_steps=ko_args["rannacher_steps"],
+            space_grid=ko_args["space_grid"],
+            american_solver=PDEEarlyExercise.INTRINSIC,
+        )
+
+        df_T = float(ko_args["discount_curve"].df(ko_args["time_to_maturity"]))
+        ki_price = van_price + spec.rebate * df_T - ko_price
+
+        # For grid greeks we return the KO grid (best we can do)
+        V_ki = np.interp(S_ko, S_van, V_van) - V_ko
+        V_ki_prev = np.interp(S_ko, S_van, V_van_prev) - V_ko_prev
+        return ki_price, S_ko, V_ki, V_ki_prev, last_dtau_ko
+
+    def solve(self) -> tuple[float, np.ndarray, np.ndarray]:
+        """Compute the full FD solution."""
+        pv, S, V, *_ = self._solve()
+        return pv, S, V
+
+    def present_value(self) -> float:
+        """Return present value from the PDE barrier solve."""
+        params = self.valuation_ctx.params
+        if not isinstance(params, PDEParams):
+            raise ConfigurationError("PDE valuation requires PDEParams on OptionValuation")
+        spec = self._spec
+        label = f"PDE barrier {'American' if spec.exercise_type is ExerciseType.AMERICAN else 'European'}"
+        with log_timing(logger, f"{label} present_value", params.log_timings):
+            pv, *_ = self._solve()
+        return float(pv)

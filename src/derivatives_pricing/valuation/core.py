@@ -52,7 +52,7 @@ from .binomial import (
 from .bsm import _BSMEuropeanValuation
 from .asian_analytical import _AnalyticalAsianValuation
 from .barrier_analytical import _AnalyticalBarrierValuation
-from .pde import _FDEuropeanValuation, _FDAmericanValuation
+from .pde import _FDEuropeanValuation, _FDAmericanValuation, _FDBarrierValuation
 from ..rates import DiscountCurve
 from ..market_environment import MarketData
 from .contracts import AsianSpec, BarrierSpec, PayoffSpec, VanillaSpec
@@ -87,6 +87,8 @@ _BARRIER_REGISTRY: dict[tuple[PricingMethod, ExerciseType], type] = {
     (PricingMethod.BSM, ExerciseType.EUROPEAN): _AnalyticalBarrierValuation,
     (PricingMethod.MONTE_CARLO, ExerciseType.EUROPEAN): _MCBarrierEuropeanValuation,
     (PricingMethod.MONTE_CARLO, ExerciseType.AMERICAN): _MCBarrierAmericanValuation,
+    (PricingMethod.PDE_FD, ExerciseType.EUROPEAN): _FDBarrierValuation,
+    (PricingMethod.PDE_FD, ExerciseType.AMERICAN): _FDBarrierValuation,
 }
 
 # Maps GreekCalculationMethod → (required PricingMethod, capability_flag_name,
