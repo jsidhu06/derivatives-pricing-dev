@@ -1071,7 +1071,7 @@ def _dp_barrier_pde_price(
 
 _BARRIER_MC_PATHS = 150_000
 _BARRIER_MC_STEPS = 200
-_BARRIER_MC_CFG = MonteCarloParams(random_seed=42, deg=3)
+_BARRIER_MC_CFG = MonteCarloParams(random_seed=42, deg=3, barrier_aware_basis=True)
 
 
 def _dp_barrier_mc_price(
@@ -1246,7 +1246,7 @@ _BARRIER_SCENARIOS = [
     "direction,action,option_type,strike,barrier,rebate,r_curve,q_curve",
     _BARRIER_SCENARIOS,
 )
-def test_barrier_analytical_vs_quantlib(
+def test_barrier_european_vs_quantlib(
     direction, action, option_type, strike, barrier, rebate, r_curve, q_curve
 ):
     """European barrier option: DP analytical, PDE, and MC vs QuantLib.
@@ -1396,7 +1396,7 @@ _BARRIER_REBATE_SCENARIOS = [
     "direction,action,option_type,strike,barrier,rebate,rebate_timing,r_curve,q_curve",
     _BARRIER_REBATE_SCENARIOS,
 )
-def test_barrier_rebate_vs_quantlib(
+def test_barrier_rebate_european_vs_quantlib(
     direction,
     action,
     option_type,
@@ -1542,7 +1542,7 @@ _BARRIER_AMERICAN_KO_SCENARIOS = [
     "direction,action,option_type,strike,barrier,rebate",
     _BARRIER_AMERICAN_KO_SCENARIOS,
 )
-def test_barrier_american_ko_pde_vs_quantlib(
+def test_barrier_american_ko_vs_quantlib(
     direction,
     action,
     option_type,
@@ -1591,9 +1591,144 @@ def test_barrier_american_ko_pde_vs_quantlib(
         mc_pv,
         ql_pv,
     )
+    assert np.isclose(pde_pv, ql_pv, rtol=0.02), f"PDE {pde_pv:.6f} vs QL {ql_pv:.6f}"
+    # LSM shows larger downward bias when the KO barrier cuts into the payoff region.
+    mc_tol = (
+        0.08
+        if (
+            (direction is BarrierDirection.UP and option_type is OptionType.CALL)
+            or (direction is BarrierDirection.DOWN and option_type is OptionType.PUT)
+        )
+        else 0.03
+    )
+    if mc_tol == 0.08:
+        logger.info(
+            "American KO MC tolerance widened to %.2f%% because LSM downward bias is expected when "
+            "the KO barrier cuts into the payoff region.",
+            mc_tol * 100,
+        )
+    assert np.isclose(mc_pv, ql_pv, rtol=mc_tol), f"MC {mc_pv:.6f} vs QL {ql_pv:.6f}"
+
+
+# ── American knock-in barrier: PDE (two-surface) vs QL BinomialCRR ────────
+
+_BARRIER_AMERICAN_KI_SCENARIOS = [
+    # Down-and-in
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        0.0,
+        id="am_down_in_call_flat",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        85.0,
+        0.0,
+        id="am_down_in_put_flat",
+    ),
+    # Up-and-in
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.CALL,
+        100.0,
+        120.0,
+        0.0,
+        id="am_up_in_call_flat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        0.0,
+        id="am_up_in_put_flat",
+    ),
+    # With rebate (AT_EXPIRY for KI)
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        5.0,
+        id="am_down_in_call_rebate",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        5.0,
+        id="am_up_in_put_rebate",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "direction,action,option_type,strike,barrier,rebate",
+    _BARRIER_AMERICAN_KI_SCENARIOS,
+)
+def test_barrier_american_ki_vs_quantlib(
+    direction,
+    action,
+    option_type,
+    strike,
+    barrier,
+    rebate,
+):
+    """American KI barrier: DP PDE (two-surface) and MC vs QL BinomialCRR."""
+    pde_pv = _dp_barrier_pde_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        exercise_type=ExerciseType.AMERICAN,
+        rebate=rebate,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
+    mc_pv = _dp_barrier_mc_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        exercise_type=ExerciseType.AMERICAN,
+        rebate=rebate,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
+
+    ql_pv = _ql_barrier_american_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        rebate=rebate,
+    )
+    logger.info(
+        "American KI %s-%s %s K=%.0f H=%.0f R=%.1f | PDE=%.6f MC=%.6f QL=%.6f",
+        direction.value,
+        action.value,
+        option_type.value,
+        strike,
+        barrier,
+        rebate,
+        pde_pv,
+        mc_pv,
+        ql_pv,
+    )
     assert np.isclose(pde_pv, ql_pv, rtol=0.03), f"PDE {pde_pv:.6f} vs QL {ql_pv:.6f}"
-    # LSM has known downward bias for American barriers (~8% on ATM cases)
-    assert np.isclose(mc_pv, ql_pv, rtol=0.10), f"MC {mc_pv:.6f} vs QL {ql_pv:.6f}"
+    assert np.isclose(mc_pv, ql_pv, rtol=0.03), f"MC {mc_pv:.6f} vs QL {ql_pv:.6f}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
