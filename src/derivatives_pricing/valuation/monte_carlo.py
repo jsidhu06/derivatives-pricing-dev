@@ -228,6 +228,132 @@ def _ridge_lsm_continuation(
     return cont
 
 
+def _ridge_predict(
+    X_fit: np.ndarray,
+    y_fit: np.ndarray,
+    X_pred: np.ndarray,
+    ridge_lambda: float,
+) -> np.ndarray:
+    """Return ridge-regression predictions for the supplied design matrices."""
+    p = X_fit.shape[1]
+    XtX = X_fit.T @ X_fit
+    Xty = X_fit.T @ y_fit
+    beta = np.linalg.solve(XtX + ridge_lambda * np.eye(p), Xty)
+    return X_pred @ beta
+
+
+def _barrier_log_distance(
+    spot: np.ndarray,
+    barrier: float,
+    direction: BarrierDirection,
+) -> np.ndarray:
+    """Return positive log-distance from the absorbing barrier.
+
+    For alive knock-out states, smaller values mean closer proximity to the
+    barrier. The log transform captures the natural geometry of GBM barriers
+    better than raw spot ratios.
+    """
+    safe_spot = np.maximum(np.asarray(spot, dtype=float), 1.0e-12)
+    if direction is BarrierDirection.UP:
+        return np.maximum(np.log(barrier / safe_spot), 0.0)
+    return np.maximum(np.log(safe_spot / barrier), 0.0)
+
+
+def _barrier_lsm_design_matrix(
+    S_t: np.ndarray,
+    strike: float,
+    barrier: float,
+    direction: BarrierDirection,
+    deg: int,
+) -> np.ndarray:
+    """Build a barrier-aware design matrix for American knock-out LSM.
+
+    The standard Laguerre basis in moneyness is augmented with barrier
+    distance terms so the regression can better represent the sharp drop in
+    continuation value near the absorbing barrier.
+    """
+    x = np.asarray(S_t, dtype=float) / strike
+    base = _laguerre_basis(x, deg=deg)
+    dist = _barrier_log_distance(S_t, barrier, direction)
+    inv_dist = 1.0 / np.maximum(dist, 5.0e-2)
+    near_barrier = np.exp(-4.0 * dist)
+    columns = [
+        base,
+        dist[:, None],
+        (dist**2)[:, None],
+        inv_dist[:, None],
+        near_barrier[:, None],
+        (x * near_barrier)[:, None],
+    ]
+    if deg >= 2:
+        columns.append((base[:, 1] * near_barrier)[:, None])
+    return np.column_stack(columns)
+
+
+def _ridge_barrier_lsm_continuation(
+    S_t: np.ndarray,
+    Y: np.ndarray,
+    itm: np.ndarray,
+    strike: float,
+    barrier: float,
+    direction: BarrierDirection,
+    deg: int,
+    ridge_lambda: float,
+    min_itm: int,
+) -> np.ndarray:
+    """Barrier-aware continuation estimate for American knock-out LSM.
+
+    Uses a barrier-distance basis plus a near/far split so the regression can
+    fit the sharp continuation cliff close to the absorbing boundary without
+    distorting the smoother far-from-barrier region.
+    """
+    cont = np.zeros_like(S_t, dtype=float)
+    if not np.any(itm):
+        return cont
+
+    S_itm = S_t[itm]
+    Y_itm = Y[itm]
+    n = S_itm.size
+
+    X_itm = _barrier_lsm_design_matrix(
+        S_itm,
+        strike=strike,
+        barrier=barrier,
+        direction=direction,
+        deg=deg,
+    )
+    min_regression_paths = max(min_itm, X_itm.shape[1] + 2)
+    if n < min_regression_paths:
+        cont[itm] = np.mean(Y_itm)
+        return cont
+
+    dist_itm = _barrier_log_distance(S_itm, barrier, direction)
+    split_threshold = min(float(np.quantile(dist_itm, 0.35)), 0.25)
+    near_mask = dist_itm <= split_threshold
+    far_mask = ~near_mask
+    min_bucket = max(12, X_itm.shape[1] + 1)
+
+    if np.sum(near_mask) < min_bucket or np.sum(far_mask) < min_bucket:
+        cont[itm] = _ridge_predict(X_itm, Y_itm, X_itm, ridge_lambda)
+        return cont
+
+    pred_itm = np.empty_like(Y_itm)
+    pred_itm[near_mask] = _ridge_predict(
+        X_itm[near_mask],
+        Y_itm[near_mask],
+        X_itm[near_mask],
+        ridge_lambda,
+    )
+    pred_itm[far_mask] = _ridge_predict(
+        X_itm[far_mask],
+        Y_itm[far_mask],
+        X_itm[far_mask],
+        ridge_lambda,
+    )
+    cont[itm] = pred_itm
+    return cont
+
+
 def _year_fractions(
     pricing_date,
     dates: np.ndarray,
@@ -1591,15 +1717,28 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
                 alive = ~ever_hit[t]
                 itm = (intrinsic[t] > 0) & alive
 
-                continuation = _ridge_lsm_continuation(
-                    S_t=spot_paths[t],
-                    Y=df_step * values[t + 1],
-                    itm=itm,
-                    strike=self.valuation_ctx.strike,
-                    deg=self.mc_params.deg,
-                    ridge_lambda=self.mc_params.ridge_lambda,
-                    min_itm=self.mc_params.min_itm,
-                )
+                if self.mc_params.barrier_aware_basis:
+                    continuation = _ridge_barrier_lsm_continuation(
+                        S_t=spot_paths[t],
+                        Y=df_step * values[t + 1],
+                        itm=itm,
+                        strike=self.valuation_ctx.strike,
+                        barrier=float(self.spec.barrier),
+                        direction=self.spec.direction,
+                        deg=self.mc_params.deg,
+                        ridge_lambda=self.mc_params.ridge_lambda,
+                        min_itm=self.mc_params.min_itm,
+                    )
+                else:
+                    continuation = _ridge_lsm_continuation(
+                        S_t=spot_paths[t],
+                        Y=df_step * values[t + 1],
+                        itm=itm,
+                        strike=self.valuation_ctx.strike,
+                        deg=self.mc_params.deg,
+                        ridge_lambda=self.mc_params.ridge_lambda,
+                        min_itm=self.mc_params.min_itm,
+                    )
 
                 values[t] = np.where(
                     alive & (intrinsic[t] > continuation),

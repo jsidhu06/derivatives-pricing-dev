@@ -44,6 +44,12 @@ class MonteCarloParams:
         analytical European price and the MC European price from the same
         simulation.  Only applicable to American exercise pricing.
         Default: ``False``.
+    barrier_aware_basis:
+        When ``True``, American barrier Monte Carlo augments the LSM
+        regression basis with barrier-distance features and a local near/far
+        split for American knock-out options. This is mainly useful where
+        the continuation surface changes sharply near the absorbing barrier.
+        Default: ``False``.
     """
 
     random_seed: int | None = None
@@ -53,6 +59,7 @@ class MonteCarloParams:
     log_timings: bool = False
     std_error_warn_ratio: float | None = 0.1
     control_variate_european: bool = False
+    barrier_aware_basis: bool = False
 
     def __post_init__(self) -> None:
         if self.deg < 1:
@@ -64,6 +71,10 @@ class MonteCarloParams:
         if self.std_error_warn_ratio is not None and self.std_error_warn_ratio <= 0:
             raise ValidationError(
                 f"std_error_warn_ratio must be > 0 when set, got {self.std_error_warn_ratio}"
+            )
+        if not isinstance(self.barrier_aware_basis, bool):
+            raise ValidationError(
+                f"barrier_aware_basis must be a bool, got {type(self.barrier_aware_basis).__name__}"
             )
 
 
