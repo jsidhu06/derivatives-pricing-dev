@@ -2055,14 +2055,20 @@ def _fd_barrier_ki_core(
                     hull_r_dt = r * d_tau if hull_discounting else 0.0
                     left_vals = V_inact_prev[j_inact - 1].copy()
                     right_vals = V_inact_prev[j_inact + 1].copy()
-                    left_vals[0] = left_inact
-                    right_vals[-1] = right_inact
+                    # Explicit stepping uses the previous tau layer throughout
+                    # the stencil. Current-step Dirichlet values are imposed
+                    # only after the interior update, matching _explicit_step.
                     interior = (
                         -a_sub * left_vals
                         + (1.0 - b_sub) * V_inact_prev[j_inact]
                         - c_sub * right_vals
                     )
                     V_inact[j_inact] = interior / (1.0 + hull_r_dt)
+                    # Set the sub-grid boundary nodes explicitly for local
+                    # readability. These assignments are consistent with the
+                    # full-region coupling / far-field boundary updates below.
+                    V_inact[j_inact[0] - 1] = left_inact
+                    V_inact[j_inact[-1] + 1] = right_inact
                 elif method_used is PDEMethod.IMPLICIT:
                     # Fully implicit: RHS = V_prev, full-weight coefficients
                     diag = 1.0 + b_sub
