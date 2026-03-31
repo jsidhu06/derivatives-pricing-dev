@@ -48,6 +48,7 @@ from .binomial import (
     _BinomialEuropeanValuation,
     _BinomialAmericanValuation,
     _BinomialAsianValuation,
+    _BinomialBarrierValuation,
 )
 from .bsm import _BSMEuropeanValuation
 from .asian_analytical import _AnalyticalAsianValuation
@@ -87,6 +88,8 @@ _BARRIER_REGISTRY: dict[tuple[PricingMethod, ExerciseType], type] = {
     (PricingMethod.BSM, ExerciseType.EUROPEAN): _AnalyticalBarrierValuation,
     (PricingMethod.MONTE_CARLO, ExerciseType.EUROPEAN): _MCBarrierEuropeanValuation,
     (PricingMethod.MONTE_CARLO, ExerciseType.AMERICAN): _MCBarrierAmericanValuation,
+    (PricingMethod.BINOMIAL, ExerciseType.EUROPEAN): _BinomialBarrierValuation,
+    (PricingMethod.BINOMIAL, ExerciseType.AMERICAN): _BinomialBarrierValuation,
     (PricingMethod.PDE_FD, ExerciseType.EUROPEAN): _FDBarrierValuation,
     (PricingMethod.PDE_FD, ExerciseType.AMERICAN): _FDBarrierValuation,
 }

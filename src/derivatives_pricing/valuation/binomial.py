@@ -9,7 +9,15 @@ from typing import TYPE_CHECKING
 import logging
 import numpy as np
 import pandas as pd
-from ..enums import AsianAveraging, ExerciseType, OptionType
+from ..enums import (
+    AsianAveraging,
+    BarrierAction,
+    BarrierDirection,
+    BarrierMonitoring,
+    ExerciseType,
+    OptionType,
+    RebateTiming,
+)
 from ..utils import calculate_year_fraction, pv_discrete_dividends, log_timing
 from ..exceptions import (
     ArbitrageViolationError,
@@ -21,7 +29,7 @@ from ..exceptions import (
 from .params import BinomialParams
 
 if TYPE_CHECKING:
-    from .core import AsianSpec, OptionValuation, UnderlyingData
+    from .core import AsianSpec, BarrierSpec, OptionValuation, UnderlyingData
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +49,8 @@ class _BinomialValuationBase:
 
     def _setup_binomial_parameters(
         self,
+        *,
+        num_steps: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Setup binomial tree parameters and lattice.
 
@@ -52,7 +62,10 @@ class _BinomialValuationBase:
             p : shape (num_steps,) — risk-neutral up-move probabilities
             spot_lattice : shape (num_steps+1, num_steps+1) — CRR spot prices
         """
-        num_steps = int(self.binom_params.num_steps)
+        if num_steps is None:
+            num_steps = int(self.binom_params.num_steps)
+        else:
+            num_steps = int(num_steps)
         start = self.valuation_ctx.pricing_date
         end = self.valuation_ctx.maturity
         time_intervals = pd.date_range(start, end, periods=num_steps + 1)
@@ -197,7 +210,7 @@ class _BinomialValuationBase:
         payoff_fn = self.valuation_ctx.spec.payoff  # type: ignore[union-attr]
         return payoff_fn(instrument_values)
 
-    def _solve_backward(self, *, early_exercise: bool) -> np.ndarray:
+    def _solve_backward(self, *, early_exercise: bool, num_steps: int | None = None) -> np.ndarray:
         """Run CRR backward induction, optionally with early exercise.
 
         Parameters
@@ -211,8 +224,11 @@ class _BinomialValuationBase:
         np.ndarray
             Option value lattice, shape ``(num_steps+1, num_steps+1)``.
         """
-        num_steps = int(self.binom_params.num_steps)
-        discount_factors, p, spot_lattice = self._setup_binomial_parameters()
+        if num_steps is None:
+            num_steps = int(self.binom_params.num_steps)
+        else:
+            num_steps = int(num_steps)
+        discount_factors, p, spot_lattice = self._setup_binomial_parameters(num_steps=num_steps)
 
         option_lattice = np.zeros_like(spot_lattice)
         intrinsic = self._get_intrinsic_values(spot_lattice)
@@ -836,3 +852,263 @@ class _BinomialAsianValuation(_BinomialValuationBase):
         if self.binom_params.mc_paths is not None:
             return self._solve_mc()
         return self._solve_hull()
+
+
+class _BinomialBarrierValuation(_BinomialValuationBase):
+    """Barrier option valuation using a CRR binomial tree.
+
+    Continuous barriers use QuantLib-style Boyle-Lau step adjustment on top of
+    the user-provided base ``num_steps``. Knock-out options are solved directly
+    via barrier-aware backward induction; knock-in options use an explicit
+    active/inactive two-state recursion so American knock-ins and KI rebates are
+    handled without parity shortcuts.
+    """
+
+    def __init__(self, valuation_ctx: OptionValuation) -> None:
+        super().__init__(valuation_ctx)
+        self.spec: BarrierSpec = valuation_ctx.spec  # type: ignore[assignment]
+        if not hasattr(self.spec, "barrier"):
+            raise ConfigurationError("_BinomialBarrierValuation requires a BarrierSpec.")
+
+    @staticmethod
+    def _is_triggered(spot: float, barrier: float, direction: BarrierDirection) -> bool:
+        if direction is BarrierDirection.UP:
+            return spot >= barrier
+        return spot <= barrier
+
+    @staticmethod
+    def _hit_mask(
+        spots: np.ndarray,
+        barrier: float,
+        direction: BarrierDirection,
+    ) -> np.ndarray:
+        if direction is BarrierDirection.UP:
+            return spots >= barrier
+        return spots <= barrier
+
+    def _tree_dates(self, num_steps: int) -> np.ndarray:
+        return np.array(
+            pd.date_range(
+                self.valuation_ctx.pricing_date,
+                self.valuation_ctx.maturity,
+                periods=num_steps + 1,
+            ).to_pydatetime()
+        )
+
+    def _monitoring_step_mask(self, num_steps: int) -> np.ndarray:
+        if self.spec.monitoring is BarrierMonitoring.CONTINUOUS:
+            mask = np.ones(num_steps + 1, dtype=bool)
+            mask[0] = False
+            return mask
+
+        if self.spec.monitoring_dates is not None:
+            tree_dates = self._tree_dates(num_steps)
+            tree_seconds = np.array([d.timestamp() for d in tree_dates], dtype=float)
+            mapped = []
+            for obs_date in self.spec.monitoring_dates:
+                idx = int(np.argmin(np.abs(tree_seconds - obs_date.timestamp())))
+                mapped.append(idx)
+            observation_indices = np.unique(np.array(mapped, dtype=int))
+        elif self.spec.num_observations is not None:
+            observation_indices = np.unique(
+                np.round(np.linspace(0, num_steps, self.spec.num_observations)).astype(int)
+            )
+        else:
+            raise ValidationError(
+                "Discrete barrier monitoring requires num_observations or monitoring_dates."
+            )
+
+        mask = np.zeros(num_steps + 1, dtype=bool)
+        mask[observation_indices] = True
+        mask[0] = False
+        return mask
+
+    def _effective_num_steps(self) -> int:
+        base_steps = int(self.binom_params.num_steps)
+        if self.spec.monitoring is not BarrierMonitoring.CONTINUOUS:
+            return base_steps
+
+        spot = float(self.underlying.initial_value)
+        barrier = float(self.spec.barrier)
+        sigma = float(self.underlying.volatility)
+        maturity = calculate_year_fraction(
+            self.valuation_ctx.pricing_date,
+            self.valuation_ctx.maturity,
+            day_count_convention=self.valuation_ctx.day_count_convention,
+        )
+        if spot <= 0.0 or barrier <= 0.0 or sigma <= 0.0 or maturity <= 0.0:
+            return base_steps
+
+        log_distance = np.log(max(spot, barrier) / min(spot, barrier))
+        divisor = log_distance * log_distance
+        if np.isclose(divisor, 0.0):
+            return base_steps
+
+        max_steps = max(1000, base_steps * 5)
+        optimum_steps = base_steps
+        for i in range(1, base_steps):
+            candidate = int((i * i * sigma * sigma * maturity) / divisor)
+            if base_steps < candidate:
+                optimum_steps = min(candidate, max_steps)
+                break
+        return optimum_steps
+
+    def _ko_rebate_values(
+        self,
+        *,
+        discount_factors: np.ndarray,
+        num_steps: int,
+    ) -> np.ndarray:
+        rebate = float(self.spec.rebate)
+        if rebate <= 0.0:
+            return np.zeros(num_steps + 1, dtype=float)
+        if self.spec.rebate_timing is RebateTiming.AT_HIT:
+            return np.full(num_steps + 1, rebate, dtype=float)
+
+        to_maturity = np.ones(num_steps + 1, dtype=float)
+        if num_steps > 0:
+            to_maturity[:num_steps] = np.cumprod(discount_factors[::-1])[::-1]
+        return rebate * to_maturity
+
+    def _solve_knock_out(self, *, early_exercise: bool, num_steps: int) -> np.ndarray:
+        discount_factors, p, spot_lattice = self._setup_binomial_parameters(num_steps=num_steps)
+        intrinsic = self._get_intrinsic_values(spot_lattice)
+        option_lattice = np.zeros_like(spot_lattice)
+        monitoring_mask = self._monitoring_step_mask(num_steps)
+        rebate_values = self._ko_rebate_values(
+            discount_factors=discount_factors,
+            num_steps=num_steps,
+        )
+
+        option_lattice[: num_steps + 1, num_steps] = intrinsic[: num_steps + 1, num_steps]
+        if monitoring_mask[num_steps]:
+            terminal_hit = self._hit_mask(
+                spot_lattice[: num_steps + 1, num_steps],
+                float(self.spec.barrier),
+                self.spec.direction,
+            )
+            option_lattice[: num_steps + 1, num_steps] = np.where(
+                terminal_hit,
+                rebate_values[num_steps],
+                option_lattice[: num_steps + 1, num_steps],
+            )
+
+        for t in range(num_steps - 1, -1, -1):
+            continuation = discount_factors[t] * (
+                p[t] * option_lattice[: t + 1, t + 1]
+                + (1.0 - p[t]) * option_lattice[1 : t + 2, t + 1]
+            )
+            if early_exercise:
+                values = np.maximum(intrinsic[: t + 1, t], continuation)
+            else:
+                values = continuation
+
+            if monitoring_mask[t]:
+                hit = self._hit_mask(
+                    spot_lattice[: t + 1, t],
+                    float(self.spec.barrier),
+                    self.spec.direction,
+                )
+                values = np.where(hit, rebate_values[t], values)
+
+            option_lattice[: t + 1, t] = values
+
+        return option_lattice
+
+    def _solve_knock_in(
+        self, *, early_exercise: bool, num_steps: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        discount_factors, p, spot_lattice = self._setup_binomial_parameters(num_steps=num_steps)
+        intrinsic = self._get_intrinsic_values(spot_lattice)
+        monitoring_mask = self._monitoring_step_mask(num_steps)
+
+        active = np.zeros_like(spot_lattice)
+        inactive = np.zeros_like(spot_lattice)
+
+        active[: num_steps + 1, num_steps] = intrinsic[: num_steps + 1, num_steps]
+        inactive_terminal = np.full(num_steps + 1, float(self.spec.rebate), dtype=float)
+        if monitoring_mask[num_steps]:
+            terminal_hit = self._hit_mask(
+                spot_lattice[: num_steps + 1, num_steps],
+                float(self.spec.barrier),
+                self.spec.direction,
+            )
+            inactive_terminal = np.where(
+                terminal_hit,
+                active[: num_steps + 1, num_steps],
+                inactive_terminal,
+            )
+        inactive[: num_steps + 1, num_steps] = inactive_terminal
+
+        for t in range(num_steps - 1, -1, -1):
+            continuation_active = discount_factors[t] * (
+                p[t] * active[: t + 1, t + 1] + (1.0 - p[t]) * active[1 : t + 2, t + 1]
+            )
+            if early_exercise:
+                active_values = np.maximum(intrinsic[: t + 1, t], continuation_active)
+            else:
+                active_values = continuation_active
+            active[: t + 1, t] = active_values
+
+            continuation_inactive = discount_factors[t] * (
+                p[t] * inactive[: t + 1, t + 1] + (1.0 - p[t]) * inactive[1 : t + 2, t + 1]
+            )
+            if monitoring_mask[t]:
+                hit = self._hit_mask(
+                    spot_lattice[: t + 1, t],
+                    float(self.spec.barrier),
+                    self.spec.direction,
+                )
+                continuation_inactive = np.where(hit, active_values, continuation_inactive)
+            inactive[: t + 1, t] = continuation_inactive
+
+        return active, inactive
+
+    def _initial_value_if_triggered(self, *, early_exercise: bool, num_steps: int) -> float | None:
+        if not self._is_triggered(
+            float(self.underlying.initial_value),
+            float(self.spec.barrier),
+            self.spec.direction,
+        ):
+            return None
+
+        if self.spec.action is BarrierAction.OUT:
+            if self.spec.rebate <= 0.0:
+                return 0.0
+            if self.spec.rebate_timing is RebateTiming.AT_HIT:
+                return float(self.spec.rebate)
+            maturity = calculate_year_fraction(
+                self.valuation_ctx.pricing_date,
+                self.valuation_ctx.maturity,
+                day_count_convention=self.valuation_ctx.day_count_convention,
+            )
+            return float(self.spec.rebate) * float(self.valuation_ctx.discount_curve.df(maturity))
+
+        vanilla_lattice = self._solve_backward(early_exercise=early_exercise, num_steps=num_steps)
+        return float(vanilla_lattice[0, 0])
+
+    def solve(self) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        num_steps = self._effective_num_steps()
+        early_exercise = self.spec.exercise_type is ExerciseType.AMERICAN
+        if self.spec.action is BarrierAction.OUT:
+            return self._solve_knock_out(early_exercise=early_exercise, num_steps=num_steps)
+        return self._solve_knock_in(early_exercise=early_exercise, num_steps=num_steps)
+
+    def present_value(self) -> float:
+        num_steps = self._effective_num_steps()
+        early_exercise = self.spec.exercise_type is ExerciseType.AMERICAN
+        triggered_value = self._initial_value_if_triggered(
+            early_exercise=early_exercise,
+            num_steps=num_steps,
+        )
+        if triggered_value is not None:
+            return triggered_value
+
+        label = f"Binomial barrier {'American' if early_exercise else 'European'} present_value"
+        with log_timing(logger, label, self.binom_params.log_timings):
+            solved = self.solve()
+
+        if self.spec.action is BarrierAction.OUT:
+            return float(solved[0, 0])
+        _, inactive = solved
+        return float(inactive[0, 0])

@@ -940,6 +940,53 @@ def _ql_barrier_price(
     return opt.NPV()
 
 
+def _ql_barrier_binomial_price(
+    *,
+    direction: BarrierDirection,
+    action: BarrierAction,
+    barrier: float,
+    option_type: OptionType,
+    strike: float,
+    exercise_type: ExerciseType = ExerciseType.EUROPEAN,
+    rebate: float = 0.0,
+    r_curve: DiscountCurve | None = None,
+    q_curve: DiscountCurve | None = None,
+    binom_steps: int = 400,
+) -> float:
+    eval_date = ql.Date(PRICING_DATE.day, PRICING_DATE.month, PRICING_DATE.year)
+    ql.Settings.instance().evaluationDate = eval_date
+    ql_dc = ql.Actual365Fixed()
+
+    spot_h = ql.QuoteHandle(ql.SimpleQuote(_BARRIER_SPOT))
+
+    if r_curve is not None:
+        rf_h = _ql_curve_from_times(times=r_curve.times, dfs=r_curve.dfs)
+    else:
+        rf_h = ql.YieldTermStructureHandle(ql.FlatForward(eval_date, _BARRIER_RATE, ql_dc))
+
+    if q_curve is not None:
+        div_h = _ql_curve_from_times(times=q_curve.times, dfs=q_curve.dfs)
+    else:
+        div_h = ql.YieldTermStructureHandle(ql.FlatForward(eval_date, _BARRIER_DIV, ql_dc))
+
+    vol_h = ql.BlackVolTermStructureHandle(
+        ql.BlackConstantVol(eval_date, ql.TARGET(), _BARRIER_VOL, ql_dc)
+    )
+    proc = ql.BlackScholesMertonProcess(spot_h, div_h, rf_h, vol_h)
+
+    ql_type = ql.Option.Put if option_type is OptionType.PUT else ql.Option.Call
+    payoff = ql.PlainVanillaPayoff(ql_type, strike)
+    ql_maturity = ql.Date(_BARRIER_MATURITY.day, _BARRIER_MATURITY.month, _BARRIER_MATURITY.year)
+    if exercise_type is ExerciseType.EUROPEAN:
+        exercise = ql.EuropeanExercise(ql_maturity)
+    else:
+        exercise = ql.AmericanExercise(eval_date, ql_maturity)
+    bt = _QL_BARRIER_TYPE[(direction, action)]
+    opt = ql.BarrierOption(bt, barrier, rebate, payoff, exercise)
+    opt.setPricingEngine(ql.BinomialCRRBarrierEngine(proc, binom_steps))
+    return opt.NPV()
+
+
 def _ql_barrier_fd_price(
     *,
     direction: BarrierDirection,
@@ -1028,6 +1075,7 @@ _BARRIER_PDE_CFG = PDEParams(
     method=PDEMethod.CRANK_NICOLSON,
     space_grid=PDESpaceGrid.LOG_SPOT,
 )
+_BARRIER_BINOM_CFG = BinomialParams(num_steps=400)
 
 
 def _dp_barrier_pde_price(
@@ -1067,6 +1115,45 @@ def _dp_barrier_pde_price(
         rebate_timing=rebate_timing,
     )
     return OptionValuation(ud, spec, PricingMethod.PDE_FD, _BARRIER_PDE_CFG).present_value()
+
+
+def _dp_barrier_binomial_price(
+    *,
+    direction: BarrierDirection,
+    action: BarrierAction,
+    barrier: float,
+    option_type: OptionType,
+    strike: float,
+    exercise_type: ExerciseType = ExerciseType.EUROPEAN,
+    rebate: float = 0.0,
+    rebate_timing: RebateTiming = RebateTiming.AT_HIT,
+    monitoring: BarrierMonitoring = BarrierMonitoring.CONTINUOUS,
+    r_curve: DiscountCurve | None = None,
+    q_curve: DiscountCurve | None = None,
+) -> float:
+    ttm = calculate_year_fraction(PRICING_DATE, _BARRIER_MATURITY)
+    rc = r_curve if r_curve is not None else DiscountCurve.flat(_BARRIER_RATE, end_time=ttm)
+    qc = q_curve if q_curve is not None else DiscountCurve.flat(_BARRIER_DIV, end_time=ttm)
+    md = MarketData(PRICING_DATE, rc, currency=CURRENCY)
+    ud = UnderlyingData(
+        initial_value=_BARRIER_SPOT,
+        volatility=_BARRIER_VOL,
+        market_data=md,
+        dividend_curve=qc,
+    )
+    spec = BarrierSpec(
+        option_type=option_type,
+        exercise_type=exercise_type,
+        strike=strike,
+        maturity=_BARRIER_MATURITY,
+        barrier=barrier,
+        direction=direction,
+        action=action,
+        monitoring=monitoring,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+    )
+    return OptionValuation(ud, spec, PricingMethod.BINOMIAL, _BARRIER_BINOM_CFG).present_value()
 
 
 _BARRIER_MC_PATHS = 150_000
@@ -1249,7 +1336,7 @@ _BARRIER_SCENARIOS = [
 def test_barrier_european_vs_quantlib(
     direction, action, option_type, strike, barrier, rebate, r_curve, q_curve
 ):
-    """European barrier option: DP analytical, PDE, and MC vs QuantLib.
+    """European barrier option: DP analytical, PDE, MC, and binomial vs QuantLib.
 
     For flat curves, PDE is compared against QL analytical (constant-rate).
     For non-flat curves, PDE is compared against QL FdBlackScholesBarrierEngine
@@ -1283,6 +1370,17 @@ def test_barrier_european_vs_quantlib(
         r_curve=r_curve,
         q_curve=q_curve,
     )
+    binom_pv = _dp_barrier_binomial_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        exercise_type=ExerciseType.EUROPEAN,
+        rebate=rebate,
+        r_curve=r_curve,
+        q_curve=q_curve,
+    )
     ql_pv = _ql_barrier_price(
         direction=direction,
         action=action,
@@ -1295,7 +1393,8 @@ def test_barrier_european_vs_quantlib(
     )
     assert np.isclose(dp_pv, ql_pv, rtol=1e-10), f"DP {dp_pv:.6f} vs QL {ql_pv:.6f}"
 
-    # For non-flat curves, compare PDE/MC against QL FD (both use time-varying rates)
+    # For non-flat curves, compare DP PDE/MC/binomial against QL FD
+    # engine instead of analytical, since the latter assumes constant rates.
     if r_curve is not None:
         ql_fd_pv = _ql_barrier_fd_price(
             direction=direction,
@@ -1308,7 +1407,7 @@ def test_barrier_european_vs_quantlib(
             q_curve=q_curve,
         )
         logger.info(
-            "Barrier %s-%s %s K=%.0f H=%.0f | DP=%.6f PDE=%.6f MC=%.6f QL_AN=%.6f QL_FD=%.6f",
+            "Barrier %s-%s %s K=%.0f H=%.0f | DP=%.6f PDE=%.6f MC=%.6f Binom=%.6f QL_AN=%.6f QL_FD=%.6f",
             direction.value,
             action.value,
             option_type.value,
@@ -1317,14 +1416,18 @@ def test_barrier_european_vs_quantlib(
             dp_pv,
             pde_pv,
             mc_pv,
+            binom_pv,
             ql_pv,
             ql_fd_pv,
         )
         assert np.isclose(pde_pv, ql_fd_pv, rtol=0.015), f"PDE {pde_pv:.6f} vs QL_FD {ql_fd_pv:.6f}"
         assert np.isclose(mc_pv, ql_fd_pv, rtol=0.025), f"MC {mc_pv:.6f} vs QL_FD {ql_fd_pv:.6f}"
+        assert np.isclose(binom_pv, ql_fd_pv, rtol=0.015), (
+            f"Binom {binom_pv:.6f} vs QL_FD {ql_fd_pv:.6f}"
+        )
     else:
         logger.info(
-            "Barrier %s-%s %s K=%.0f H=%.0f | DP=%.6f PDE=%.6f MC=%.6f QL=%.6f",
+            "Barrier %s-%s %s K=%.0f H=%.0f | DP=%.6f PDE=%.6f MC=%.6f Binom=%.6f QL=%.6f",
             direction.value,
             action.value,
             option_type.value,
@@ -1333,10 +1436,12 @@ def test_barrier_european_vs_quantlib(
             dp_pv,
             pde_pv,
             mc_pv,
+            binom_pv,
             ql_pv,
         )
         assert np.isclose(pde_pv, ql_pv, rtol=0.01), f"PDE {pde_pv:.6f} vs QL {ql_pv:.6f}"
         assert np.isclose(mc_pv, ql_pv, rtol=0.025), f"MC {mc_pv:.6f} vs QL {ql_pv:.6f}"
+        assert np.isclose(binom_pv, ql_pv, rtol=0.015), f"Binom {binom_pv:.6f} vs QL {ql_pv:.6f}"
 
 
 # Rebate tests: KO at-hit (matches QL), KI at-expiry (known small difference)
@@ -1407,7 +1512,7 @@ def test_barrier_rebate_european_vs_quantlib(
     r_curve,
     q_curve,
 ):
-    """Barrier rebate pricing: analytical, PDE, and MC vs QuantLib."""
+    """Barrier rebate pricing: analytical, PDE, MC, and binomial vs QuantLib."""
     dp_pv = _dp_barrier_price(
         direction=direction,
         action=action,
@@ -1441,6 +1546,18 @@ def test_barrier_rebate_european_vs_quantlib(
         r_curve=r_curve,
         q_curve=q_curve,
     )
+    binom_pv = _dp_barrier_binomial_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        exercise_type=ExerciseType.EUROPEAN,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+        r_curve=r_curve,
+        q_curve=q_curve,
+    )
     ql_pv = _ql_barrier_price(
         direction=direction,
         action=action,
@@ -1455,12 +1572,17 @@ def test_barrier_rebate_european_vs_quantlib(
     # at-hit/at-expiry timing in its complementary rebate calculation.
     if action is BarrierAction.OUT:
         analytic_tol = 1e-10
-        pde_tol = 0.01
     else:
         analytic_tol = 0.005  # ~0.3–0.4% expected
-        pde_tol = 0.01
+
+    # TODO: Switch ql to FD engine for non-flat curves
+    assert np.isclose(dp_pv, ql_pv, rtol=analytic_tol), f"DP {dp_pv:.6f} vs QL {ql_pv:.6f}"
+    assert np.isclose(pde_pv, ql_pv, rtol=0.01), f"PDE {pde_pv:.6f} vs QL {ql_pv:.6f}"
+    assert np.isclose(mc_pv, ql_pv, rtol=0.025), f"MC {mc_pv:.6f} vs QL {ql_pv:.6f}"
+    assert np.isclose(binom_pv, ql_pv, rtol=0.01), f"Binom {binom_pv:.6f} vs QL {ql_pv:.6f}"
+
     logger.info(
-        "Barrier rebate %s-%s %s K=%.0f H=%.0f R=%.1f | DP=%.6f PDE=%.6f MC=%.6f QL=%.6f",
+        "Barrier rebate %s-%s %s K=%.0f H=%.0f R=%.1f | DP=%.6f PDE=%.6f MC=%.6f Binom=%.6f QL=%.6f",
         direction.value,
         action.value,
         option_type.value,
@@ -1470,11 +1592,167 @@ def test_barrier_rebate_european_vs_quantlib(
         dp_pv,
         pde_pv,
         mc_pv,
+        binom_pv,
         ql_pv,
     )
-    assert np.isclose(dp_pv, ql_pv, rtol=analytic_tol), f"DP {dp_pv:.6f} vs QL {ql_pv:.6f}"
-    assert np.isclose(pde_pv, ql_pv, rtol=pde_tol), f"PDE {pde_pv:.6f} vs QL {ql_pv:.6f}"
-    assert np.isclose(mc_pv, ql_pv, rtol=0.025), f"MC {mc_pv:.6f} vs QL {ql_pv:.6f}"
+
+
+_BARRIER_BINOMIAL_EUROPEAN_SCENARIOS = [
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        0.0,
+        RebateTiming.AT_HIT,
+        id="binom_eu_down_out_call",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        115.0,
+        0.0,
+        RebateTiming.AT_EXPIRY,
+        id="binom_eu_up_in_put",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        3.0,
+        RebateTiming.AT_HIT,
+        id="binom_eu_down_out_call_rebate",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        115.0,
+        3.0,
+        RebateTiming.AT_EXPIRY,
+        id="binom_eu_up_in_put_rebate",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "direction,action,option_type,strike,barrier,rebate,rebate_timing",
+    _BARRIER_BINOMIAL_EUROPEAN_SCENARIOS,
+)
+def test_barrier_binomial_european_vs_quantlib(
+    direction,
+    action,
+    option_type,
+    strike,
+    barrier,
+    rebate,
+    rebate_timing,
+):
+    dp_pv = _dp_barrier_binomial_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        exercise_type=ExerciseType.EUROPEAN,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+    )
+    ql_pv = _ql_barrier_binomial_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        rebate=rebate,
+        binom_steps=_BARRIER_BINOM_CFG.num_steps,
+    )
+    assert np.isclose(dp_pv, ql_pv, rtol=0.003), f"DP {dp_pv:.6f} vs QL {ql_pv:.6f}"
+
+
+_BARRIER_BINOMIAL_AMERICAN_SCENARIOS = [
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        100.0,
+        85.0,
+        0.0,
+        RebateTiming.AT_HIT,
+        id="binom_am_down_out_put",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        0.0,
+        RebateTiming.AT_EXPIRY,
+        id="binom_am_up_in_put",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        5.0,
+        RebateTiming.AT_HIT,
+        id="binom_am_up_out_put_rebate",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        5.0,
+        RebateTiming.AT_EXPIRY,
+        id="binom_am_up_in_put_rebate",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "direction,action,option_type,strike,barrier,rebate,rebate_timing",
+    _BARRIER_BINOMIAL_AMERICAN_SCENARIOS,
+)
+def test_barrier_binomial_american_vs_quantlib(
+    direction,
+    action,
+    option_type,
+    strike,
+    barrier,
+    rebate,
+    rebate_timing,
+):
+    dp_pv = _dp_barrier_binomial_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        exercise_type=ExerciseType.AMERICAN,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+    )
+    ql_pv = _ql_barrier_american_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        rebate=rebate,
+        binom_steps=_BARRIER_BINOM_CFG.num_steps,
+    )
+    assert np.isclose(dp_pv, ql_pv, rtol=0.01), f"DP {dp_pv:.6f} vs QL {ql_pv:.6f}"
 
 
 # American barrier KO — DP PDE vs QL BinomialCRR
@@ -1550,7 +1828,7 @@ def test_barrier_american_ko_vs_quantlib(
     barrier,
     rebate,
 ):
-    """American KO barrier: DP PDE and MC vs QL BinomialCRR (1000 steps)."""
+    """American KO barrier: DP PDE, MC, and binomial vs QL BinomialCRR."""
     pde_pv = _dp_barrier_pde_price(
         direction=direction,
         action=action,
@@ -1571,6 +1849,16 @@ def test_barrier_american_ko_vs_quantlib(
         rebate=rebate,
         rebate_timing=RebateTiming.AT_HIT,
     )
+    binom_pv = _dp_barrier_binomial_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        exercise_type=ExerciseType.AMERICAN,
+        rebate=rebate,
+        rebate_timing=RebateTiming.AT_HIT,
+    )
     ql_pv = _ql_barrier_american_price(
         direction=direction,
         action=action,
@@ -1580,7 +1868,7 @@ def test_barrier_american_ko_vs_quantlib(
         rebate=rebate,
     )
     logger.info(
-        "American KO %s-%s %s K=%.0f H=%.0f R=%.1f | PDE=%.6f MC=%.6f QL=%.6f",
+        "American KO %s-%s %s K=%.0f H=%.0f R=%.1f | PDE=%.6f MC=%.6f Binom=%.6f QL=%.6f",
         direction.value,
         action.value,
         option_type.value,
@@ -1589,9 +1877,11 @@ def test_barrier_american_ko_vs_quantlib(
         rebate,
         pde_pv,
         mc_pv,
+        binom_pv,
         ql_pv,
     )
     assert np.isclose(pde_pv, ql_pv, rtol=0.02), f"PDE {pde_pv:.6f} vs QL {ql_pv:.6f}"
+    assert np.isclose(binom_pv, ql_pv, rtol=0.01), f"Binom {binom_pv:.6f} vs QL {ql_pv:.6f}"
     # LSM shows larger downward bias when the KO barrier cuts into the payoff region.
     mc_tol = (
         0.08
@@ -1685,7 +1975,7 @@ def test_barrier_american_ki_vs_quantlib(
     barrier,
     rebate,
 ):
-    """American KI barrier: DP PDE (two-surface) and MC vs QL BinomialCRR."""
+    """American KI barrier: DP PDE, MC, and binomial vs QL BinomialCRR."""
     pde_pv = _dp_barrier_pde_price(
         direction=direction,
         action=action,
@@ -1706,6 +1996,16 @@ def test_barrier_american_ki_vs_quantlib(
         rebate=rebate,
         rebate_timing=RebateTiming.AT_EXPIRY,
     )
+    binom_pv = _dp_barrier_binomial_price(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        exercise_type=ExerciseType.AMERICAN,
+        rebate=rebate,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
 
     ql_pv = _ql_barrier_american_price(
         direction=direction,
@@ -1716,7 +2016,7 @@ def test_barrier_american_ki_vs_quantlib(
         rebate=rebate,
     )
     logger.info(
-        "American KI %s-%s %s K=%.0f H=%.0f R=%.1f | PDE=%.6f MC=%.6f QL=%.6f",
+        "American KI %s-%s %s K=%.0f H=%.0f R=%.1f | PDE=%.6f MC=%.6f Binom=%.6f QL=%.6f",
         direction.value,
         action.value,
         option_type.value,
@@ -1725,9 +2025,11 @@ def test_barrier_american_ki_vs_quantlib(
         rebate,
         pde_pv,
         mc_pv,
+        binom_pv,
         ql_pv,
     )
     assert np.isclose(pde_pv, ql_pv, rtol=0.03), f"PDE {pde_pv:.6f} vs QL {ql_pv:.6f}"
+    assert np.isclose(binom_pv, ql_pv, rtol=0.01), f"Binom {binom_pv:.6f} vs QL {ql_pv:.6f}"
     assert np.isclose(mc_pv, ql_pv, rtol=0.03), f"MC {mc_pv:.6f} vs QL {ql_pv:.6f}"
 
 
