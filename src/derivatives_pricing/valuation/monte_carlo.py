@@ -1700,9 +1700,10 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
         # Terminal payoff
         if is_ko:
             alive_T = ~ever_hit[-1]
-            values[-1] = intrinsic[-1] * alive_T.astype(float)
             if rebate > 0.0 and rebate_timing is RebateTiming.AT_EXPIRY:
-                values[-1] += rebate * (~alive_T).astype(float)
+                values[-1] = np.where(alive_T, intrinsic[-1], rebate)
+            else:
+                values[-1] = intrinsic[-1] * alive_T.astype(float)
         else:
             active_T = ever_hit[-1]
             values[-1] = intrinsic[-1] * active_T.astype(float)
@@ -1740,11 +1741,24 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
                         min_itm=self.mc_params.min_itm,
                     )
 
-                values[t] = np.where(
+                values_t = np.where(
                     alive & (intrinsic[t] > continuation),
                     intrinsic[t],
-                    np.where(alive, df_step * values[t + 1], 0.0),
+                    df_step * values[t + 1],
                 )
+
+                dead = ~alive
+                if rebate > 0.0 and rebate_timing is RebateTiming.AT_HIT:
+                    just_hit = first_hit_step == t
+                    values_t = np.where(just_hit, rebate, values_t)
+                    values_t = np.where(dead & ~just_hit, 0.0, values_t)
+                elif rebate > 0.0 and rebate_timing is RebateTiming.AT_EXPIRY:
+                    rebate_hold_t = rebate * (discount_factors[-1] / discount_factors[t])
+                    values_t = np.where(dead, rebate_hold_t, values_t)
+                else:
+                    values_t = np.where(dead, 0.0, values_t)
+
+                values[t] = values_t
             else:
                 active = ever_hit[t]
                 itm_active = (intrinsic[t] > 0) & active
@@ -1766,14 +1780,7 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
                 )
 
         df0 = discount_factors[1] / discount_factors[0]
-        pv_pathwise = df0 * values[1]
-
-        # KO AT_HIT rebate for dead paths
-        if is_ko and rebate > 0.0 and rebate_timing is RebateTiming.AT_HIT:
-            hit_mask = first_hit_step >= 0
-            pv_pathwise[hit_mask] += rebate * discount_factors[first_hit_step[hit_mask]]
-
-        return pv_pathwise
+        return df0 * values[1]
 
     def present_value(self) -> float:
         """Calculate PV using Longstaff-Schwartz MC for American barrier option."""
