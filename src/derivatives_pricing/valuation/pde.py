@@ -2100,15 +2100,24 @@ def _fd_barrier_ki_core(
                 V_inact[0] = rebate_bv
         else:
             # Discrete monitoring: full grid solve, coupling at monitoring dates
-            left_inact, right_inact = _boundary_values(
-                option_type=option_type,
-                strike=strike,
-                smin=smin,
-                smax=smax,
-                df_tT=df_tT,
-                dq_tT=dq_tT,
-                early_exercise=False,
-            )
+            # For an inactive KI, on the safe far side its asymptotic value is
+            # the no-hit value (rebate PV, or 0 if no rebate). On the risky
+            # side, immediate coupling to the current active boundary is too
+            # aggressive between monitoring dates because activation cannot
+            # occur until the next observation. Use a one-step look-ahead
+            # proxy: current active boundary on monitoring dates, otherwise the
+            # next-time-slice active boundary carried in V_act_prev. This is a
+            # pragmatic discrete-monitoring closure, not an exact asymptotic
+            # boundary condition.
+            rebate_bv = rebate * df_tT
+            tau_key = round(tau_curr, 12)
+            is_monitoring_step = monitoring_tau_set is not None and tau_key in monitoring_tau_set
+            if direction is BarrierDirection.DOWN:
+                left_inact = V_act[0] if is_monitoring_step else V_act_prev[0]
+                right_inact = rebate_bv
+            else:
+                left_inact = rebate_bv
+                right_inact = V_act[-1] if is_monitoring_step else V_act_prev[-1]
             if method_used in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
                 V_inact = _explicit_step(
                     V_inact_prev,
@@ -2141,7 +2150,6 @@ def _fd_barrier_ki_core(
 
             # Discrete barrier coupling at monitoring dates
             if monitoring_tau_set is not None:
-                tau_key = round(tau_curr, 12)
                 if tau_key in monitoring_tau_set:
                     if direction is BarrierDirection.DOWN:
                         mask = S <= barrier
