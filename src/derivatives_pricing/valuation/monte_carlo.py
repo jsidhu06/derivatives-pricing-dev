@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from typing import TYPE_CHECKING
+import warnings
 import logging
 import datetime as dt
 import numpy as np
@@ -1561,6 +1562,24 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
     Knock-in: regress on active+ITM paths only; inactive paths carry
     discounted actual continuation pathwise (no separate regression).
     """
+
+    def __init__(self, valuation_ctx: OptionValuation) -> None:
+        super().__init__(valuation_ctx)
+        if self.spec.action is not BarrierAction.OUT:
+            return
+        is_down_out_put = (
+            self.spec.direction is BarrierDirection.DOWN and self.spec.option_type is OptionType.PUT
+        )
+        is_up_out_call = (
+            self.spec.direction is BarrierDirection.UP and self.spec.option_type is OptionType.CALL
+        )
+        if is_down_out_put or is_up_out_call:
+            warnings.warn(
+                "American barrier Monte Carlo LSM can show significant downward bias "
+                "for down-and-out puts and up-and-out calls. "
+                "Prefer BINOMIAL or PDE_FD for production pricing.",
+                stacklevel=3,
+            )
 
     def solve(
         self,
