@@ -1363,7 +1363,7 @@ def _barrier_monitoring_taus(
     return taus
 
 
-def _fd_barrier_core(
+def _fd_barrier_ko_core(
     *,
     spot: float,
     strike: float,
@@ -1375,7 +1375,6 @@ def _fd_barrier_core(
     option_type: OptionType,
     barrier: float,
     direction: BarrierDirection,
-    action: BarrierAction,
     monitoring: BarrierMonitoring,
     rebate: float,
     rebate_timing: RebateTiming,
@@ -1392,7 +1391,7 @@ def _fd_barrier_core(
     tol: float | None = None,
     max_iter: int | None = None,
 ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
-    """Core finite-difference solver for barrier options.
+    """Core finite-difference solver for knock-out barrier options.
 
     For continuous knock-out barriers, the grid is truncated at the barrier
     level so the barrier becomes a domain boundary.
@@ -1400,20 +1399,11 @@ def _fd_barrier_core(
     For discrete knock-out barriers, the full grid is used and barrier
     resets are applied at monitoring dates (analogous to dividend jumps).
 
-    Knock-in options are NOT handled here — they should be computed via
-    in-out parity at the caller level.
-
     Returns
     -------
     tuple[float, np.ndarray, np.ndarray, np.ndarray, float]
         ``(price, spot_grid, V_final, V_prev, last_dtau)``
     """
-    if action is BarrierAction.IN:
-        raise UnsupportedFeatureError(
-            "_fd_barrier_core only handles knock-out barriers. "
-            "Knock-ins should use in-out parity at the caller level."
-        )
-
     _validate_fd_inputs(
         option_type=option_type,
         time_to_maturity=time_to_maturity,
@@ -1750,6 +1740,55 @@ def _fd_barrier_core(
     return price, S, V, V_prev, last_dtau
 
 
+def _subgrid_pde_step(
+    V: np.ndarray,
+    V_prev: np.ndarray,
+    j_sub: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+    c: np.ndarray,
+    left: float,
+    right: float,
+    method: PDEMethod,
+    r_dt: float,
+) -> np.ndarray:
+    """One PDE time-step on a sub-grid. Used for the inactive-surface solve in a coupled KI PDE.
+
+    Parameters
+    ----------
+    V, V_prev : full-length value arrays (current / previous tau layer).
+    j_sub : node indices of the sub-grid interior.
+    a, b, c : scaled operator coefficients for the **full** interior
+        (``j=1..M-1``); this helper slices them to ``j_sub``.
+    left, right : Dirichlet boundary values for the sub-grid.
+    method : PDE stepping scheme.
+    r_dt : ``r * d_tau`` for Hull explicit discounting (0 otherwise).
+    """
+    V = V.copy()
+    ci = j_sub - 1  # coefficient indices into full-interior arrays
+    a_s, b_s, c_s = a[ci], b[ci], c[ci]
+
+    if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
+        interior = -a_s * V_prev[j_sub - 1] + (1.0 - b_s) * V_prev[j_sub] - c_s * V_prev[j_sub + 1]
+        V[j_sub] = interior / (1.0 + r_dt)
+        V[j_sub[0] - 1] = left
+        V[j_sub[-1] + 1] = right
+    elif method is PDEMethod.IMPLICIT:
+        diag = 1.0 + b_s
+        rhs = V_prev[j_sub].copy()
+        rhs[0] -= a_s[0] * left
+        rhs[-1] -= c_s[-1] * right
+        V[j_sub] = _solve_tridiagonal_thomas(a_s[1:], diag, c_s[:-1], rhs)
+    else:
+        a_h, b_h, c_h = a_s * 0.5, b_s * 0.5, c_s * 0.5
+        diag = 1.0 + b_h
+        rhs = -a_h * V_prev[j_sub - 1] + (1.0 - b_h) * V_prev[j_sub] - c_h * V_prev[j_sub + 1]
+        rhs[0] -= a_h[0] * left
+        rhs[-1] -= c_h[-1] * right
+        V[j_sub] = _solve_tridiagonal_thomas(a_h[1:], diag, c_h[:-1], rhs)
+    return V
+
+
 def _fd_barrier_ki_core(
     *,
     spot: float,
@@ -1769,6 +1808,7 @@ def _fd_barrier_ki_core(
     smax_mult: float,
     spot_steps: int,
     time_steps: int,
+    early_exercise: bool,
     method: PDEMethod,
     rannacher_steps: int,
     space_grid: PDESpaceGrid,
@@ -1777,12 +1817,12 @@ def _fd_barrier_ki_core(
     tol: float | None = None,
     max_iter: int | None = None,
 ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
-    """Two-surface coupled PDE solver for American knock-in barrier options.
+    """Two-surface coupled PDE solver for knock-in barrier options.
 
     Maintains two value surfaces that are stepped backward in time:
 
     * **Active** (``V_act``): the barrier has been hit; behaves as a standard
-      American option with early-exercise projection (PSOR).
+      option (with early-exercise projection when ``early_exercise=True``).
     * **Inactive** (``V_inact``): the barrier has not yet been hit; pure
       continuation PDE with no exercise allowed.
 
@@ -1804,7 +1844,7 @@ def _fd_barrier_ki_core(
         time_steps=time_steps,
         volatility=volatility,
         discount_curve=discount_curve,
-        early_exercise=True,
+        early_exercise=early_exercise,
         method=method,
         american_solver=american_solver,
         omega=omega,
@@ -1851,7 +1891,7 @@ def _fd_barrier_ki_core(
     else:
         payoff = np.maximum(S - strike, 0.0)
 
-    intrinsic = payoff  # always needed for active surface
+    intrinsic = payoff if early_exercise else None
 
     df_0T = float(discount_curve.df(time_to_maturity))
 
@@ -1869,7 +1909,8 @@ def _fd_barrier_ki_core(
     mat_div = dividend_map.pop(0.0, None)
     if mat_div is not None:
         _apply_dividend_jump(V_act, grid, mat_div, space_grid=space_grid)
-        V_act[:] = np.maximum(V_act, payoff)
+        if early_exercise:
+            V_act[:] = np.maximum(V_act, payoff)
         _apply_dividend_jump(V_inact, grid, mat_div, space_grid=space_grid)
 
     ttm_key = round(time_to_maturity, 12)
@@ -1981,7 +2022,7 @@ def _fd_barrier_ki_core(
             smax=smax,
             df_tT=df_tT,
             dq_tT=dq_tT,
-            early_exercise=True,
+            early_exercise=early_exercise,
         )
 
         V_act_prev = V_act.copy()
@@ -2042,56 +2083,23 @@ def _fd_barrier_ki_core(
                 right_inact = V_act[j_H]  # inner (barrier side)
 
             if j_inact.size > 0:
-                # Extract sub-arrays of operator coefficients for j_inact
-                # a, b, c are indexed for full interior j=1..M-1 → a[k]
-                # corresponds to interior node k+1.  j_inact nodes map
-                # to coefficient indices j_inact - 1.
-                ci = j_inact - 1  # coefficient indices
-                a_sub = a[ci]
-                b_sub = b[ci]
-                c_sub = c[ci]
+                V_inact = _subgrid_pde_step(
+                    V_inact,
+                    V_inact_prev,
+                    j_inact,
+                    a,
+                    b,
+                    c,
+                    left_inact,
+                    right_inact,
+                    method_used,
+                    r_dt=r * d_tau if hull_discounting else 0.0,
+                )
 
-                if method_used in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
-                    hull_r_dt = r * d_tau if hull_discounting else 0.0
-                    left_vals = V_inact_prev[j_inact - 1].copy()
-                    right_vals = V_inact_prev[j_inact + 1].copy()
-                    # Explicit stepping uses the previous tau layer throughout
-                    # the stencil. Current-step Dirichlet values are imposed
-                    # only after the interior update, matching _explicit_step.
-                    interior = (
-                        -a_sub * left_vals
-                        + (1.0 - b_sub) * V_inact_prev[j_inact]
-                        - c_sub * right_vals
-                    )
-                    V_inact[j_inact] = interior / (1.0 + hull_r_dt)
-                    # Set the sub-grid boundary nodes explicitly for local
-                    # readability. These assignments are consistent with the
-                    # full-region coupling / far-field boundary updates below.
-                    V_inact[j_inact[0] - 1] = left_inact
-                    V_inact[j_inact[-1] + 1] = right_inact
-                elif method_used is PDEMethod.IMPLICIT:
-                    # Fully implicit: RHS = V_prev, full-weight coefficients
-                    diag = 1.0 + b_sub
-                    rhs = V_inact_prev[j_inact].copy()
-                    rhs[0] -= a_sub[0] * left_inact
-                    rhs[-1] -= c_sub[-1] * right_inact
-                    V_inact[j_inact] = _solve_tridiagonal_thomas(a_sub[1:], diag, c_sub[:-1], rhs)
-                else:
-                    # CN: half-weight coefficients
-                    a_h = a_sub * 0.5
-                    b_h = b_sub * 0.5
-                    c_h = c_sub * 0.5
-                    diag = 1.0 + b_h
-                    rhs = (
-                        -a_h * V_inact_prev[j_inact - 1]
-                        + (1.0 - b_h) * V_inact_prev[j_inact]
-                        - c_h * V_inact_prev[j_inact + 1]
-                    )
-                    rhs[0] -= a_h[0] * left_inact
-                    rhs[-1] -= c_h[-1] * right_inact
-                    V_inact[j_inact] = _solve_tridiagonal_thomas(a_h[1:], diag, c_h[:-1], rhs)
-
-            # Set coupled region: at and beyond barrier = V_act
+            # The sub-grid solve fills only the continuation-region interior.
+            # The assignments below complete the current V_inact slice over
+            # the full spatial grid by imposing the hit-side coupling region
+            # and the far-field boundary.
             if direction is BarrierDirection.DOWN:
                 V_inact[: j_H + 1] = V_act[: j_H + 1]
                 V_inact[-1] = rebate_bv  # far-field boundary
@@ -2162,7 +2170,8 @@ def _fd_barrier_ki_core(
             amount = dividend_map.get(round(tau_curr, 12))
             if amount is not None:
                 _apply_dividend_jump(V_act, grid, amount, space_grid=space_grid)
-                V_act[:] = np.maximum(V_act, intrinsic)
+                if early_exercise:
+                    V_act[:] = np.maximum(V_act, intrinsic)
                 _apply_dividend_jump(V_inact, grid, amount, space_grid=space_grid)
                 if continuous:
                     if direction is BarrierDirection.DOWN:
@@ -2204,8 +2213,8 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         if not isinstance(self._spec, BarrierSpec):
             raise ConfigurationError("_FDBarrierValuation requires a BarrierSpec.")
 
-    def _ko_solve_args(self) -> dict:
-        """Build keyword arguments for _fd_barrier_core (knock-out)."""
+    def _base_solve_args(self) -> dict:
+        """Build keyword arguments shared by both KO and KI solvers."""
         params = self.valuation_ctx.params
         if not isinstance(params, PDEParams):
             raise ConfigurationError("PDE valuation requires PDEParams on OptionValuation")
@@ -2226,7 +2235,6 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
             maturity=ctx.maturity,
             day_count_convention=ctx.day_count_convention,
         )
-
         # Resolve monitoring dates to taus
         monitoring_taus: list[float] | None = None
         if spec.monitoring is BarrierMonitoring.DISCRETE:
@@ -2238,7 +2246,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
                 day_count_convention=ctx.day_count_convention,
             )
 
-        return dict(
+        args = dict(
             spot=float(self.underlying.initial_value),
             strike=float(spec.strike),
             time_to_maturity=float(time_to_maturity),
@@ -2249,7 +2257,6 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
             option_type=spec.option_type,
             barrier=float(spec.barrier),
             direction=spec.direction,
-            action=BarrierAction.OUT,  # always KO for the core solver
             monitoring=spec.monitoring,
             rebate=float(spec.rebate),
             rebate_timing=spec.rebate_timing,
@@ -2268,81 +2275,24 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
             tol=float(params.tol) if early_exercise else None,
             max_iter=int(params.max_iter) if early_exercise else None,
         )
-
-    def _ki_solve_args(self) -> dict:
-        """Build keyword arguments for _fd_barrier_ki_core (knock-in)."""
-        params = self.valuation_ctx.params
-        if not isinstance(params, PDEParams):
-            raise ConfigurationError("PDE valuation requires PDEParams on OptionValuation")
-
-        spec = self._spec
-        ctx = self.valuation_ctx
-
-        time_to_maturity = calculate_year_fraction(
-            ctx.pricing_date,
-            ctx.maturity,
-            day_count_convention=ctx.day_count_convention,
-        )
-
-        dividend_schedule = _dividend_tau_schedule(
-            discrete_dividends=self.underlying.discrete_dividends,
-            pricing_date=ctx.pricing_date,
-            maturity=ctx.maturity,
-            day_count_convention=ctx.day_count_convention,
-        )
-
-        monitoring_taus: list[float] | None = None
-        if spec.monitoring is BarrierMonitoring.DISCRETE:
-            mon_dates = ctx._barrier_monitoring_dates()
-            monitoring_taus = _barrier_monitoring_taus(
-                monitoring_dates=mon_dates,
-                pricing_date=ctx.pricing_date,
-                maturity=ctx.maturity,
-                day_count_convention=ctx.day_count_convention,
-            )
-
-        return dict(
-            spot=float(self.underlying.initial_value),
-            strike=float(spec.strike),
-            time_to_maturity=float(time_to_maturity),
-            volatility=float(self.underlying.volatility),
-            discount_curve=ctx.discount_curve,
-            dividend_curve=self.underlying.dividend_curve,
-            dividend_schedule=dividend_schedule,
-            option_type=spec.option_type,
-            barrier=float(spec.barrier),
-            direction=spec.direction,
-            monitoring=spec.monitoring,
-            rebate=float(spec.rebate),
-            rebate_timing=spec.rebate_timing,
-            monitoring_taus=monitoring_taus,
-            smax_mult=float(params.smax_mult),
-            spot_steps=int(params.spot_steps),
-            time_steps=int(params.time_steps),
-            method=params.method,
-            rannacher_steps=int(params.rannacher_steps),
-            space_grid=params.space_grid,
-            american_solver=params.american_solver,
-            omega=float(params.omega),
-            tol=float(params.tol),
-            max_iter=int(params.max_iter),
-        )
+        return args
 
     def _solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the PDE solve, handling KI via parity or coupled PDE."""
         spec = self._spec
+        solve_args = self._base_solve_args()
 
         if spec.action is BarrierAction.OUT:
-            return _fd_barrier_core(**self._ko_solve_args())
+            return _fd_barrier_ko_core(**solve_args)
 
         # American knock-in: two-surface coupled PDE
         if spec.exercise_type is ExerciseType.AMERICAN:
-            return _fd_barrier_ki_core(**self._ki_solve_args())
+            return _fd_barrier_ki_core(**solve_args)
 
         # European knock-in via parity: V_KI = V_vanilla + R * df_T - V_KO
         # When R=0 this reduces to V_vanilla - V_KO.
-        ko_args = self._ko_solve_args()
-        ko_price, S_ko, V_ko, V_ko_prev, last_dtau_ko = _fd_barrier_core(**ko_args)
+        ko_args = solve_args
+        ko_price, S_ko, V_ko, V_ko_prev, last_dtau_ko = _fd_barrier_ko_core(**ko_args)
 
         # Vanilla solve (same parameters, no barrier)
         van_price, S_van, V_van, V_van_prev, last_dtau_van = _fd_core(
