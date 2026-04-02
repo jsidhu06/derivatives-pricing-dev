@@ -1378,6 +1378,7 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
                 paths,
                 time_index_end,
                 time_deltas,
+                t_grid,
                 discount_factors,
                 H,
                 sigma,
@@ -1446,8 +1447,7 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
             if action is BarrierAction.OUT:
                 knocked_out = ever_hit
                 if rebate_timing is RebateTiming.AT_HIT:
-                    hit_mask = knocked_out & (first_hit_step >= 0)
-                    rebate_pv[hit_mask] = rebate * discount_factors[first_hit_step[hit_mask]]
+                    rebate_pv[knocked_out] = rebate * discount_factors[first_hit_step[knocked_out]]
                 else:
                     rebate_pv[knocked_out] = rebate * float(discount_factors[time_index_end])
             else:
@@ -1461,6 +1461,7 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
         paths: np.ndarray,
         time_index_end: int,
         time_deltas: np.ndarray,
+        t_grid: np.ndarray,
         discount_factors: np.ndarray,
         H: float,
         sigma: float,
@@ -1506,7 +1507,12 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
                 and action is BarrierAction.OUT
                 and rebate_timing is RebateTiming.AT_HIT
             ):
-                rebate_pv += surv * p_hit * float(discount_factors[t]) * rebate
+                # Approximate the unknown intra-step hit time by discounting to the
+                # interval midpoint
+                midpoint_df = float(
+                    self.valuation_ctx.discount_curve.df(0.5 * (t_grid[t - 1] + t_grid[t]))
+                )
+                rebate_pv += surv * p_hit * midpoint_df * rebate
 
             surv *= p_surv_step
 
