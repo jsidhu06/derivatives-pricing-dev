@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import logging
 import datetime as dt
 import numpy as np
+import pandas as pd
 
 from ..utils import calculate_year_fraction, log_timing
 from ..stochastic_processes import PathSimulation, GBMProcess
@@ -1253,8 +1254,6 @@ def _resolve_monitoring_indices(
     np.ndarray
         Sorted, deduplicated integer indices into *time_grid*.
     """
-    import pandas as pd  # local import — not needed elsewhere in module
-
     if spec.monitoring is BarrierMonitoring.CONTINUOUS:
         return np.arange(len(time_grid))
 

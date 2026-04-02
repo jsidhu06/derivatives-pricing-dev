@@ -40,6 +40,7 @@ from ..enums import (
 )
 from ..exceptions import UnsupportedFeatureError
 from ..utils import calculate_year_fraction
+from .contracts import VanillaSpec
 
 if TYPE_CHECKING:
     from .contracts import BarrierSpec
@@ -545,8 +546,6 @@ class _AnalyticalBarrierValuation:
             return spec.rebate * df_r  # paid at expiry
 
         # Knock-in: already activated → price as vanilla
-        from .contracts import VanillaSpec
-
         vanilla_spec = VanillaSpec(
             option_type=spec.option_type,
             exercise_type=spec.exercise_type,
