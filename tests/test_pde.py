@@ -6,6 +6,8 @@ consistent prices.  These are internal engine tests — cross-method and
 QuantLib comparisons live in test_quantlib_comparison.py.
 """
 
+import datetime as dt
+
 import numpy as np
 import pytest
 
@@ -23,8 +25,11 @@ from derivatives_pricing.enums import (
     PricingMethod,
     RebateTiming,
 )
+from derivatives_pricing.market_environment import MarketData
 from derivatives_pricing.rates import DiscountCurve
+from derivatives_pricing.valuation import OptionValuation, UnderlyingData
 from derivatives_pricing.valuation.contracts import BarrierSpec, PayoffSpec
+from derivatives_pricing.valuation.pde import _FDBarrierValuation, _fd_barrier_ki_core
 from helpers import (
     flat_curve,
     market_data,
@@ -33,7 +38,6 @@ from helpers import (
     PRICING_DATE,
     MATURITY,
 )
-from derivatives_pricing.valuation import OptionValuation
 from derivatives_pricing.valuation.params import PDEParams
 
 
@@ -525,6 +529,66 @@ def test_pde_fd_barrier_equivalence_european(scenario):
 
             pv = _barrier_pde_value(scenario, params)
             assert np.isclose(pv, baseline, rtol=0.015)
+
+
+@pytest.mark.parametrize(
+    "option_type,strike,direction,barrier,rebate",
+    [
+        pytest.param(OptionType.CALL, 100.0, BarrierDirection.DOWN, 90.0, 0.0, id="down_in_call"),
+        pytest.param(OptionType.PUT, 100.0, BarrierDirection.DOWN, 90.0, 0.0, id="down_in_put"),
+        pytest.param(
+            OptionType.CALL, 95.0, BarrierDirection.UP, 105.0, 2.0, id="up_in_call_rebate"
+        ),
+        pytest.param(OptionType.PUT, 100.0, BarrierDirection.UP, 105.0, 2.0, id="up_in_put_rebate"),
+    ],
+)
+def test_pde_fd_barrier_european_ki_parity_matches_direct(
+    option_type: OptionType,
+    strike: float,
+    direction: BarrierDirection,
+    barrier: float,
+    rebate: float,
+):
+    """European KI parity pricing should closely track the direct KI PDE solve."""
+    curve_r = DiscountCurve.flat(0.05, 2)
+    curve_q = DiscountCurve.flat(0.03, 2)
+    pricing_date = dt.datetime(2025, 1, 1)
+    maturity = dt.datetime(2025, 12, 31)
+
+    md = MarketData(pricing_date, curve_r, currency="USD")
+    ud = UnderlyingData(
+        initial_value=96.0,
+        volatility=0.25,
+        market_data=md,
+        dividend_curve=curve_q,
+    )
+    barrier_spec = BarrierSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=strike,
+        maturity=maturity,
+        barrier=barrier,
+        direction=direction,
+        action=BarrierAction.IN,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=rebate,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
+    params = PDEParams(
+        spot_steps=600,
+        time_steps=600,
+        method=PDEMethod.CRANK_NICOLSON,
+        space_grid=PDESpaceGrid.LOG_SPOT,
+        rannacher_steps=2,
+    )
+
+    valuation = OptionValuation(ud, barrier_spec, PricingMethod.PDE_FD, params=params)
+    impl = _FDBarrierValuation(valuation)
+
+    parity_price = impl.present_value()
+    direct_price = _fd_barrier_ki_core(**impl._base_solve_args())[0]
+
+    assert np.isclose(parity_price, direct_price, rtol=0.003)
 
 
 @pytest.mark.slow

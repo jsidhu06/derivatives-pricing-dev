@@ -1503,8 +1503,8 @@ def _fd_barrier_ko_core(
     else:
         payoff = np.maximum(S - strike, 0.0)
 
-    # For continuous KO: payoff is zero on the barrier side (already
-    # enforced by grid truncation since the barrier is at the boundary).
+    # For continuous KO: payoff is zero on the barrier side (enforced
+    # by grid truncation since the barrier is at the boundary).
     # For discrete KO: zero out the payoff on the knocked-out side at maturity
     # only if maturity is a monitoring date (which it typically is).
     if not continuous:
