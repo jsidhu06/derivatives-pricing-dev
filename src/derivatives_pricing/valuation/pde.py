@@ -1254,11 +1254,7 @@ class _FDValuationBase(_FDGridGreeksMixin):
         dividend_curve = self.underlying.dividend_curve
         discrete_dividends = self.underlying.discrete_dividends
 
-        time_to_maturity = calculate_year_fraction(
-            self.valuation_ctx.pricing_date,
-            self.valuation_ctx.maturity,
-            day_count_convention=self.valuation_ctx.day_count_convention,
-        )
+        time_to_maturity = self.valuation_ctx._maturity_year_fraction()
 
         dividend_schedule = _dividend_tau_schedule(
             discrete_dividends=discrete_dividends,
@@ -2223,11 +2219,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         ctx = self.valuation_ctx
         early_exercise = spec.exercise_type is ExerciseType.AMERICAN
 
-        time_to_maturity = calculate_year_fraction(
-            ctx.pricing_date,
-            ctx.maturity,
-            day_count_convention=ctx.day_count_convention,
-        )
+        time_to_maturity = ctx._maturity_year_fraction()
 
         dividend_schedule = _dividend_tau_schedule(
             discrete_dividends=self.underlying.discrete_dividends,

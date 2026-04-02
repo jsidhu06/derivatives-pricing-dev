@@ -264,11 +264,7 @@ class _BinomialValuationBase:
                 "Tree Greeks are only available for vanilla binomial options, "
                 "not Asian or other path-dependent specs."
             )
-        T = calculate_year_fraction(
-            self.valuation_ctx.pricing_date,
-            self.valuation_ctx.maturity,
-            day_count_convention=self.valuation_ctx.day_count_convention,
-        )
+        T = self.valuation_ctx._maturity_year_fraction()
         dt = T / num_steps
         return option_lattice, spot_lattice, dt
 
@@ -931,12 +927,8 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         spot = float(self.underlying.initial_value)
         barrier = float(self.spec.barrier)
         sigma = float(self.underlying.volatility)
-        maturity = calculate_year_fraction(
-            self.valuation_ctx.pricing_date,
-            self.valuation_ctx.maturity,
-            day_count_convention=self.valuation_ctx.day_count_convention,
-        )
-        if spot <= 0.0 or barrier <= 0.0 or sigma <= 0.0 or maturity <= 0.0:
+        ttm = self.valuation_ctx._maturity_year_fraction()
+        if spot <= 0.0 or barrier <= 0.0 or sigma <= 0.0 or ttm <= 0.0:
             return base_steps
 
         log_distance = np.log(max(spot, barrier) / min(spot, barrier))
@@ -947,7 +939,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         max_steps = max(1000, base_steps * 5)
         optimum_steps = base_steps
         for i in range(1, base_steps):
-            candidate = int((i * i * sigma * sigma * maturity) / divisor)
+            candidate = int((i * i * sigma * sigma * ttm) / divisor)
             if base_steps < candidate:
                 optimum_steps = min(candidate, max_steps)
                 break
@@ -1077,12 +1069,8 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
                 return 0.0
             if self.spec.rebate_timing is RebateTiming.AT_HIT:
                 return float(self.spec.rebate)
-            maturity = calculate_year_fraction(
-                self.valuation_ctx.pricing_date,
-                self.valuation_ctx.maturity,
-                day_count_convention=self.valuation_ctx.day_count_convention,
-            )
-            return float(self.spec.rebate) * float(self.valuation_ctx.discount_curve.df(maturity))
+            ttm = self.valuation_ctx._maturity_year_fraction()
+            return float(self.spec.rebate) * float(self.valuation_ctx.discount_curve.df(ttm))
 
         vanilla_lattice = self._solve_backward(early_exercise=early_exercise, num_steps=num_steps)
         return float(vanilla_lattice[0, 0])

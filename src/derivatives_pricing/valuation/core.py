@@ -25,6 +25,7 @@ import datetime as dt
 import logging
 import numpy as np
 import pandas as pd
+from ..utils import calculate_year_fraction
 from ..stochastic_processes import PathSimulation, GBMProcess
 from ..exceptions import ConfigurationError, UnsupportedFeatureError, ValidationError
 from ..enums import (
@@ -717,6 +718,15 @@ class OptionValuation:
     # ──────────────────────────────
     # Private API (helpers)
     # ──────────────────────────────
+    def _maturity_year_fraction(self) -> float:
+        """Time to maturity in years under the valuation day-count convention."""
+        return float(
+            calculate_year_fraction(
+                self.pricing_date,
+                self.maturity,
+                day_count_convention=self.day_count_convention,
+            )
+        )
 
     @staticmethod
     def _fmt_dt(d: dt.datetime) -> str:
