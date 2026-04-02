@@ -2309,9 +2309,16 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         df_T = float(ko_args["discount_curve"].df(ko_args["time_to_maturity"]))
         ki_price = van_price + spec.rebate * df_T - ko_price
 
-        # For grid greeks we return the KO grid (best we can do)
-        V_ki = np.interp(S_ko, S_van, V_van) - V_ko
-        V_ki_prev = np.interp(S_ko, S_van, V_van_prev) - V_ko_prev
+        if last_dtau_ko > 0.0:
+            df_prev = float(ko_args["discount_curve"].df(last_dtau_ko))
+            rebate_prev = float(spec.rebate) * df_T / df_prev
+        else:
+            rebate_prev = float(spec.rebate) * df_T
+
+        # For grid greeks we return the KO grid (best we can do). Include the
+        # KI no-hit rebate PV in the reconstructed grids as well as the scalar price.
+        V_ki = np.interp(S_ko, S_van, V_van) + float(spec.rebate) * df_T - V_ko
+        V_ki_prev = np.interp(S_ko, S_van, V_van_prev) + rebate_prev - V_ko_prev
         return ki_price, S_ko, V_ki, V_ki_prev, last_dtau_ko
 
     def solve(self) -> tuple[float, np.ndarray, np.ndarray]:

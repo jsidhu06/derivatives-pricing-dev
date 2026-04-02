@@ -591,6 +591,57 @@ def test_pde_fd_barrier_european_ki_parity_matches_direct(
     assert np.isclose(parity_price, direct_price, rtol=0.003)
 
 
+def test_pde_fd_barrier_european_ki_rebate_grid_matches_direct_near_spot():
+    """Returned KI grids should include the rebate term near the spot node."""
+    curve_r = DiscountCurve.flat(0.05, 2)
+    curve_q = DiscountCurve.flat(0.03, 2)
+    pricing_date = dt.datetime(2025, 1, 1)
+    maturity = dt.datetime(2025, 12, 31)
+
+    md = MarketData(pricing_date, curve_r, currency="USD")
+    ud = UnderlyingData(
+        initial_value=96.0,
+        volatility=0.25,
+        market_data=md,
+        dividend_curve=curve_q,
+    )
+    barrier_spec = BarrierSpec(
+        option_type=OptionType.PUT,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=100.0,
+        maturity=maturity,
+        barrier=105.0,
+        direction=BarrierDirection.UP,
+        action=BarrierAction.IN,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=50.0,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
+    params = PDEParams(
+        spot_steps=400,
+        time_steps=400,
+        method=PDEMethod.CRANK_NICOLSON,
+        space_grid=PDESpaceGrid.LOG_SPOT,
+        rannacher_steps=2,
+    )
+
+    valuation = OptionValuation(ud, barrier_spec, PricingMethod.PDE_FD, params=params)
+    impl = _FDBarrierValuation(valuation)
+
+    _, S_parity, V_parity, V_parity_prev, _ = impl._solve()
+    _, S_direct, V_direct, V_direct_prev, _ = _fd_barrier_ki_core(**impl._base_solve_args())
+
+    V_direct_on_parity = np.interp(S_parity, S_direct, V_direct)
+    V_direct_prev_on_parity = np.interp(S_parity, S_direct, V_direct_prev)
+
+    j = int(np.searchsorted(S_parity, float(ud.initial_value)))
+    j = max(1, min(j, len(S_parity) - 2))
+    window = slice(max(0, j - 3), min(len(S_parity), j + 4))
+
+    assert np.allclose(V_parity[window], V_direct_on_parity[window], atol=0.002)
+    assert np.allclose(V_parity_prev[window], V_direct_prev_on_parity[window], atol=0.002)
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize("scenario", _AMERICAN_BARRIER_SCENARIOS)
 def test_pde_fd_barrier_equivalence_american(scenario):
