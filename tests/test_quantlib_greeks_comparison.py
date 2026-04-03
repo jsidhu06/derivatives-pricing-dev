@@ -24,6 +24,8 @@ from derivatives_pricing.enums import (
     DayCountConvention,
     ExerciseType,
     OptionType,
+    PDEMethod,
+    PDESpaceGrid,
     PricingMethod,
 )
 from derivatives_pricing.market_environment import MarketData
@@ -56,7 +58,7 @@ from derivatives_pricing.utils import calculate_year_fraction
 if TYPE_CHECKING:
     import QuantLib as ql_typing
 
-pytestmark = pytest.mark.slow
+# pytestmark = pytest.mark.slow
 
 ql = pytest.importorskip("QuantLib")
 
@@ -908,6 +910,15 @@ _BARRIER_SPOT = 100.0
 _BARRIER_VOL = 0.25
 _BARRIER_RATE = 0.05
 _BARRIER_DIV = 0.02
+_BARRIER_NUMERICAL_SPOT_BUMP_RATIO = 0.025
+_BARRIER_NUMERICAL_THETA_DAYS = 21.0
+_BARRIER_PDE_CFG = PDEParams(
+    spot_steps=800,
+    time_steps=800,
+    method=PDEMethod.CRANK_NICOLSON,
+    space_grid=PDESpaceGrid.LOG_SPOT,
+)
+_BARRIER_BINOM_CFG = BinomialParams(num_steps=400)
 
 _QL_BARRIER_TYPE = {
     (BarrierDirection.DOWN, BarrierAction.IN): ql.Barrier.DownIn,
@@ -930,8 +941,24 @@ def _barrier_nonflat_curves() -> tuple[DiscountCurve, DiscountCurve]:
     )
 
 
+def _barrier_numerical_spot_bump(spot: float) -> float:
+    return float(spot) * _BARRIER_NUMERICAL_SPOT_BUMP_RATIO
+
+
+def _dp_barrier_greeks_from_valuation(ov: OptionValuation, *, spot: float) -> dict[str, float]:
+    bump = _barrier_numerical_spot_bump(spot)
+    return {
+        "delta": ov.delta(epsilon=bump),
+        "gamma": ov.gamma(epsilon=bump),
+        "vega": ov.vega(),
+        "theta": ov.theta(time_bump_days=_BARRIER_NUMERICAL_THETA_DAYS),
+        "rho": ov.rho(),
+    }
+
+
 def _ql_barrier_bump_greeks(
     *,
+    engine: str,
     direction: BarrierDirection,
     action: BarrierAction,
     barrier: float,
@@ -941,8 +968,11 @@ def _ql_barrier_bump_greeks(
     vol: float,
     r_curve: DiscountCurve | None = None,
     q_curve: DiscountCurve | None = None,
+    grid_points: int = 800,
+    time_steps: int = 800,
+    binom_steps: int = 400,
 ) -> dict[str, float]:
-    """Compute barrier Greeks via QL bump-and-revalue (analytic engine)."""
+    """Compute barrier Greeks via QL bump-and-revalue for a chosen engine."""
     eval_date = ql.Date(PRICING_DATE.day, PRICING_DATE.month, PRICING_DATE.year)
     ql_dc = ql.Actual365Fixed()
     maturity_ql = ql.Date(MATURITY.day, MATURITY.month, MATURITY.year)
@@ -965,7 +995,14 @@ def _ql_barrier_bump_greeks(
         payoff = ql.PlainVanillaPayoff(ql_type, strike)
         exercise = ql.EuropeanExercise(maturity_ql)
         opt = ql.BarrierOption(bt, barrier, 0.0, payoff, exercise)
-        opt.setPricingEngine(ql.AnalyticBarrierEngine(pr))
+        if engine == "analytic":
+            opt.setPricingEngine(ql.AnalyticBarrierEngine(pr))
+        elif engine == "fd":
+            opt.setPricingEngine(ql.FdBlackScholesBarrierEngine(pr, time_steps, grid_points))
+        elif engine == "binomial":
+            opt.setPricingEngine(ql.BinomialCRRBarrierEngine(pr, binom_steps))
+        else:
+            raise ValueError(f"unsupported QL barrier engine: {engine}")
         return opt.NPV()
 
     r0 = _BARRIER_RATE
@@ -974,7 +1011,7 @@ def _ql_barrier_bump_greeks(
     pv0 = _price(spot, vol, r0, q0)
 
     # Delta & gamma
-    ds = spot * 0.01
+    ds = _barrier_numerical_spot_bump(spot)
     pv_up = _price(spot + ds, vol, r0, q0)
     pv_dn = _price(spot - ds, vol, r0, q0)
     delta = (pv_up - pv_dn) / (2 * ds)
@@ -985,8 +1022,8 @@ def _ql_barrier_bump_greeks(
     vega = (_price(spot, vol + dv, r0, q0) - _price(spot, vol - dv, r0, q0)) / (2 * dv) / 100
 
     # Theta (per calendar day = /365)
-    eval_fwd = eval_date + 1
-    theta = (_price(spot, vol, r0, q0, eval_fwd) - pv0) / (1.0 / 365.0) / 365.0
+    eval_fwd = eval_date + int(_BARRIER_NUMERICAL_THETA_DAYS)
+    theta = (_price(spot, vol, r0, q0, eval_fwd) - pv0) / _BARRIER_NUMERICAL_THETA_DAYS
 
     # Rho (per 1% = /100) — match DP convention: half-bumps ±dr/2, divide by dr
     dr = 0.01
@@ -1005,6 +1042,8 @@ def _ql_barrier_bump_greeks(
 
 def _dp_barrier_greeks(
     *,
+    pricing_method: PricingMethod,
+    params: BinomialParams | PDEParams | None = None,
     direction: BarrierDirection,
     action: BarrierAction,
     barrier: float,
@@ -1013,7 +1052,7 @@ def _dp_barrier_greeks(
     r_curve: DiscountCurve | None = None,
     q_curve: DiscountCurve | None = None,
 ) -> dict[str, float]:
-    """Compute barrier Greeks via DP (numerical bump-and-revalue)."""
+    """Compute barrier Greeks via a selected DP pricing engine."""
     ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
     rc = r_curve if r_curve is not None else DiscountCurve.flat(_BARRIER_RATE, end_time=ttm)
     qc = q_curve if q_curve is not None else DiscountCurve.flat(_BARRIER_DIV, end_time=ttm)
@@ -1033,14 +1072,8 @@ def _dp_barrier_greeks(
         direction=direction,
         action=action,
     )
-    ov = OptionValuation(ud, spec, PricingMethod.BSM)
-    return {
-        "delta": ov.delta(),
-        "gamma": ov.gamma(),
-        "vega": ov.vega(),
-        "theta": ov.theta(),
-        "rho": ov.rho(),
-    }
+    ov = OptionValuation(ud, spec, pricing_method, params=params)
+    return _dp_barrier_greeks_from_valuation(ov, spot=_BARRIER_SPOT)
 
 
 _BARRIER_GREEK_SCENARIOS = [
@@ -1138,8 +1171,9 @@ def test_barrier_greeks_vs_quantlib(
     r_curve,
     q_curve,
 ):
-    """European barrier numerical Greeks: DP vs QL bump-and-revalue."""
-    dp_g = _dp_barrier_greeks(
+    """European barrier Greeks: DP analytical/binomial/PDE vs QuantLib references."""
+    dp_an = _dp_barrier_greeks(
+        pricing_method=PricingMethod.BSM,
         direction=direction,
         action=action,
         barrier=barrier,
@@ -1148,7 +1182,8 @@ def test_barrier_greeks_vs_quantlib(
         r_curve=r_curve,
         q_curve=q_curve,
     )
-    ql_g = _ql_barrier_bump_greeks(
+    ql_an = _ql_barrier_bump_greeks(
+        engine="analytic",
         direction=direction,
         action=action,
         barrier=barrier,
@@ -1160,23 +1195,88 @@ def test_barrier_greeks_vs_quantlib(
         q_curve=q_curve,
     )
 
-    # Both sides do bump-and-revalue on analytical engines, so tight tolerances.
-    tols = {"delta": 1e-4, "gamma": 1e-3, "vega": 1e-4, "theta": 0.02, "rho": 1e-3}
+    dp_bn = _dp_barrier_greeks(
+        pricing_method=PricingMethod.BINOMIAL,
+        params=_BARRIER_BINOM_CFG,
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        r_curve=r_curve,
+        q_curve=q_curve,
+    )
+    dp_pde = _dp_barrier_greeks(
+        pricing_method=PricingMethod.PDE_FD,
+        params=_BARRIER_PDE_CFG,
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        r_curve=r_curve,
+        q_curve=q_curve,
+    )
+
+    if r_curve is not None:
+        ql_ref = _ql_barrier_bump_greeks(
+            engine="fd",
+            direction=direction,
+            action=action,
+            barrier=barrier,
+            option_type=option_type,
+            strike=strike,
+            spot=_BARRIER_SPOT,
+            vol=_BARRIER_VOL,
+            r_curve=r_curve,
+            q_curve=q_curve,
+            grid_points=_BARRIER_PDE_CFG.spot_steps,
+            time_steps=_BARRIER_PDE_CFG.time_steps,
+        )
+    else:
+        ql_ref = ql_an
+
+    an_tols = {"delta": 1e-4, "gamma": 1e-3, "vega": 1e-4, "theta": 0.02, "rho": 1e-3}
+    binom_tols = {"delta": 0.03, "gamma": 0.12, "vega": 0.08, "theta": 0.30, "rho": 0.08}
+    pde_tols = {"delta": 0.03, "gamma": 0.06, "vega": 0.10, "theta": 0.10, "rho": 0.08}
+    pde_atols = {"delta": 0.012, "gamma": 1e-6, "vega": 1e-6, "theta": 1e-6, "rho": 1e-6}
 
     for greek in ("delta", "gamma", "vega", "theta", "rho"):
-        ql_val = ql_g[greek]
-        dp_val = dp_g[greek]
+        ql_an_val = ql_an[greek]
+        dp_an_val = dp_an[greek]
         logger.info(
-            "Barrier %s-%s %s %s K=%.0f H=%.0f | DP=%.6f QL=%.6f",
+            "Barrier %s-%s %s %s K=%.0f H=%.0f | DP_AN=%.6f QL_AN=%.6f",
             direction.value,
             action.value,
             option_type.value,
             greek,
             strike,
             barrier,
-            dp_val,
-            ql_val,
+            dp_an_val,
+            ql_an_val,
         )
-        assert np.isclose(dp_val, ql_val, rtol=tols[greek], atol=1e-6), (
-            f"{greek}: DP {dp_val:.6f} vs QL {ql_val:.6f}"
+        assert np.isclose(dp_an_val, ql_an_val, rtol=an_tols[greek], atol=1e-6), (
+            f"{greek}: DP_AN {dp_an_val:.6f} vs QL_AN {ql_an_val:.6f}"
+        )
+
+        ql_ref_val = ql_ref[greek]
+        dp_bn_val = dp_bn[greek]
+        dp_pde_val = dp_pde[greek]
+        logger.info(
+            "Barrier %s-%s %s %s K=%.0f H=%.0f | DP_BN=%.6f DP_PDE=%.6f QL_REF=%.6f",
+            direction.value,
+            action.value,
+            option_type.value,
+            greek,
+            strike,
+            barrier,
+            dp_bn_val,
+            dp_pde_val,
+            ql_ref_val,
+        )
+        assert np.isclose(dp_bn_val, ql_ref_val, rtol=binom_tols[greek], atol=1e-6), (
+            f"{greek}: DP_BN {dp_bn_val:.6f} vs QL_REF {ql_ref_val:.6f}"
+        )
+        assert np.isclose(dp_pde_val, ql_ref_val, rtol=pde_tols[greek], atol=pde_atols[greek]), (
+            f"{greek}: DP_PDE {dp_pde_val:.6f} vs QL_REF {ql_ref_val:.6f}"
         )

@@ -1053,14 +1053,13 @@ class OptionValuation:
 
         # --- validate explicit choice ---
 
-        # Asian/Barrier options only support NUMERICAL — no engine-native Greeks.
+        # Asian options only support NUMERICAL — no engine-native Greeks.
         if (
-            isinstance(self._spec, (AsianSpec, BarrierSpec))
+            isinstance(self._spec, AsianSpec)
             and greek_calc_method is not GreekCalculationMethod.NUMERICAL
         ):
-            spec_name = "Asian" if isinstance(self._spec, AsianSpec) else "Barrier"
             raise UnsupportedFeatureError(
-                f"{spec_name} options only support GreekCalculationMethod.NUMERICAL "
+                f"Asian options only support GreekCalculationMethod.NUMERICAL "
                 f"(bump-and-revalue), got {greek_calc_method.name}."
             )
 
@@ -1099,10 +1098,11 @@ class OptionValuation:
         grid_capable: bool,
     ) -> GreekCalculationMethod:
         """Choose the best Greek method for the current pricing engine."""
-        # Asian/Barrier options: no engine-native Greeks implemented — always bump-and-revalue.
-        if isinstance(self._spec, (AsianSpec, BarrierSpec)):
+        # Asian options: no engine-native Greeks implemented — always bump-and-revalue.
+        if isinstance(self._spec, AsianSpec):
             return GreekCalculationMethod.NUMERICAL
-        if self._pricing_method is PricingMethod.BSM:
+        if self._pricing_method is PricingMethod.BSM and not isinstance(self._spec, BarrierSpec):
+            # Analytical Greeks not available for barriers
             return GreekCalculationMethod.ANALYTICAL
         if tree_capable and self._pricing_method is PricingMethod.BINOMIAL:
             return GreekCalculationMethod.TREE
