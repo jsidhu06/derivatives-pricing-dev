@@ -688,3 +688,60 @@ def test_pde_fd_barrier_equivalence_american(scenario):
                 # even across robust formulations, so use a wider neighborhood
                 # tolerance than the plain vanilla equivalence tests.
                 assert np.isclose(pv, baseline_by_solver[solver], rtol=0.05)
+
+
+def test_european_knock_in_grid_gamma_uses_native_surface_parity():
+    """European KI grid gamma should follow vanilla-minus-KO parity."""
+    r_curve = DiscountCurve.flat(0.05, end_time=1.0)
+    q_curve = DiscountCurve.flat(0.02, end_time=1.0)
+    md = MarketData(PRICING_DATE, r_curve, currency="USD")
+    ud = UnderlyingData(
+        initial_value=100.0,
+        volatility=0.25,
+        market_data=md,
+        dividend_curve=q_curve,
+    )
+    params = PDEParams(spot_steps=400, time_steps=400)
+
+    ki_spec = BarrierSpec(
+        option_type=OptionType.CALL,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=105.0,
+        maturity=MATURITY,
+        barrier=115.0,
+        direction=BarrierDirection.UP,
+        action=BarrierAction.IN,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=0.0,
+        rebate_timing=RebateTiming.AT_HIT,
+    )
+    ko_spec = BarrierSpec(
+        option_type=OptionType.CALL,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=105.0,
+        maturity=MATURITY,
+        barrier=115.0,
+        direction=BarrierDirection.UP,
+        action=BarrierAction.OUT,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=0.0,
+        rebate_timing=RebateTiming.AT_HIT,
+    )
+    vanilla_spec = spec(
+        strike=105.0,
+        option_type=OptionType.CALL,
+        exercise=ExerciseType.EUROPEAN,
+    )
+
+    ki = OptionValuation(ud, ki_spec, PricingMethod.PDE_FD, params=params)
+    ko = OptionValuation(ud, ko_spec, PricingMethod.PDE_FD, params=params)
+    vanilla = OptionValuation(ud, vanilla_spec, PricingMethod.PDE_FD, params=params)
+
+    gamma_grid = ki.gamma(greek_calc_method=GreekCalculationMethod.GRID)
+    gamma_parity = vanilla.gamma(greek_calc_method=GreekCalculationMethod.GRID) - ko.gamma(
+        greek_calc_method=GreekCalculationMethod.GRID
+    )
+    gamma_numerical = ki.gamma(greek_calc_method=GreekCalculationMethod.NUMERICAL)
+
+    assert np.isclose(gamma_grid, gamma_parity, rtol=1.0e-4, atol=1.0e-4)
+    assert np.isclose(gamma_grid, gamma_numerical, rtol=0.01, atol=1.0e-4)

@@ -1139,6 +1139,23 @@ class _FDGridGreeksMixin:
     valuation_ctx: OptionValuation
     underlying: UnderlyingData
 
+    @staticmethod
+    def _spot_grid_index(S: np.ndarray, spot: float) -> int:
+        """Return the nearest interior grid index to the current spot."""
+        j = int(np.searchsorted(S, spot))
+        return max(1, min(j, len(S) - 2))
+
+    @staticmethod
+    def _grid_gamma_at_index(S: np.ndarray, V: np.ndarray, j: int) -> float:
+        """Return the non-uniform three-point gamma stencil at index ``j``."""
+        h_up = S[j + 1] - S[j]
+        h_dn = S[j] - S[j - 1]
+        return float(
+            2.0
+            * (V[j + 1] * h_dn + V[j - 1] * h_up - V[j] * (h_up + h_dn))
+            / (h_up * h_dn * (h_up + h_dn))
+        )
+
     def _solve(
         self,
     ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]: ...
@@ -1157,9 +1174,7 @@ class _FDGridGreeksMixin:
         """
         _, S, V, V_prev, last_dtau = self._solve()
         spot = float(self.underlying.initial_value)
-        j = int(np.searchsorted(S, spot))
-        # Clamp to interior so the 3-point stencil is valid.
-        j = max(1, min(j, len(S) - 2))
+        j = self._spot_grid_index(S, spot)
         return S, V, V_prev, last_dtau, j
 
     def delta(self) -> float:
@@ -1184,13 +1199,7 @@ class _FDGridGreeksMixin:
         :math:`(V_{j+1} - 2V_j + V_{j-1}) / h^2`.
         """
         S, V, _, _, j = self._grid_greeks_data()
-        h_up = S[j + 1] - S[j]
-        h_dn = S[j] - S[j - 1]
-        return float(
-            2.0
-            * (V[j + 1] * h_dn + V[j - 1] * h_up - V[j] * (h_up + h_dn))
-            / (h_up * h_dn * (h_up + h_dn))
-        )
+        return self._grid_gamma_at_index(S, V, j)
 
     def theta(self) -> float:
         r"""Grid theta via backward difference between the last two time
@@ -2269,6 +2278,52 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         )
         return args
 
+    def _solve_european_ki_components(
+        self,
+    ) -> tuple[
+        dict,
+        tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+        tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+    ]:
+        """Return the native KO and vanilla solves used by European KI parity."""
+        solve_args = self._base_solve_args()
+        ko_result = _fd_barrier_ko_core(**solve_args)
+        van_result = _fd_core(
+            spot=solve_args["spot"],
+            strike=solve_args["strike"],
+            time_to_maturity=solve_args["time_to_maturity"],
+            volatility=solve_args["volatility"],
+            discount_curve=solve_args["discount_curve"],
+            dividend_curve=solve_args["dividend_curve"],
+            dividend_schedule=solve_args["dividend_schedule"],
+            option_type=self._spec.option_type,
+            smax_mult=solve_args["smax_mult"],
+            spot_steps=solve_args["spot_steps"],
+            time_steps=solve_args["time_steps"],
+            early_exercise=False,
+            method=solve_args["method"],
+            rannacher_steps=solve_args["rannacher_steps"],
+            space_grid=solve_args["space_grid"],
+            american_solver=PDEEarlyExercise.INTRINSIC,
+        )
+        return solve_args, ko_result, van_result
+
+    def gamma(self) -> float:
+        """Return grid gamma, using native-surface parity for European KI barriers."""
+        spec = self._spec
+        if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
+            return super().gamma()
+
+        _, ko_result, van_result = self._solve_european_ki_components()
+        _, S_ko, V_ko, _, _ = ko_result
+        _, S_van, V_van, _, _ = van_result
+        spot = float(self.underlying.initial_value)
+        j_ko = self._spot_grid_index(S_ko, spot)
+        j_van = self._spot_grid_index(S_van, spot)
+        return self._grid_gamma_at_index(S_van, V_van, j_van) - self._grid_gamma_at_index(
+            S_ko, V_ko, j_ko
+        )
+
     def _solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the PDE solve, handling KI via parity or coupled PDE."""
         spec = self._spec
@@ -2283,28 +2338,9 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
         # European knock-in via parity: V_KI = V_vanilla + R * df_T - V_KO
         # When R=0 this reduces to V_vanilla - V_KO.
-        ko_args = solve_args
-        ko_price, S_ko, V_ko, V_ko_prev, last_dtau_ko = _fd_barrier_ko_core(**ko_args)
-
-        # Vanilla solve (same parameters, no barrier)
-        van_price, S_van, V_van, V_van_prev, last_dtau_van = _fd_core(
-            spot=ko_args["spot"],
-            strike=ko_args["strike"],
-            time_to_maturity=ko_args["time_to_maturity"],
-            volatility=ko_args["volatility"],
-            discount_curve=ko_args["discount_curve"],
-            dividend_curve=ko_args["dividend_curve"],
-            dividend_schedule=ko_args["dividend_schedule"],
-            option_type=spec.option_type,
-            smax_mult=ko_args["smax_mult"],
-            spot_steps=ko_args["spot_steps"],
-            time_steps=ko_args["time_steps"],
-            early_exercise=False,  # European parity
-            method=ko_args["method"],
-            rannacher_steps=ko_args["rannacher_steps"],
-            space_grid=ko_args["space_grid"],
-            american_solver=PDEEarlyExercise.INTRINSIC,
-        )
+        ko_args, ko_result, van_result = self._solve_european_ki_components()
+        ko_price, S_ko, V_ko, V_ko_prev, last_dtau_ko = ko_result
+        van_price, S_van, V_van, V_van_prev, _ = van_result
 
         df_T = float(ko_args["discount_curve"].df(ko_args["time_to_maturity"]))
         ki_price = van_price + spec.rebate * df_T - ko_price
