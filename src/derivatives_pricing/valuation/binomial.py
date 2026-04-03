@@ -47,11 +47,11 @@ class _BinomialValuationBase:
             )
         self.binom_params: BinomialParams = valuation_ctx.params
 
-    def _setup_binomial_parameters(
-        self,
-        *,
-        num_steps: int | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _effective_num_steps(self) -> int:
+        """Return the canonical tree depth for this engine instance."""
+        return int(self.binom_params.num_steps)
+
+    def _setup_binomial_parameters(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Setup binomial tree parameters and lattice.
 
 
@@ -62,10 +62,7 @@ class _BinomialValuationBase:
             p : shape (num_steps,) — risk-neutral up-move probabilities
             spot_lattice : shape (num_steps+1, num_steps+1) — CRR spot prices
         """
-        if num_steps is None:
-            num_steps = int(self.binom_params.num_steps)
-        else:
-            num_steps = int(num_steps)
+        num_steps = self._effective_num_steps()
         start = self.valuation_ctx.pricing_date
         end = self.valuation_ctx.maturity
         time_intervals = pd.date_range(start, end, periods=num_steps + 1)
@@ -210,7 +207,7 @@ class _BinomialValuationBase:
         payoff_fn = self.valuation_ctx.spec.payoff  # type: ignore[union-attr]
         return payoff_fn(instrument_values)
 
-    def _solve_backward(self, *, early_exercise: bool, num_steps: int | None = None) -> np.ndarray:
+    def _solve_backward(self, *, early_exercise: bool) -> np.ndarray:
         """Run CRR backward induction, optionally with early exercise.
 
         Parameters
@@ -224,11 +221,8 @@ class _BinomialValuationBase:
         np.ndarray
             Option value lattice, shape ``(num_steps+1, num_steps+1)``.
         """
-        if num_steps is None:
-            num_steps = int(self.binom_params.num_steps)
-        else:
-            num_steps = int(num_steps)
-        discount_factors, p, spot_lattice = self._setup_binomial_parameters(num_steps=num_steps)
+        num_steps = self._effective_num_steps()
+        discount_factors, p, spot_lattice = self._setup_binomial_parameters()
 
         option_lattice = np.zeros_like(spot_lattice)
         intrinsic = self._get_intrinsic_values(spot_lattice)
@@ -256,7 +250,7 @@ class _BinomialValuationBase:
         Raises UnsupportedFeatureError for Asian or other non-vanilla specs
         whose ``solve()`` does not return a 2-D option lattice.
         """
-        num_steps = int(self.binom_params.num_steps)
+        num_steps = self._effective_num_steps()
         _, _, spot_lattice = self._setup_binomial_parameters()
         option_lattice = self.solve()  # type: ignore[attr-defined]
         if not isinstance(option_lattice, np.ndarray) or option_lattice.ndim != 2:
@@ -294,7 +288,7 @@ class _BinomialValuationBase:
         :math:`\\Delta_- = (f_{ud}-f_{dd})/(S_{ud}-S_{dd})`,
         and :math:`h = (S_{uu}-S_{dd})/2`.
         """
-        if self.binom_params.num_steps < 2:
+        if self._effective_num_steps() < 2:
             raise ValidationError("Tree gamma requires num_steps >= 2.")
         f, S, _ = self._tree_greeks_data()
         delta_up = (f[0, 2] - f[1, 2]) / (S[0, 2] - S[1, 2])
@@ -312,7 +306,7 @@ class _BinomialValuationBase:
         where :math:`f_{ud}` is the central node at step 2 and :math:`f_0`
         the root value.  Returned per **calendar day** (divided by 365).
         """
-        if self.binom_params.num_steps < 2:
+        if self._effective_num_steps() < 2:
             raise ValidationError("Tree theta requires num_steps >= 2.")
         f, _, dt = self._tree_greeks_data()
         theta_per_year = (f[1, 2] - f[0, 0]) / (2.0 * dt)
@@ -324,7 +318,7 @@ class _BinomialEuropeanValuation(_BinomialValuationBase):
 
     def solve(self) -> np.ndarray:
         """Compute the option value lattice using a binomial tree."""
-        logger.debug("Binomial European num_steps=%d", self.binom_params.num_steps)
+        logger.debug("Binomial European num_steps=%d", self._effective_num_steps())
         return self._solve_backward(early_exercise=False)
 
     def present_value(self) -> float:
@@ -341,7 +335,7 @@ class _BinomialAmericanValuation(_BinomialValuationBase):
 
     def solve(self) -> np.ndarray:
         """Compute the option value lattice using a binomial tree with early exercise."""
-        logger.debug("Binomial American num_steps=%d", self.binom_params.num_steps)
+        logger.debug("Binomial American num_steps=%d", self._effective_num_steps())
         return self._solve_backward(early_exercise=True)
 
     def present_value(self) -> float:
@@ -400,7 +394,7 @@ class _BinomialAsianValuation(_BinomialValuationBase):
                 "set mc_paths to None in BinomialParams."
             )
 
-        num_steps = int(self.binom_params.num_steps)
+        num_steps = self._effective_num_steps()
         logger.debug(
             "Binomial Asian MC num_steps=%d paths=%s", num_steps, self.binom_params.mc_paths
         )
@@ -697,7 +691,7 @@ class _BinomialAsianValuation(_BinomialValuationBase):
             values : (k, N+1, N+1) — option values per average bucket
             avg_grid : (k, N+1, N+1) — representative averages
         """
-        num_steps = int(self.binom_params.num_steps)
+        num_steps = self._effective_num_steps()
         logger.debug(
             "Binomial Asian Hull num_steps=%d averages=%s",
             num_steps,
@@ -865,6 +859,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         self.spec: BarrierSpec = valuation_ctx.spec  # type: ignore[assignment]
         if not hasattr(self.spec, "barrier"):
             raise ConfigurationError("_BinomialBarrierValuation requires a BarrierSpec.")
+        self._effective_steps = self._resolve_effective_num_steps()
 
     @staticmethod
     def _is_triggered(spot: float, barrier: float, direction: BarrierDirection) -> bool:
@@ -919,7 +914,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         mask[0] = False
         return mask
 
-    def _effective_num_steps(self) -> int:
+    def _resolve_effective_num_steps(self) -> int:
         base_steps = int(self.binom_params.num_steps)
         if self.spec.monitoring is not BarrierMonitoring.CONTINUOUS:
             return base_steps
@@ -945,6 +940,9 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
                 break
         return optimum_steps
 
+    def _effective_num_steps(self) -> int:
+        return self._effective_steps
+
     def _ko_rebate_values(
         self,
         *,
@@ -962,8 +960,9 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
             to_maturity[:num_steps] = np.cumprod(discount_factors[::-1])[::-1]
         return rebate * to_maturity
 
-    def _solve_knock_out(self, *, early_exercise: bool, num_steps: int) -> np.ndarray:
-        discount_factors, p, spot_lattice = self._setup_binomial_parameters(num_steps=num_steps)
+    def _solve_knock_out(self, *, early_exercise: bool) -> np.ndarray:
+        num_steps = self._effective_num_steps()
+        discount_factors, p, spot_lattice = self._setup_binomial_parameters()
         intrinsic = self._get_intrinsic_values(spot_lattice)
         option_lattice = np.zeros_like(spot_lattice)
         monitoring_mask = self._monitoring_step_mask(num_steps)
@@ -1007,10 +1006,9 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
 
         return option_lattice
 
-    def _solve_knock_in(
-        self, *, early_exercise: bool, num_steps: int
-    ) -> tuple[np.ndarray, np.ndarray]:
-        discount_factors, p, spot_lattice = self._setup_binomial_parameters(num_steps=num_steps)
+    def _solve_knock_in(self, *, early_exercise: bool) -> tuple[np.ndarray, np.ndarray]:
+        num_steps = self._effective_num_steps()
+        discount_factors, p, spot_lattice = self._setup_binomial_parameters()
         intrinsic = self._get_intrinsic_values(spot_lattice)
         monitoring_mask = self._monitoring_step_mask(num_steps)
 
@@ -1056,7 +1054,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
 
         return active, inactive
 
-    def _initial_value_if_triggered(self, *, early_exercise: bool, num_steps: int) -> float | None:
+    def _initial_value_if_triggered(self, *, early_exercise: bool) -> float | None:
         if not self._is_triggered(
             float(self.underlying.initial_value),
             float(self.spec.barrier),
@@ -1072,22 +1070,19 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
             ttm = self.valuation_ctx._maturity_year_fraction()
             return float(self.spec.rebate) * float(self.valuation_ctx.discount_curve.df(ttm))
 
-        vanilla_lattice = self._solve_backward(early_exercise=early_exercise, num_steps=num_steps)
+        vanilla_lattice = self._solve_backward(early_exercise=early_exercise)
         return float(vanilla_lattice[0, 0])
 
     def solve(self) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-        num_steps = self._effective_num_steps()
         early_exercise = self.spec.exercise_type is ExerciseType.AMERICAN
         if self.spec.action is BarrierAction.OUT:
-            return self._solve_knock_out(early_exercise=early_exercise, num_steps=num_steps)
-        return self._solve_knock_in(early_exercise=early_exercise, num_steps=num_steps)
+            return self._solve_knock_out(early_exercise=early_exercise)
+        return self._solve_knock_in(early_exercise=early_exercise)
 
     def present_value(self) -> float:
-        num_steps = self._effective_num_steps()
         early_exercise = self.spec.exercise_type is ExerciseType.AMERICAN
         triggered_value = self._initial_value_if_triggered(
             early_exercise=early_exercise,
-            num_steps=num_steps,
         )
         if triggered_value is not None:
             return triggered_value
