@@ -943,6 +943,37 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
     def _effective_num_steps(self) -> int:
         return self._effective_steps
 
+    def _tree_greek_option_lattice(self, *, early_exercise: bool) -> np.ndarray:
+        """Return the single lattice used for tree-greek extraction.
+
+        Knock-ins use the inactive-state lattice because that is the contract's
+        state at the root. If the knock-in barrier is already triggered at
+        inception, tree greeks should follow the same vanilla shortcut used by
+        present_value().
+        """
+        if self.spec.action is BarrierAction.OUT:
+            return self._solve_knock_out(early_exercise=early_exercise)
+
+        if self._is_triggered(
+            float(self.underlying.initial_value),
+            float(self.spec.barrier),
+            self.spec.direction,
+        ):
+            return self._solve_backward(early_exercise=early_exercise)
+
+        _, inactive = self._solve_knock_in(early_exercise=early_exercise)
+        return inactive
+
+    def _tree_greeks_data(self) -> tuple[np.ndarray, np.ndarray, float]:
+        """Return the barrier lattice used for tree-greek extraction."""
+        num_steps = self._effective_num_steps()
+        _, _, spot_lattice = self._setup_binomial_parameters()
+        early_exercise = self.spec.exercise_type is ExerciseType.AMERICAN
+        option_lattice = self._tree_greek_option_lattice(early_exercise=early_exercise)
+        T = self.valuation_ctx._maturity_year_fraction()
+        dt = T / num_steps
+        return option_lattice, spot_lattice, dt
+
     def _ko_rebate_values(
         self,
         *,

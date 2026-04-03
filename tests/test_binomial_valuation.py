@@ -11,6 +11,7 @@ from derivatives_pricing.enums import (
     BarrierMonitoring,
     DayCountConvention,
     ExerciseType,
+    GreekCalculationMethod,
     OptionType,
     PricingMethod,
 )
@@ -161,3 +162,99 @@ class TestBinomialValuation:
         solved_lattice = engine.solve()
 
         assert solved_lattice.shape == (effective_steps + 1, effective_steps + 1)
+
+    def test_binomial_knock_in_tree_greeks_use_inactive_lattice(self):
+        barrier_spec = BarrierSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=STRIKE,
+            maturity=MATURITY,
+            barrier=115.0,
+            direction=BarrierDirection.UP,
+            action=BarrierAction.IN,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+        valuation = OptionValuation(
+            underlying(),
+            barrier_spec,
+            PricingMethod.BINOMIAL,
+            params=BinomialParams(num_steps=200),
+        )
+        engine = _BinomialBarrierValuation(valuation)
+
+        _, inactive = engine._solve_knock_in(early_exercise=False)
+        _, _, spot_lattice = engine._setup_binomial_parameters()
+        T = valuation._maturity_year_fraction()
+        dt = T / engine._effective_num_steps()
+
+        expected_delta = (inactive[0, 1] - inactive[1, 1]) / (
+            spot_lattice[0, 1] - spot_lattice[1, 1]
+        )
+        delta_up = (inactive[0, 2] - inactive[1, 2]) / (spot_lattice[0, 2] - spot_lattice[1, 2])
+        delta_down = (inactive[1, 2] - inactive[2, 2]) / (spot_lattice[1, 2] - spot_lattice[2, 2])
+        h = (spot_lattice[0, 2] - spot_lattice[2, 2]) / 2.0
+        expected_gamma = (delta_up - delta_down) / h
+        expected_theta = ((inactive[1, 2] - inactive[0, 0]) / (2.0 * dt)) / 365.0
+
+        assert np.isclose(
+            valuation.delta(greek_calc_method=GreekCalculationMethod.TREE),
+            expected_delta,
+        )
+        assert np.isclose(
+            valuation.gamma(greek_calc_method=GreekCalculationMethod.TREE),
+            expected_gamma,
+        )
+        assert np.isclose(
+            valuation.theta(greek_calc_method=GreekCalculationMethod.TREE),
+            expected_theta,
+        )
+
+    def test_binomial_knock_in_tree_greeks_use_vanilla_lattice_when_triggered(self):
+        barrier_spec = BarrierSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=STRIKE,
+            maturity=MATURITY,
+            barrier=95.0,
+            direction=BarrierDirection.UP,
+            action=BarrierAction.IN,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+        valuation = OptionValuation(
+            underlying(),
+            barrier_spec,
+            PricingMethod.BINOMIAL,
+            params=BinomialParams(num_steps=200),
+        )
+        engine = _BinomialBarrierValuation(valuation)
+
+        vanilla_lattice = engine._solve_backward(early_exercise=False)
+        _, _, spot_lattice = engine._setup_binomial_parameters()
+        T = valuation._maturity_year_fraction()
+        dt = T / engine._effective_num_steps()
+
+        expected_delta = (vanilla_lattice[0, 1] - vanilla_lattice[1, 1]) / (
+            spot_lattice[0, 1] - spot_lattice[1, 1]
+        )
+        delta_up = (vanilla_lattice[0, 2] - vanilla_lattice[1, 2]) / (
+            spot_lattice[0, 2] - spot_lattice[1, 2]
+        )
+        delta_down = (vanilla_lattice[1, 2] - vanilla_lattice[2, 2]) / (
+            spot_lattice[1, 2] - spot_lattice[2, 2]
+        )
+        h = (spot_lattice[0, 2] - spot_lattice[2, 2]) / 2.0
+        expected_gamma = (delta_up - delta_down) / h
+        expected_theta = ((vanilla_lattice[1, 2] - vanilla_lattice[0, 0]) / (2.0 * dt)) / 365.0
+
+        assert np.isclose(
+            valuation.delta(greek_calc_method=GreekCalculationMethod.TREE),
+            expected_delta,
+        )
+        assert np.isclose(
+            valuation.gamma(greek_calc_method=GreekCalculationMethod.TREE),
+            expected_gamma,
+        )
+        assert np.isclose(
+            valuation.theta(greek_calc_method=GreekCalculationMethod.TREE),
+            expected_theta,
+        )
