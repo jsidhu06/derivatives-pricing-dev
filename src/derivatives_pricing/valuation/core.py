@@ -346,9 +346,13 @@ class OptionValuation:
                     )
 
             # Inject barrier monitoring dates into the copy's sim_config.
-            if isinstance(spec, BarrierSpec):
+            elif isinstance(spec, BarrierSpec):
                 mon_dates = self._barrier_monitoring_dates()
                 if mon_dates is not None:
+                    if mon_dates[0] < underlying.pricing_date:
+                        raise ValidationError(
+                            "Barrier monitoring schedule must not start before pricing_date."
+                        )
                     extra = set(mon_dates) - underlying.observation_dates
                     if extra:
                         sim_config = dc_replace(
@@ -368,6 +372,13 @@ class OptionValuation:
             fixing_dates = self._asian_fixing_dates()
             if fixing_dates[0] < underlying.pricing_date:
                 raise ValidationError("Asian fixing schedule must not start before pricing_date.")
+
+        elif isinstance(spec, BarrierSpec):
+            mon_dates = self._barrier_monitoring_dates()
+            if mon_dates is not None and mon_dates[0] < underlying.pricing_date:
+                raise ValidationError(
+                    "Barrier monitoring schedule must not start before pricing_date."
+                )
 
         # Dispatch to appropriate pricing method implementation
         self._impl = self._build_impl()
