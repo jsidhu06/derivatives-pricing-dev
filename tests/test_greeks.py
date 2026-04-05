@@ -12,10 +12,15 @@ from derivatives_pricing.exceptions import (
 )
 from derivatives_pricing.enums import (
     AsianAveraging,
+    BarrierDirection,
+    BarrierAction,
     ExerciseType,
     GreekCalculationMethod,
     OptionType,
+    PDEMethod,
+    PDESpaceGrid,
     PricingMethod,
+    RebateTiming,
 )
 from derivatives_pricing.market_environment import MarketData
 from derivatives_pricing.rates import DiscountCurve
@@ -29,11 +34,12 @@ from derivatives_pricing.stochastic_processes import (
 )
 from derivatives_pricing.valuation import (
     AsianSpec,
+    BarrierSpec,
     VanillaSpec,
     OptionValuation,
     UnderlyingData,
 )
-from derivatives_pricing.valuation import BinomialParams, MonteCarloParams
+from derivatives_pricing.valuation import BinomialParams, MonteCarloParams, PDEParams
 
 logger = logging.getLogger(__name__)
 
@@ -1005,3 +1011,227 @@ class TestAsianGreekMethodSelection(TestGreeksSetup):
         )
         with pytest.raises(UnsupportedFeatureError, match="Asian options only support.*NUMERICAL"):
             ov.delta(greek_calc_method=GreekCalculationMethod.TREE)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Barrier Greeks
+# ═══════════════════════════════════════════════════════════════════════
+PRICING_DATE = dt.datetime(2025, 1, 1)
+MATURITY = dt.datetime(2026, 1, 1)
+CURRENCY = "USD"
+
+_BARRIER_SPOT = 100.0
+_BARRIER_VOL = 0.25
+_BARRIER_RATE = 0.05
+_BARRIER_DIV = 0.02
+_BARRIER_NUMERICAL_SPOT_BUMP_RATIO = 0.025
+_BARRIER_NUMERICAL_THETA_DAYS = 21.0
+_BARRIER_PDE_CFG = PDEParams(
+    spot_steps=800,
+    time_steps=800,
+    method=PDEMethod.CRANK_NICOLSON,
+    space_grid=PDESpaceGrid.LOG_SPOT,
+)
+_BARRIER_BINOM_CFG = BinomialParams(num_steps=400)
+
+
+def _barrier_numerical_spot_bump(spot: float) -> float:
+    return float(spot) * _BARRIER_NUMERICAL_SPOT_BUMP_RATIO
+
+
+def _dp_barrier_greeks_from_valuation(ov: OptionValuation, *, spot: float) -> dict[str, float]:
+    bump = _barrier_numerical_spot_bump(spot)
+    return {
+        "delta": ov.delta(epsilon=bump),
+        "gamma": ov.gamma(epsilon=bump),
+        "vega": ov.vega(),
+        "theta": ov.theta(time_bump_days=_BARRIER_NUMERICAL_THETA_DAYS),
+        "rho": ov.rho(),
+    }
+
+
+def _fmt_greek_value(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.6f}"
+
+
+def _dp_barrier_greeks(
+    *,
+    pricing_method: PricingMethod,
+    params: BinomialParams | PDEParams | None = None,
+    exercise_type: ExerciseType,
+    direction: BarrierDirection,
+    action: BarrierAction,
+    barrier: float,
+    option_type: OptionType,
+    strike: float,
+    rebate: float = 0.0,
+    rebate_timing: RebateTiming = RebateTiming.AT_HIT,
+    r_curve: DiscountCurve | None = None,
+    q_curve: DiscountCurve | None = None,
+) -> dict[str, float]:
+    """Compute barrier Greeks via a selected DP pricing engine."""
+    ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
+    rc = r_curve if r_curve is not None else DiscountCurve.flat(_BARRIER_RATE, end_time=ttm)
+    qc = q_curve if q_curve is not None else DiscountCurve.flat(_BARRIER_DIV, end_time=ttm)
+    md = MarketData(PRICING_DATE, rc, currency=CURRENCY)
+    ud = UnderlyingData(
+        initial_value=_BARRIER_SPOT,
+        volatility=_BARRIER_VOL,
+        market_data=md,
+        dividend_curve=qc,
+    )
+    spec = BarrierSpec(
+        option_type=option_type,
+        exercise_type=exercise_type,
+        strike=strike,
+        maturity=MATURITY,
+        barrier=barrier,
+        direction=direction,
+        action=action,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+    )
+    ov = OptionValuation(ud, spec, pricing_method, params=params)
+    return _dp_barrier_greeks_from_valuation(ov, spot=_BARRIER_SPOT)
+
+
+def _barrier_nonflat_curves() -> tuple[DiscountCurve, DiscountCurve]:
+    """Non-flat rate and dividend curves for barrier tests."""
+    ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
+    r_times = np.array([0.0, 0.25, 0.5, ttm])
+    r_forwards = np.array([0.03, 0.06, 0.04])
+    q_times = np.array([0.0, 0.25, 0.5, ttm])
+    q_forwards = np.array([0.01, 0.03, 0.005])
+    return (
+        DiscountCurve.from_forwards(times=r_times, forwards=r_forwards),
+        DiscountCurve.from_forwards(times=q_times, forwards=q_forwards),
+    )
+
+
+_BARRIER_AMERICAN_NONFLAT_GREEK_SCENARIOS = [
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        105.0,
+        90.0,
+        0.0,
+        RebateTiming.AT_HIT,
+        *_barrier_nonflat_curves(),
+        id="am_down_out_put_nonflat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        120.0,
+        0.0,
+        RebateTiming.AT_HIT,
+        *_barrier_nonflat_curves(),
+        id="am_up_out_call_nonflat",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.CALL,
+        95.0,
+        80.0,
+        0.0,
+        RebateTiming.AT_EXPIRY,
+        *_barrier_nonflat_curves(),
+        id="am_down_in_call_nonflat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        110.0,
+        0.0,
+        RebateTiming.AT_EXPIRY,
+        *_barrier_nonflat_curves(),
+        id="am_up_in_put_nonflat",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "direction,action,option_type,strike,barrier,rebate,rebate_timing,r_curve,q_curve",
+    _BARRIER_AMERICAN_NONFLAT_GREEK_SCENARIOS,
+)
+def test_american_barrier_nonflat_greeks_binomial_vs_pde(
+    direction,
+    action,
+    option_type,
+    strike,
+    barrier,
+    rebate,
+    rebate_timing,
+    r_curve,
+    q_curve,
+):
+    """American non-flat barrier Greeks: compare PDE FD to binomial only.
+
+    QuantLib's American barrier support is binomial-only and only approximates
+    non-flat term structures, so these scenarios are validated internally using
+    DP binomial as the baseline reference.
+    """
+    dp_bn = _dp_barrier_greeks(
+        pricing_method=PricingMethod.BINOMIAL,
+        params=_BARRIER_BINOM_CFG,
+        exercise_type=ExerciseType.AMERICAN,
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+        r_curve=r_curve,
+        q_curve=q_curve,
+    )
+    dp_pde = _dp_barrier_greeks(
+        pricing_method=PricingMethod.PDE_FD,
+        params=_BARRIER_PDE_CFG,
+        exercise_type=ExerciseType.AMERICAN,
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+        r_curve=r_curve,
+        q_curve=q_curve,
+    )
+
+    pde_tols = {"delta": 0.05, "gamma": 0.10, "vega": 0.20, "theta": 0.25, "rho": 0.12}
+
+    for greek in ("delta", "gamma", "vega", "theta", "rho"):
+        logger.info(
+            "American barrier nonflat %s-%s %s %s K=%.0f H=%.0f | DP_BN=%s DP_PDE=%s",
+            direction.value,
+            action.value,
+            option_type.value,
+            greek,
+            strike,
+            barrier,
+            _fmt_greek_value(dp_bn[greek]),
+            _fmt_greek_value(dp_pde[greek]),
+        )
+
+    assert_greeks_close(
+        lhs=dp_pde,
+        rhs=dp_bn,
+        tols=pde_tols,
+        log_prefix=(
+            f"American barrier nonflat PDE {direction.value}-{action.value} {option_type.value} "
+            f"K={strike:.0f} H={barrier:.0f}"
+        ),
+        lhs_name="DP_PDE",
+        rhs_name="DP_BN",
+        skip_missing_rhs=False,
+        atol=0.002,
+        logger=None,
+    )

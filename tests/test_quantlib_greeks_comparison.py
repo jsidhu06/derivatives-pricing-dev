@@ -1153,9 +1153,9 @@ def test_european_barrier_greeks_vs_quantlib(
     q_curve,
 ):
     """European barrier Greeks: DP engines vs direct QuantLib FD Greeks."""
-    is_nonflat = r_curve is not None
+    is_flat = r_curve is None
 
-    if not is_nonflat:
+    if is_flat:
         dp_an = _dp_barrier_greeks(
             pricing_method=PricingMethod.BSM,
             exercise_type=ExerciseType.EUROPEAN,
