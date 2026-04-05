@@ -1916,7 +1916,9 @@ def _fd_barrier_ki_core(
         _apply_dividend_jump(V_act, grid, mat_div, space_grid=space_grid)
         if early_exercise:
             V_act[:] = np.maximum(V_act, payoff)
-        _apply_dividend_jump(V_inact, grid, mat_div, space_grid=space_grid)
+        # The inactive terminal surface is spot-independent (equal to the
+        # maturity rebate everywhere), so the maturity-date dividend jump is
+        # a no-op for V_inact.
 
     ttm_key = round(time_to_maturity, 12)
     pricing_div = dividend_map.pop(ttm_key, None)
