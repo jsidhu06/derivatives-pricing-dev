@@ -2161,7 +2161,11 @@ def _fd_barrier_ki_core(
                     max_iter,
                 )
 
-            # Discrete barrier coupling at monitoring dates
+            # Discrete barrier coupling at monitoring dates.
+            # This is imposed on the ex-div surface at the observation time;
+            # the dividend jump below then carries that knocked-in state back
+            # to the pre-div surface (for example, cum-div spots that fall
+            # through the barrier once the cash dividend goes ex).
             if monitoring_tau_set is not None:
                 if tau_key in monitoring_tau_set:
                     if direction is BarrierDirection.DOWN:
