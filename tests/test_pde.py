@@ -6,6 +6,7 @@ consistent prices.  These are internal engine tests — cross-method and
 QuantLib comparisons live in test_quantlib_comparison.py.
 """
 
+from dataclasses import replace as dc_replace
 import datetime as dt
 
 import numpy as np
@@ -27,6 +28,7 @@ from derivatives_pricing.enums import (
 )
 from derivatives_pricing.market_environment import MarketData
 from derivatives_pricing.rates import DiscountCurve
+from derivatives_pricing.utils import calculate_year_fraction
 from derivatives_pricing.valuation import OptionValuation, UnderlyingData
 from derivatives_pricing.valuation.contracts import BarrierSpec, PayoffSpec
 from derivatives_pricing.valuation.pde import _FDBarrierValuation, _fd_barrier_ki_core
@@ -745,3 +747,219 @@ def test_european_knock_in_grid_gamma_uses_native_surface_parity():
 
     assert np.isclose(gamma_grid, gamma_parity, rtol=1.0e-4, atol=1.0e-4)
     assert np.isclose(gamma_grid, gamma_numerical, rtol=0.01, atol=1.0e-4)
+
+
+def test_european_knock_in_grid_delta_uses_native_surface_parity():
+    """European KI grid delta should follow vanilla-minus-KO parity."""
+    r_curve = DiscountCurve.flat(0.05, end_time=1.0)
+    q_curve = DiscountCurve.flat(0.02, end_time=1.0)
+    md = MarketData(PRICING_DATE, r_curve, currency="USD")
+    ud = UnderlyingData(
+        initial_value=100.0,
+        volatility=0.25,
+        market_data=md,
+        dividend_curve=q_curve,
+    )
+    params = PDEParams(spot_steps=400, time_steps=400)
+
+    ki_spec = BarrierSpec(
+        option_type=OptionType.PUT,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=100.0,
+        maturity=MATURITY,
+        barrier=85.0,
+        direction=BarrierDirection.DOWN,
+        action=BarrierAction.IN,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=0.0,
+        rebate_timing=RebateTiming.AT_HIT,
+    )
+    ko_spec = dc_replace(ki_spec, action=BarrierAction.OUT)
+
+    vanilla_spec = spec(
+        strike=100.0,
+        option_type=OptionType.PUT,
+        exercise=ExerciseType.EUROPEAN,
+    )
+
+    ki = OptionValuation(ud, ki_spec, PricingMethod.PDE_FD, params=params)
+    ko = OptionValuation(ud, ko_spec, PricingMethod.PDE_FD, params=params)
+    vanilla = OptionValuation(ud, vanilla_spec, PricingMethod.PDE_FD, params=params)
+
+    delta_grid = ki.delta(greek_calc_method=GreekCalculationMethod.GRID)
+    delta_parity = vanilla.delta(greek_calc_method=GreekCalculationMethod.GRID) - ko.delta(
+        greek_calc_method=GreekCalculationMethod.GRID
+    )
+    delta_numerical = ki.delta(greek_calc_method=GreekCalculationMethod.NUMERICAL, epsilon=2.5)
+
+    assert np.isclose(delta_grid, delta_parity, rtol=1.0e-4, atol=1.0e-4)
+    assert np.isclose(delta_grid, delta_numerical, rtol=0.01, atol=1.0e-4)
+
+
+def test_european_knock_in_grid_theta_uses_native_surface_parity():
+    """European KI grid theta should follow vanilla-plus-rebate-minus-KO parity."""
+    r_curve = DiscountCurve.flat(0.05, end_time=1.0)
+    q_curve = DiscountCurve.flat(0.02, end_time=1.0)
+    md = MarketData(PRICING_DATE, r_curve, currency="USD")
+    ud = UnderlyingData(
+        initial_value=100.0,
+        volatility=0.25,
+        market_data=md,
+        dividend_curve=q_curve,
+    )
+    params = PDEParams(spot_steps=400, time_steps=400)
+
+    ki_spec = BarrierSpec(
+        option_type=OptionType.PUT,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=100.0,
+        maturity=MATURITY,
+        barrier=85.0,
+        direction=BarrierDirection.DOWN,
+        action=BarrierAction.IN,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=3.0,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
+
+    ko_spec = dc_replace(ki_spec, action=BarrierAction.OUT)
+
+    vanilla_spec = spec(
+        strike=100.0,
+        option_type=OptionType.PUT,
+        exercise=ExerciseType.EUROPEAN,
+    )
+
+    ki = OptionValuation(ud, ki_spec, PricingMethod.PDE_FD, params=params)
+    ko = OptionValuation(ud, ko_spec, PricingMethod.PDE_FD, params=params)
+    vanilla = OptionValuation(ud, vanilla_spec, PricingMethod.PDE_FD, params=params)
+
+    theta_grid = ki.theta(greek_calc_method=GreekCalculationMethod.GRID)
+    theta_numerical = ki.theta(
+        greek_calc_method=GreekCalculationMethod.NUMERICAL, time_bump_days=21.0
+    )
+
+    ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
+    rebate_pv = ki_spec.rebate * float(r_curve.df(ttm))
+    rebate_theta = rebate_pv * 0.05 / 365.0
+    theta_parity = (
+        vanilla.theta(greek_calc_method=GreekCalculationMethod.GRID)
+        + rebate_theta
+        - ko.theta(greek_calc_method=GreekCalculationMethod.GRID)
+    )
+
+    assert np.isclose(theta_grid, theta_parity, rtol=1.0e-4, atol=1.0e-4)
+    assert np.isclose(theta_grid, theta_numerical, rtol=0.02, atol=1.0e-4)
+
+
+@pytest.mark.parametrize(
+    ("monitoring", "monitoring_dates"),
+    [
+        (BarrierMonitoring.CONTINUOUS, None),
+        (BarrierMonitoring.DISCRETE, (PRICING_DATE, MATURITY)),
+    ],
+)
+def test_knock_out_triggered_at_inception_grid_greeks_zero_without_rebate(
+    monitoring, monitoring_dates
+):
+    """PDE KO greeks should collapse to zero when the contract is already dead."""
+    ud = underlying(initial_value=120.0)
+    params = PDEParams(spot_steps=300, time_steps=300)
+    ko_spec = BarrierSpec(
+        option_type=OptionType.CALL,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=100.0,
+        maturity=MATURITY,
+        barrier=120.0,
+        direction=BarrierDirection.UP,
+        action=BarrierAction.OUT,
+        monitoring=monitoring,
+        monitoring_dates=monitoring_dates,
+        rebate=0.0,
+        rebate_timing=RebateTiming.AT_HIT,
+    )
+
+    valuation = OptionValuation(ud, ko_spec, PricingMethod.PDE_FD, params=params)
+
+    assert np.isclose(valuation.present_value(), 0.0, atol=1.0e-12)
+    assert np.isclose(valuation.delta(), 0.0, atol=1.0e-12)
+    assert np.isclose(valuation.gamma(), 0.0, atol=1.0e-12)
+    assert np.isclose(valuation.theta(), 0.0, atol=1.0e-12)
+    assert np.isclose(valuation.rho(), 0.0, atol=1.0e-12)
+
+
+@pytest.mark.parametrize(
+    ("monitoring", "monitoring_dates"),
+    [
+        (BarrierMonitoring.CONTINUOUS, None),
+        (BarrierMonitoring.DISCRETE, (PRICING_DATE, MATURITY)),
+    ],
+)
+def test_knock_out_triggered_at_inception_grid_greeks_match_fixed_expiry_rebate(
+    monitoring, monitoring_dates
+):
+    """PDE KO greeks should match the resolved expiry rebate when already triggered."""
+    rate = 0.05
+    md = MarketData(PRICING_DATE, flat_curve(PRICING_DATE, MATURITY, rate), currency="USD")
+    ud = underlying(initial_value=120.0, market_data=md)
+    params = PDEParams(spot_steps=300, time_steps=300)
+    rebate = 5.0
+    ko_spec = BarrierSpec(
+        option_type=OptionType.CALL,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=100.0,
+        maturity=MATURITY,
+        barrier=120.0,
+        direction=BarrierDirection.UP,
+        action=BarrierAction.OUT,
+        monitoring=monitoring,
+        monitoring_dates=monitoring_dates,
+        rebate=rebate,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
+
+    valuation = OptionValuation(ud, ko_spec, PricingMethod.PDE_FD, params=params)
+    ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
+    discount_factor = float(md.discount_curve.df(ttm))
+    expected_pv = rebate * discount_factor
+    expected_theta = expected_pv * rate / 365.0
+    expected_rho = -expected_pv * ttm * 0.01
+
+    assert np.isclose(valuation.present_value(), expected_pv, rtol=1.0e-12, atol=1.0e-12)
+    assert np.isclose(valuation.delta(), 0.0, atol=1.0e-12)
+    assert np.isclose(valuation.gamma(), 0.0, atol=1.0e-12)
+    assert np.isclose(valuation.theta(), expected_theta, rtol=0.01, atol=1.0e-6)
+    assert np.isclose(valuation.rho(), expected_rho, rtol=0.02, atol=1.0e-6)
+
+
+def test_knock_in_triggered_at_inception_grid_greeks_match_vanilla():
+    """Triggered-at-inception KI should reduce to vanilla for PDE grid greeks."""
+    q_curve = flat_curve(PRICING_DATE, MATURITY, 0.02)
+    ud = underlying(initial_value=120.0, dividend_curve=q_curve)
+    params = PDEParams(spot_steps=400, time_steps=400)
+    ki_spec = BarrierSpec(
+        option_type=OptionType.CALL,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=100.0,
+        maturity=MATURITY,
+        barrier=115.0,
+        direction=BarrierDirection.UP,
+        action=BarrierAction.IN,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=4.0,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
+    vanilla_spec = spec(
+        strike=100.0,
+        option_type=OptionType.CALL,
+        exercise=ExerciseType.EUROPEAN,
+    )
+
+    ki = OptionValuation(ud, ki_spec, PricingMethod.PDE_FD, params=params)
+    vanilla = OptionValuation(ud, vanilla_spec, PricingMethod.PDE_FD, params=params)
+
+    assert np.isclose(ki.present_value(), vanilla.present_value(), rtol=1.0e-6, atol=1.0e-6)
+    assert np.isclose(ki.delta(), vanilla.delta(), rtol=1.0e-6, atol=1.0e-6)
+    assert np.isclose(ki.gamma(), vanilla.gamma(), rtol=1.0e-6, atol=1.0e-6)
+    assert np.isclose(ki.theta(), vanilla.theta(), rtol=1.0e-6, atol=1.0e-6)
+    assert np.isclose(ki.rho(), vanilla.rho(), rtol=1.0e-6, atol=1.0e-6)

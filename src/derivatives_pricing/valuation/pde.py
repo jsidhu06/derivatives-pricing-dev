@@ -56,7 +56,7 @@ from ..exceptions import (
     UnsupportedFeatureError,
     ValidationError,
 )
-from .contracts import BarrierSpec, PayoffSpec, PayoffBoundaryModel, WingBoundary
+from .contracts import BarrierSpec, PayoffSpec, PayoffBoundaryModel, VanillaSpec, WingBoundary
 from .params import PDEParams
 
 if TYPE_CHECKING:
@@ -2218,6 +2218,117 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         if not isinstance(self._spec, BarrierSpec):
             raise ConfigurationError("_FDBarrierValuation requires a BarrierSpec.")
 
+    @staticmethod
+    def _is_triggered(spot: float, barrier: float, direction: BarrierDirection) -> bool:
+        if direction is BarrierDirection.DOWN:
+            return spot <= barrier
+        return spot >= barrier
+
+    def _is_triggered_at_inception(self) -> bool:
+        spot = float(self.underlying.initial_value)
+        barrier = float(self._spec.barrier)
+        if not self._is_triggered(spot, barrier, self._spec.direction):
+            return False
+
+        if self._spec.monitoring is BarrierMonitoring.CONTINUOUS:
+            return True
+
+        monitoring_dates = self.valuation_ctx._barrier_monitoring_dates()
+        assert monitoring_dates is not None
+        return any(date == self.valuation_ctx.pricing_date for date in monitoring_dates)
+
+    def _resolved_knock_out_value(self) -> float | None:
+        if self._spec.action is not BarrierAction.OUT or not self._is_triggered_at_inception():
+            return None
+
+        if self._spec.rebate <= 0.0:
+            return 0.0
+        if self._spec.rebate_timing is RebateTiming.AT_HIT:
+            return float(self._spec.rebate)
+
+        ttm = self.valuation_ctx._maturity_year_fraction()
+        return float(self._spec.rebate) * float(self.valuation_ctx.discount_curve.df(ttm))
+
+    def _vanilla_equivalent_valuation(self) -> OptionValuation:
+        from .core import OptionValuation
+
+        vanilla_spec = VanillaSpec(
+            option_type=self._spec.option_type,
+            exercise_type=self._spec.exercise_type,
+            strike=self._spec.strike,
+            maturity=self._spec.maturity,
+        )
+        return OptionValuation(
+            underlying=self.underlying,
+            spec=vanilla_spec,
+            pricing_method=self.valuation_ctx.pricing_method,
+            params=self.valuation_ctx.params,
+        )
+
+    def _last_dtau(self) -> float:
+        solve_args = self._base_solve_args()
+        time_to_maturity = float(solve_args["time_to_maturity"])
+        dividend_taus = [
+            tau
+            for tau, _ in solve_args["dividend_schedule"] or []
+            if 1.0e-12 < tau < time_to_maturity - 1.0e-12
+        ]
+        all_extra_taus = dividend_taus.copy()
+        if solve_args["monitoring_taus"] is not None:
+            all_extra_taus.extend(solve_args["monitoring_taus"])
+        tau_grid = _build_tau_grid(time_to_maturity, int(solve_args["time_steps"]), all_extra_taus)
+        if tau_grid.size < 2:
+            return 0.0
+        return float(tau_grid[-1] - tau_grid[-2])
+
+    def _discounted_rebate_theta(self, last_dtau: float) -> float:
+        if (
+            self._spec.rebate <= 0.0
+            or self._spec.rebate_timing is not RebateTiming.AT_EXPIRY
+            or last_dtau <= 0.0
+        ):
+            return 0.0
+
+        ttm = self.valuation_ctx._maturity_year_fraction()
+        discount_curve = self.valuation_ctx.discount_curve
+        current_value = float(self._spec.rebate) * float(discount_curve.df(ttm))
+        previous_value = float(self._spec.rebate) * float(
+            discount_curve.df(max(ttm - last_dtau, 0.0))
+        )
+        return float((previous_value - current_value) / last_dtau / 365.0)
+
+    def _resolved_knock_out_theta(self) -> float:
+        return self._discounted_rebate_theta(self._last_dtau())
+
+    @staticmethod
+    def _grid_delta_from_result(
+        result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+        spot: float,
+    ) -> float:
+        _, S, V, _, _ = result
+        j = _FDGridGreeksMixin._spot_grid_index(S, spot)
+        return float((V[j + 1] - V[j - 1]) / (S[j + 1] - S[j - 1]))
+
+    @staticmethod
+    def _grid_gamma_from_result(
+        result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+        spot: float,
+    ) -> float:
+        _, S, V, _, _ = result
+        j = _FDGridGreeksMixin._spot_grid_index(S, spot)
+        return _FDGridGreeksMixin._grid_gamma_at_index(S, V, j)
+
+    @staticmethod
+    def _grid_theta_from_result(
+        result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+        spot: float,
+    ) -> float:
+        _, S, V, V_prev, last_dtau = result
+        if last_dtau <= 0.0:
+            return 0.0
+        j = _FDGridGreeksMixin._spot_grid_index(S, spot)
+        return float((V_prev[j] - V[j]) / last_dtau / 365.0)
+
     def _base_solve_args(self) -> dict:
         """Build keyword arguments shared by both KO and KI solvers."""
         params = self.valuation_ctx.params
@@ -2308,21 +2419,55 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         )
         return solve_args, ko_result, van_result
 
+    def delta(self) -> float:
+        spec = self._spec
+        if self._is_triggered_at_inception():
+            if spec.action is BarrierAction.OUT:
+                return 0.0
+            return self._vanilla_equivalent_valuation().delta(greek_calc_method=None)
+
+        if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
+            return super().delta()
+
+        _, ko_result, van_result = self._solve_european_ki_components()
+        spot = float(self.underlying.initial_value)
+        return self._grid_delta_from_result(van_result, spot) - self._grid_delta_from_result(
+            ko_result, spot
+        )
+
     def gamma(self) -> float:
         """Return grid gamma, using native-surface parity for European KI barriers."""
         spec = self._spec
+        if self._is_triggered_at_inception():
+            if spec.action is BarrierAction.OUT:
+                return 0.0
+            return self._vanilla_equivalent_valuation().gamma(greek_calc_method=None)
+
         if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
             return super().gamma()
 
         _, ko_result, van_result = self._solve_european_ki_components()
-        _, S_ko, V_ko, _, _ = ko_result
-        _, S_van, V_van, _, _ = van_result
         spot = float(self.underlying.initial_value)
-        j_ko = self._spot_grid_index(S_ko, spot)
-        j_van = self._spot_grid_index(S_van, spot)
-        return self._grid_gamma_at_index(S_van, V_van, j_van) - self._grid_gamma_at_index(
-            S_ko, V_ko, j_ko
+        return self._grid_gamma_from_result(van_result, spot) - self._grid_gamma_from_result(
+            ko_result, spot
         )
+
+    def theta(self) -> float:
+        spec = self._spec
+        if self._is_triggered_at_inception():
+            if spec.action is BarrierAction.OUT:
+                return self._resolved_knock_out_theta()
+            return self._vanilla_equivalent_valuation().theta(greek_calc_method=None)
+
+        if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
+            return super().theta()
+
+        _, ko_result, van_result = self._solve_european_ki_components()
+        spot = float(self.underlying.initial_value)
+        ko_theta = self._grid_theta_from_result(ko_result, spot)
+        vanilla_theta = self._grid_theta_from_result(van_result, spot)
+        rebate_theta = self._discounted_rebate_theta(ko_result[-1])
+        return vanilla_theta + rebate_theta - ko_theta
 
     def _solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the PDE solve, handling KI via parity or coupled PDE."""
@@ -2346,8 +2491,8 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         ki_price = van_price + spec.rebate * df_T - ko_price
 
         if last_dtau_ko > 0.0:
-            df_prev = float(ko_args["discount_curve"].df(last_dtau_ko))
-            rebate_prev = float(spec.rebate) * df_T / df_prev
+            previous_ttm = max(float(ko_args["time_to_maturity"]) - last_dtau_ko, 0.0)
+            rebate_prev = float(spec.rebate) * float(ko_args["discount_curve"].df(previous_ttm))
         else:
             rebate_prev = float(spec.rebate) * df_T
 
@@ -2367,6 +2512,13 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         params = self.valuation_ctx.params
         if not isinstance(params, PDEParams):
             raise ConfigurationError("PDE valuation requires PDEParams on OptionValuation")
+        if self._is_triggered_at_inception():
+            if self._spec.action is BarrierAction.OUT:
+                triggered_value = self._resolved_knock_out_value()
+                if triggered_value is None:
+                    raise ConfigurationError("Resolved knock-out state unexpectedly unavailable")
+                return triggered_value
+            return self._vanilla_equivalent_valuation().present_value()
         spec = self._spec
         label = f"PDE barrier {'American' if spec.exercise_type is ExerciseType.AMERICAN else 'European'}"
         with log_timing(logger, f"{label} present_value", params.log_timings):
