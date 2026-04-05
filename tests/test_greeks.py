@@ -1058,6 +1058,8 @@ def _dp_barrier_greeks(
     *,
     pricing_method: PricingMethod,
     params: BinomialParams | PDEParams | None = None,
+    spot: float = _BARRIER_SPOT,
+    volatility: float = _BARRIER_VOL,
     exercise_type: ExerciseType,
     direction: BarrierDirection,
     action: BarrierAction,
@@ -1075,8 +1077,8 @@ def _dp_barrier_greeks(
     qc = q_curve if q_curve is not None else DiscountCurve.flat(_BARRIER_DIV, end_time=ttm)
     md = MarketData(PRICING_DATE, rc, currency=CURRENCY)
     ud = UnderlyingData(
-        initial_value=_BARRIER_SPOT,
-        volatility=_BARRIER_VOL,
+        initial_value=spot,
+        volatility=volatility,
         market_data=md,
         dividend_curve=qc,
     )
@@ -1092,7 +1094,49 @@ def _dp_barrier_greeks(
         rebate_timing=rebate_timing,
     )
     ov = OptionValuation(ud, spec, pricing_method, params=params)
-    return _dp_barrier_greeks_from_valuation(ov, spot=_BARRIER_SPOT)
+    return _dp_barrier_greeks_from_valuation(ov, spot=spot)
+
+
+def _make_barrier_valuation(
+    *,
+    pricing_method: PricingMethod,
+    params: BinomialParams | PDEParams | None = None,
+    spot: float = _BARRIER_SPOT,
+    volatility: float = _BARRIER_VOL,
+    exercise_type: ExerciseType,
+    direction: BarrierDirection,
+    action: BarrierAction,
+    barrier: float,
+    option_type: OptionType,
+    strike: float,
+    rebate: float = 0.0,
+    rebate_timing: RebateTiming = RebateTiming.AT_HIT,
+    r_curve: DiscountCurve | None = None,
+    q_curve: DiscountCurve | None = None,
+) -> OptionValuation:
+    """Build a barrier valuation with the shared test-market defaults."""
+    ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
+    rc = r_curve if r_curve is not None else DiscountCurve.flat(_BARRIER_RATE, end_time=ttm)
+    qc = q_curve if q_curve is not None else DiscountCurve.flat(_BARRIER_DIV, end_time=ttm)
+    md = MarketData(PRICING_DATE, rc, currency=CURRENCY)
+    ud = UnderlyingData(
+        initial_value=spot,
+        volatility=volatility,
+        market_data=md,
+        dividend_curve=qc,
+    )
+    spec = BarrierSpec(
+        option_type=option_type,
+        exercise_type=exercise_type,
+        strike=strike,
+        maturity=MATURITY,
+        barrier=barrier,
+        direction=direction,
+        action=action,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+    )
+    return OptionValuation(ud, spec, pricing_method, params=params)
 
 
 def _barrier_nonflat_curves() -> tuple[DiscountCurve, DiscountCurve]:
@@ -1235,3 +1279,56 @@ def test_american_barrier_nonflat_greeks_binomial_vs_pde(
         atol=0.002,
         logger=None,
     )
+
+
+@pytest.mark.parametrize("exercise_type", [ExerciseType.EUROPEAN, ExerciseType.AMERICAN])
+def test_knock_out_triggered_at_inception_default_greeks_zero_without_rebate(exercise_type):
+    valuation = _make_barrier_valuation(
+        pricing_method=PricingMethod.BINOMIAL,
+        params=_BARRIER_BINOM_CFG,
+        spot=80.0,
+        exercise_type=exercise_type,
+        direction=BarrierDirection.DOWN,
+        action=BarrierAction.OUT,
+        barrier=90.0,
+        option_type=OptionType.PUT,
+        strike=100.0,
+        rebate=0.0,
+        rebate_timing=RebateTiming.AT_HIT,
+    )
+
+    assert np.isclose(valuation.present_value(), 0.0, atol=1.0e-12)
+    assert np.isclose(valuation.delta(), 0.0, atol=1.0e-12)
+    assert np.isclose(valuation.gamma(), 0.0, atol=1.0e-12)
+    assert np.isclose(valuation.theta(), 0.0, atol=1.0e-12)
+    assert np.isclose(valuation.rho(), 0.0, atol=1.0e-12)
+
+
+@pytest.mark.parametrize("exercise_type", [ExerciseType.EUROPEAN, ExerciseType.AMERICAN])
+def test_knock_out_triggered_at_inception_default_greeks_match_fixed_expiry_rebate(exercise_type):
+    rebate = 5.0
+    valuation = _make_barrier_valuation(
+        pricing_method=PricingMethod.BINOMIAL,
+        params=_BARRIER_BINOM_CFG,
+        spot=80.0,
+        exercise_type=exercise_type,
+        direction=BarrierDirection.DOWN,
+        action=BarrierAction.OUT,
+        barrier=90.0,
+        option_type=OptionType.PUT,
+        strike=100.0,
+        rebate=rebate,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
+
+    ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
+    discount_factor = float(DiscountCurve.flat(_BARRIER_RATE, end_time=ttm).df(ttm))
+    expected_pv = rebate * discount_factor
+    expected_theta = rebate * discount_factor * _BARRIER_RATE / 365.0
+    expected_rho = -expected_pv * ttm * 0.01
+
+    assert np.isclose(valuation.present_value(), expected_pv, rtol=1.0e-12, atol=1.0e-12)
+    assert np.isclose(valuation.delta(), 0.0, atol=1.0e-12)
+    assert np.isclose(valuation.gamma(), 0.0, atol=1.0e-12)
+    assert np.isclose(valuation.theta(), expected_theta, rtol=0.02, atol=1.0e-6)
+    assert np.isclose(valuation.rho(), expected_rho, rtol=0.02, atol=1.0e-6)

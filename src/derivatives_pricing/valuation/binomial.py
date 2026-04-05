@@ -952,6 +952,12 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         present_value().
         """
         if self.spec.action is BarrierAction.OUT:
+            if self._is_triggered(
+                float(self.underlying.initial_value),
+                float(self.spec.barrier),
+                self.spec.direction,
+            ):
+                return self._resolved_knock_out_lattice()
             return self._solve_knock_out(early_exercise=early_exercise)
 
         if self._is_triggered(
@@ -990,6 +996,20 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         if num_steps > 0:
             to_maturity[:num_steps] = np.cumprod(discount_factors[::-1])[::-1]
         return rebate * to_maturity
+
+    def _resolved_knock_out_lattice(self) -> np.ndarray:
+        """Return the deterministic-value lattice for a KO already dead at inception."""
+        num_steps = self._effective_num_steps()
+        discount_factors, _, spot_lattice = self._setup_binomial_parameters()
+        values_by_time = self._ko_rebate_values(
+            discount_factors=discount_factors,
+            num_steps=num_steps,
+        )
+
+        option_lattice = np.zeros_like(spot_lattice)
+        for t in range(num_steps + 1):
+            option_lattice[: t + 1, t] = values_by_time[t]
+        return option_lattice
 
     def _solve_knock_out(self, *, early_exercise: bool) -> np.ndarray:
         num_steps = self._effective_num_steps()
