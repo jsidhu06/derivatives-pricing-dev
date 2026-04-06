@@ -1192,50 +1192,84 @@ class _FDGridGreeksMixin:
             + v2 * (2.0 * spot - x0 - x1) / ((x2 - x0) * (x2 - x1))
         )
 
+    @staticmethod
+    def _grid_gamma_at_spot(S: np.ndarray, V: np.ndarray, j: int, spot: float) -> float:
+        """Cubic-Lagrange second derivative evaluated exactly at ``spot``.
+
+        A 3-point parabolic fit gives a *constant* second derivative
+        (``f''(x) = 2a``), so a parabolic at-spot evaluation is identical
+        to the at-index value — useful for KI parity, where vanilla and
+        KO live on different grids and we need both gammas referenced to
+        the same physical ``spot``. A 4-point cubic Lagrange yields
+        ``f''(x) = 6ax + 2b`` (linear in ``x``), so evaluating at exactly
+        ``spot`` decouples the result from the local node placement.
+
+        Uses nodes ``(S[j-1], S[j], S[j+1], S[j+2])``; the index ``j`` is
+        clamped so all four neighbours exist.
+        """
+        n = len(S)
+        jc = max(1, min(j, n - 3))
+        x0, x1, x2, x3 = S[jc - 1], S[jc], S[jc + 1], S[jc + 2]
+        v0, v1, v2, v3 = V[jc - 1], V[jc], V[jc + 1], V[jc + 2]
+        # For the cubic Lagrange basis L_i(x) = prod_{k!=i}(x - x_k) / D_i,
+        # L_i''(x) = (6x - 2 * sum_{k!=i} x_k) / D_i.
+        s0 = x1 + x2 + x3
+        s1 = x0 + x2 + x3
+        s2 = x0 + x1 + x3
+        s3 = x0 + x1 + x2
+        d0 = (x0 - x1) * (x0 - x2) * (x0 - x3)
+        d1 = (x1 - x0) * (x1 - x2) * (x1 - x3)
+        d2 = (x2 - x0) * (x2 - x1) * (x2 - x3)
+        d3 = (x3 - x0) * (x3 - x1) * (x3 - x2)
+        return float(
+            v0 * (6.0 * spot - 2.0 * s0) / d0
+            + v1 * (6.0 * spot - 2.0 * s1) / d1
+            + v2 * (6.0 * spot - 2.0 * s2) / d2
+            + v3 * (6.0 * spot - 2.0 * s3) / d3
+        )
+
     def _solve(
         self,
     ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]: ...
 
     def _grid_greeks_data(
         self,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, int]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, int, float]:
         """Run the PDE solve and locate the spot node.
 
         Returns
         -------
-        S, V, V_prev, last_dtau, j
+        S, V, V_prev, last_dtau, j, spot
             The spot grid, value vector, previous-step value vector,
-            last time-step size, and the spot-grid index closest to
-            the current spot.
+            last time-step size, the spot-grid index closest to the
+            current spot, and the spot itself.
         """
         _, S, V, V_prev, last_dtau = self._solve()
         spot = float(self.underlying.initial_value)
         j = self._spot_grid_index(S, spot)
-        return S, V, V_prev, last_dtau, j
+        return S, V, V_prev, last_dtau, j, spot
 
     def delta(self) -> float:
-        r"""Grid delta via the non-uniform three-point first-derivative
-        stencil at the spot node.
+        r"""Grid delta via parabolic-Lagrange first derivative at exactly
+        ``spot`` (not at the nearest node).
 
-        Collapses to the standard central difference
-        :math:`(V_{j+1} - V_{j-1}) / (S_{j+1} - S_{j-1})` on uniform grids.
+        Collapses to the standard central difference on a uniform grid
+        when ``spot`` coincides with a node.
         """
-        S, V, _, _, j = self._grid_greeks_data()
-        return self._grid_delta_at_index(S, V, j)
+        S, V, _, _, j, spot = self._grid_greeks_data()
+        return self._grid_delta_at_spot(S, V, j, spot)
 
     def gamma(self) -> float:
-        r"""Grid gamma via the standard second-order stencil.
+        r"""Grid gamma via cubic-Lagrange second derivative at exactly
+        ``spot`` (not at the nearest node).
 
-        .. math::
-
-            \Gamma \approx \frac{V_{j+1} - 2V_j + V_{j-1}}
-                               {\tfrac12(S_{j+1} - S_{j-1}) \cdot (S_{j+1} - S_{j-1})/2}
-
-        For a uniform grid this reduces to
-        :math:`(V_{j+1} - 2V_j + V_{j-1}) / h^2`.
+        A 4-point cubic patch yields a second derivative that varies
+        linearly with ``x``, so evaluating at ``spot`` decouples the
+        result from local node placement — important for KI parity where
+        vanilla and KO live on different (truncated) grids.
         """
-        S, V, _, _, j = self._grid_greeks_data()
-        return self._grid_gamma_at_index(S, V, j)
+        S, V, _, _, j, spot = self._grid_greeks_data()
+        return self._grid_gamma_at_spot(S, V, j, spot)
 
     def theta(self) -> float:
         r"""Grid theta via backward difference between the last two time
@@ -1247,7 +1281,7 @@ class _FDGridGreeksMixin:
 
         Returned per **calendar day** (divided by 365).
         """
-        S, V, V_prev, last_dtau, j = self._grid_greeks_data()
+        _, V, V_prev, last_dtau, j, _ = self._grid_greeks_data()
         if last_dtau <= 0.0:
             return 0.0
         theta_annual = (V_prev[j] - V[j]) / last_dtau
@@ -2358,7 +2392,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
     ) -> float:
         _, S, V, _, _ = result
         j = _FDGridGreeksMixin._spot_grid_index(S, spot)
-        return _FDGridGreeksMixin._grid_gamma_at_index(S, V, j)
+        return _FDGridGreeksMixin._grid_gamma_at_spot(S, V, j, spot)
 
     @staticmethod
     def _grid_theta_from_result(
