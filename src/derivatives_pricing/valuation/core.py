@@ -405,76 +405,6 @@ class OptionValuation:
             )
         return pv_pathwise()
 
-    # For barrier options, the spot bump epsilon is capped to
-    #     min(epsilon, _BARRIER_BUMP_MAX_FRACTION * |spot - barrier|)
-    # so the bumped spot stays inside the alive region. 0.5 keeps the bump
-    # at most halfway to the barrier.
-    _BARRIER_BUMP_MAX_FRACTION: float = 0.5
-
-    @staticmethod
-    def _check_bump_compatible(
-        bump_value: float | None,
-        greek_calc_method: GreekCalculationMethod | None,
-        bump_name: str,
-    ) -> None:
-        """Raise if a numerical bump is paired with an explicit non-NUMERICAL
-        ``greek_calc_method``.
-
-        Silently ignoring the bump would let users believe they are
-        controlling it when they aren't. Auto-resolution
-        (``greek_calc_method=None``) is exempt — users may always pass a
-        default bump in case the resolved method ends up being NUMERICAL.
-        """
-        if (
-            bump_value is not None
-            and greek_calc_method is not None
-            and greek_calc_method is not GreekCalculationMethod.NUMERICAL
-        ):
-            raise ValidationError(
-                f"{bump_name} is only used by NUMERICAL greeks; got "
-                f"greek_calc_method={greek_calc_method.name}."
-            )
-
-    def _resolve_spot_bump(self, epsilon: float) -> float:
-        """Cap ``epsilon`` so a central spot bump cannot cross a barrier.
-
-        For barrier options, an unconstrained bump of ``s0 ± epsilon`` may
-        cross the barrier on one side, putting the bumped option in a
-        different (knocked-out vs alive) regime than the unbumped option.
-        The resulting numerical greek then averages two regimes and is
-        biased — sometimes by an order of magnitude.
-
-        The returned bump is ``min(epsilon, max_fraction * |spot - barrier|)``
-        where ``max_fraction = _BARRIER_BUMP_MAX_FRACTION``.
-        """
-        if epsilon <= 0:
-            raise ValidationError(f"Spot bump epsilon must be strictly positive, got {epsilon}.")
-        if not isinstance(self._spec, BarrierSpec):
-            return epsilon
-        spec = self._spec
-        s0 = float(self._underlying.initial_value)
-        barrier = float(spec.barrier)
-        if spec.direction is BarrierDirection.DOWN:
-            gap = s0 - barrier
-        else:
-            gap = barrier - s0
-        if gap <= 0:
-            # Inception-triggered; let the engine handle it.
-            return epsilon
-        max_bump = gap * self._BARRIER_BUMP_MAX_FRACTION
-        if epsilon <= max_bump:
-            return epsilon
-        logger.warning(
-            "Numerical greek bump epsilon=%g would cross %s barrier H=%g "
-            "(spot=%g); shrinking to %g.",
-            epsilon,
-            spec.direction.name,
-            barrier,
-            s0,
-            max_bump,
-        )
-        return max_bump
-
     def delta(
         self,
         *,
@@ -500,7 +430,7 @@ class OptionValuation:
         float
             First derivative of option value with respect to spot.
         """
-        self._check_bump_compatible(epsilon, greek_calc_method, "epsilon")
+        self._validate_bump(epsilon, greek_calc_method, "epsilon")
         method = self._resolve_greek_method(
             greek_calc_method,
             tree_capable=True,
@@ -515,7 +445,8 @@ class OptionValuation:
 
         if epsilon is None:
             epsilon = self._underlying.initial_value / 100
-        epsilon = self._resolve_spot_bump(epsilon)
+        if isinstance(self._spec, BarrierSpec):
+            epsilon = self._resolve_spot_bump(epsilon)
 
         s0 = self._underlying.initial_value
         up = self._bump_underlying(initial_value=s0 + epsilon)
@@ -548,21 +479,12 @@ class OptionValuation:
         float
             Second derivative of option value with respect to spot.
         """
-        # gamma is special: PATHWISE uses epsilon too (central-difference of
-        # pathwise delta), so the generic helper would over-restrict.
-        if (
-            epsilon is not None
-            and greek_calc_method is not None
-            and greek_calc_method
-            not in (
-                GreekCalculationMethod.NUMERICAL,
-                GreekCalculationMethod.PATHWISE,
-            )
-        ):
-            raise ValidationError(
-                f"epsilon is only used by NUMERICAL and PATHWISE gamma; got "
-                f"greek_calc_method={greek_calc_method.name}."
-            )
+        self._validate_bump(
+            epsilon,
+            greek_calc_method,
+            "epsilon",
+            extra_allowed_methods=(GreekCalculationMethod.PATHWISE,),
+        )
         method = self._resolve_greek_method(
             greek_calc_method,
             tree_capable=True,
@@ -580,7 +502,8 @@ class OptionValuation:
 
         if epsilon is None:
             epsilon = self._underlying.initial_value / 100
-        epsilon = self._resolve_spot_bump(epsilon)
+        if isinstance(self._spec, BarrierSpec):
+            epsilon = self._resolve_spot_bump(epsilon)
 
         s0 = self._underlying.initial_value
         up = self._bump_underlying(initial_value=s0 + epsilon)
@@ -614,7 +537,7 @@ class OptionValuation:
         float
             Vega reported per 1 vol-point (1%) change in volatility.
         """
-        self._check_bump_compatible(epsilon, greek_calc_method, "epsilon")
+        self._validate_bump(epsilon, greek_calc_method, "epsilon")
         method = self._resolve_greek_method(greek_calc_method)
         if method is GreekCalculationMethod.PATHWISE:
             return float(self._impl.vega_pathwise())
@@ -661,7 +584,7 @@ class OptionValuation:
         float
             Value change per day.
         """
-        self._check_bump_compatible(time_bump_days, greek_calc_method, "time_bump_days")
+        self._validate_bump(time_bump_days, greek_calc_method, "time_bump_days")
         method = self._resolve_greek_method(
             greek_calc_method,
             tree_capable=True,
@@ -719,7 +642,7 @@ class OptionValuation:
         float
             Rho reported per 1% parallel rate move.
         """
-        self._check_bump_compatible(rate_bump, greek_calc_method, "rate_bump")
+        self._validate_bump(rate_bump, greek_calc_method, "rate_bump")
         method = self._resolve_greek_method(greek_calc_method)
         if method is GreekCalculationMethod.PATHWISE:
             return float(self._impl.rho_pathwise())
@@ -1252,6 +1175,91 @@ class OptionValuation:
             raise UnsupportedFeatureError(
                 "Pathwise and likelihood-ratio MC Greeks are not supported with discrete dividends."
             )
+
+    # For barrier options, the spot bump epsilon is capped to
+    # min(epsilon, _BARRIER_BUMP_MAX_FRACTION * |spot - barrier|)
+    # so the bumped spot stays inside the alive region. 0.5 keeps the bump
+    # at most halfway to the barrier.
+    _BARRIER_BUMP_MAX_FRACTION: float = 0.5
+
+    @staticmethod
+    def _validate_bump(
+        bump_value: float | None,
+        greek_calc_method: GreekCalculationMethod | None,
+        bump_name: str,
+        extra_allowed_methods: tuple[GreekCalculationMethod, ...] = (),
+    ) -> None:
+        """Validate a numerical-greek bump argument.
+
+        Two checks are bundled here so every greek entry point can run a
+        single line:
+
+        1. The bump must be strictly positive when supplied. Negative
+           bumps are almost certainly user mistakes — central differences
+           are sign-symmetric so a negative spot/vol/rate bump silently
+           gives the same magnitude with confusing semantics, while a
+           negative ``time_bump_days`` flips the forward-difference theta.
+        2. The bump must be compatible with the chosen greek method.
+           Passing ``epsilon=...`` together with an explicit non-NUMERICAL
+           method is a contradiction — the bump would be silently ignored,
+           letting users believe they are controlling it when they aren't.
+           Auto-resolution (``greek_calc_method=None``) is exempt: users
+           may always pass a default bump in case the resolved method ends
+           up being NUMERICAL. ``extra_allowed_methods`` lets gamma also
+           accept PATHWISE (which uses a finite-difference epsilon).
+        """
+        if bump_value is None:
+            return
+        if bump_value <= 0:
+            raise ValidationError(f"{bump_name} must be strictly positive, got {bump_value}.")
+        if greek_calc_method is None:
+            return
+        if greek_calc_method is GreekCalculationMethod.NUMERICAL:
+            return
+        if greek_calc_method in extra_allowed_methods:
+            return
+        raise ValidationError(
+            f"{bump_name} is only used by NUMERICAL greeks; got "
+            f"greek_calc_method={greek_calc_method.name}."
+        )
+
+    def _resolve_spot_bump(self, epsilon: float) -> float:
+        """Cap ``epsilon`` so a central spot bump cannot cross the barrier.
+
+        Caller must have verified ``self._spec`` is a :class:`BarrierSpec`.
+        For barrier options, an unconstrained bump of ``s0 ± epsilon`` may
+        cross the barrier on one side, putting the bumped option in a
+        different (knocked-out vs alive) regime than the unbumped option.
+        The resulting numerical greek then averages two regimes and is
+        biased — sometimes by an order of magnitude.
+
+        The returned bump is ``min(epsilon, max_fraction * |spot - barrier|)``
+        where ``max_fraction = _BARRIER_BUMP_MAX_FRACTION``.
+        """
+        spec = self._spec
+        assert isinstance(spec, BarrierSpec)
+        s0 = float(self._underlying.initial_value)
+        barrier = float(spec.barrier)
+        if spec.direction is BarrierDirection.DOWN:
+            gap = s0 - barrier
+        else:
+            gap = barrier - s0
+        if gap <= 0:
+            # Inception-triggered; let the engine handle it.
+            return epsilon
+        max_bump = gap * self._BARRIER_BUMP_MAX_FRACTION
+        if epsilon <= max_bump:
+            return epsilon
+        logger.warning(
+            "Numerical greek bump epsilon=%g would cross %s barrier H=%g "
+            "(spot=%g); shrinking to %g.",
+            epsilon,
+            spec.direction.name,
+            barrier,
+            s0,
+            max_bump,
+        )
+        return max_bump
 
     # ── Asian theta helpers ──────────────────────────────────────────────
 
