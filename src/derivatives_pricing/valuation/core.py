@@ -411,6 +411,30 @@ class OptionValuation:
     # at most halfway to the barrier.
     _BARRIER_BUMP_MAX_FRACTION: float = 0.5
 
+    @staticmethod
+    def _check_bump_compatible(
+        bump_value: float | None,
+        greek_calc_method: GreekCalculationMethod | None,
+        bump_name: str,
+    ) -> None:
+        """Raise if a numerical bump is paired with an explicit non-NUMERICAL
+        ``greek_calc_method``.
+
+        Silently ignoring the bump would let users believe they are
+        controlling it when they aren't. Auto-resolution
+        (``greek_calc_method=None``) is exempt — users may always pass a
+        default bump in case the resolved method ends up being NUMERICAL.
+        """
+        if (
+            bump_value is not None
+            and greek_calc_method is not None
+            and greek_calc_method is not GreekCalculationMethod.NUMERICAL
+        ):
+            raise ValidationError(
+                f"{bump_name} is only used by NUMERICAL greeks; got "
+                f"greek_calc_method={greek_calc_method.name}."
+            )
+
     def _resolve_spot_bump(self, epsilon: float) -> float:
         """Cap ``epsilon`` so a central spot bump cannot cross a barrier.
 
@@ -476,6 +500,7 @@ class OptionValuation:
         float
             First derivative of option value with respect to spot.
         """
+        self._check_bump_compatible(epsilon, greek_calc_method, "epsilon")
         method = self._resolve_greek_method(
             greek_calc_method,
             tree_capable=True,
@@ -523,6 +548,21 @@ class OptionValuation:
         float
             Second derivative of option value with respect to spot.
         """
+        # gamma is special: PATHWISE uses epsilon too (central-difference of
+        # pathwise delta), so the generic helper would over-restrict.
+        if (
+            epsilon is not None
+            and greek_calc_method is not None
+            and greek_calc_method
+            not in (
+                GreekCalculationMethod.NUMERICAL,
+                GreekCalculationMethod.PATHWISE,
+            )
+        ):
+            raise ValidationError(
+                f"epsilon is only used by NUMERICAL and PATHWISE gamma; got "
+                f"greek_calc_method={greek_calc_method.name}."
+            )
         method = self._resolve_greek_method(
             greek_calc_method,
             tree_capable=True,
@@ -555,7 +595,7 @@ class OptionValuation:
     def vega(
         self,
         *,
-        epsilon: float = 0.01,
+        epsilon: float | None = None,
         greek_calc_method: GreekCalculationMethod | None = None,
     ) -> float:
         """Compute option vega.
@@ -564,7 +604,7 @@ class OptionValuation:
         ----------
         epsilon
             Volatility bump used by central-difference numerical vega.
-            The default corresponds to a 1 vol-point bump.
+            If ``None``, defaults to ``0.01`` (a 1 vol-point bump).
         greek_calc_method
             Greek computation method. Supports analytical, pathwise, and
             likelihood-ratio methods where available; otherwise numerical.
@@ -574,6 +614,7 @@ class OptionValuation:
         float
             Vega reported per 1 vol-point (1%) change in volatility.
         """
+        self._check_bump_compatible(epsilon, greek_calc_method, "epsilon")
         method = self._resolve_greek_method(greek_calc_method)
         if method is GreekCalculationMethod.PATHWISE:
             return float(self._impl.vega_pathwise())
@@ -582,6 +623,8 @@ class OptionValuation:
         if method is not GreekCalculationMethod.NUMERICAL:
             return float(self._impl.vega())
 
+        if epsilon is None:
+            epsilon = 0.01
         vol = self._underlying.volatility
         up = self._bump_underlying(volatility=vol + epsilon)
         dn = self._bump_underlying(volatility=vol - epsilon)
@@ -599,7 +642,7 @@ class OptionValuation:
     def theta(
         self,
         *,
-        time_bump_days: float = 1.0,
+        time_bump_days: float | None = None,
         greek_calc_method: GreekCalculationMethod | None = None,
     ) -> float:
         """Compute option theta.
@@ -611,12 +654,14 @@ class OptionValuation:
             otherwise bump-and-revalue is used.
         time_bump_days
             Calendar day bump applied to the pricing date for numerical theta.
+            If ``None``, defaults to ``1.0``.
 
         Returns
         -------
         float
             Value change per day.
         """
+        self._check_bump_compatible(time_bump_days, greek_calc_method, "time_bump_days")
         method = self._resolve_greek_method(
             greek_calc_method,
             tree_capable=True,
@@ -629,6 +674,8 @@ class OptionValuation:
         if method is not GreekCalculationMethod.NUMERICAL:
             return float(self._impl.theta())
 
+        if time_bump_days is None:
+            time_bump_days = 1.0
         bumped_date = self.pricing_date + dt.timedelta(days=time_bump_days)
         if bumped_date >= self.maturity:
             return 0.0
@@ -653,7 +700,7 @@ class OptionValuation:
     def rho(
         self,
         *,
-        rate_bump: float = 0.01,
+        rate_bump: float | None = None,
         greek_calc_method: GreekCalculationMethod | None = None,
     ) -> float:
         """Compute option rho.
@@ -665,13 +712,14 @@ class OptionValuation:
             otherwise finite-difference bump-and-revalue is used.
         rate_bump
             Absolute parallel bump in the continuously-compounded risk-free
-            zero-rate curve for numerical rho.
+            zero-rate curve for numerical rho. If ``None``, defaults to ``0.01``.
 
         Returns
         -------
         float
             Rho reported per 1% parallel rate move.
         """
+        self._check_bump_compatible(rate_bump, greek_calc_method, "rate_bump")
         method = self._resolve_greek_method(greek_calc_method)
         if method is GreekCalculationMethod.PATHWISE:
             return float(self._impl.rho_pathwise())
@@ -680,6 +728,8 @@ class OptionValuation:
         if method is not GreekCalculationMethod.NUMERICAL:
             return float(self._impl.rho())
 
+        if rate_bump is None:
+            rate_bump = 0.01
         curve_up = self.discount_curve.bump_parallel_zero_rate(rate_bump / 2)
         curve_down = self.discount_curve.bump_parallel_zero_rate(-rate_bump / 2)
 
