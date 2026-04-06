@@ -30,6 +30,7 @@ from ..stochastic_processes import PathSimulation, GBMProcess
 from ..exceptions import ConfigurationError, UnsupportedFeatureError, ValidationError
 from ..enums import (
     AsianAveraging,
+    BarrierDirection,
     BarrierMonitoring,
     DayCountConvention,
     OptionType,
@@ -404,6 +405,52 @@ class OptionValuation:
             )
         return pv_pathwise()
 
+    # For barrier options, the spot bump epsilon is capped to
+    #     min(epsilon, _BARRIER_BUMP_MAX_FRACTION * |spot - barrier|)
+    # so the bumped spot stays inside the alive region. 0.5 keeps the bump
+    # at most halfway to the barrier.
+    _BARRIER_BUMP_MAX_FRACTION: float = 0.5
+
+    def _resolve_spot_bump(self, epsilon: float) -> float:
+        """Cap ``epsilon`` so a central spot bump cannot cross a barrier.
+
+        For barrier options, an unconstrained bump of ``s0 ± epsilon`` may
+        cross the barrier on one side, putting the bumped option in a
+        different (knocked-out vs alive) regime than the unbumped option.
+        The resulting numerical greek then averages two regimes and is
+        biased — sometimes by an order of magnitude.
+
+        The returned bump is ``min(epsilon, max_fraction * |spot - barrier|)``
+        where ``max_fraction = _BARRIER_BUMP_MAX_FRACTION``.
+        """
+        if epsilon <= 0:
+            raise ValidationError(f"Spot bump epsilon must be strictly positive, got {epsilon}.")
+        if not isinstance(self._spec, BarrierSpec):
+            return epsilon
+        spec = self._spec
+        s0 = float(self._underlying.initial_value)
+        barrier = float(spec.barrier)
+        if spec.direction is BarrierDirection.DOWN:
+            gap = s0 - barrier
+        else:
+            gap = barrier - s0
+        if gap <= 0:
+            # Inception-triggered; let the engine handle it.
+            return epsilon
+        max_bump = gap * self._BARRIER_BUMP_MAX_FRACTION
+        if epsilon <= max_bump:
+            return epsilon
+        logger.warning(
+            "Numerical greek bump epsilon=%g would cross %s barrier H=%g "
+            "(spot=%g); shrinking to %g.",
+            epsilon,
+            spec.direction.name,
+            barrier,
+            s0,
+            max_bump,
+        )
+        return max_bump
+
     def delta(
         self,
         *,
@@ -417,7 +464,9 @@ class OptionValuation:
         epsilon
             Spot bump size used by central-difference numerical delta.
             Ignored for analytical, tree, pathwise, and likelihood-ratio methods.
-            If ``None``, defaults to ``spot / 100``.
+            If ``None``, defaults to ``spot / 100``. For barrier options the
+            bump is automatically shrunk if it would otherwise cross the
+            barrier.
         greek_calc_method
             Greek computation method. When ``None``, the method is selected
             automatically from pricing-engine capabilities.
@@ -441,6 +490,7 @@ class OptionValuation:
 
         if epsilon is None:
             epsilon = self._underlying.initial_value / 100
+        epsilon = self._resolve_spot_bump(epsilon)
 
         s0 = self._underlying.initial_value
         up = self._bump_underlying(initial_value=s0 + epsilon)
@@ -490,6 +540,7 @@ class OptionValuation:
 
         if epsilon is None:
             epsilon = self._underlying.initial_value / 100
+        epsilon = self._resolve_spot_bump(epsilon)
 
         s0 = self._underlying.initial_value
         up = self._bump_underlying(initial_value=s0 + epsilon)
