@@ -1228,6 +1228,37 @@ class _FDGridGreeksMixin:
             + v3 * (6.0 * spot - 2.0 * s3) / d3
         )
 
+    # Relative tolerance for the cubic-vs-parabolic gamma agreement check;
+    # if cubic disagrees with parabolic by more than this fraction (of the
+    # larger magnitude), we treat the cubic as polluted by PDE noise and
+    # fall back to the parabolic value.
+    _GAMMA_CUBIC_PARABOLIC_REL_TOL: float = 0.5
+
+    @staticmethod
+    def _grid_gamma_safe(S: np.ndarray, V: np.ndarray, j: int, spot: float) -> float:
+        """Cubic-at-spot gamma with parabolic-at-index fallback.
+
+        The cubic 4-point stencil is more accurate where ``V`` is locally
+        smooth, but it has wider reach and larger basis-function weights
+        than the parabolic 3-point stencil, so it amplifies PDE noise more
+        aggressively (e.g. PSOR oscillations near American exercise
+        boundaries, or noise leaking back from the KI coupling step in
+        the two-surface solver). When the two stencils disagree by more
+        than ``_GAMMA_CUBIC_PARABOLIC_REL_TOL``, we treat the cubic as
+        polluted and fall back to the parabolic value.
+
+        For the well-behaved scenarios cubic and parabolic agree closely
+        and the cubic is returned (slightly more accurate); for the
+        pathological scenarios the parabolic safety net catches the
+        amplified noise.
+        """
+        parabolic = _FDGridGreeksMixin._grid_gamma_at_index(S, V, j)
+        cubic = _FDGridGreeksMixin._grid_gamma_at_spot(S, V, j, spot)
+        scale = max(abs(parabolic), abs(cubic), 1e-6)
+        if abs(cubic - parabolic) > _FDGridGreeksMixin._GAMMA_CUBIC_PARABOLIC_REL_TOL * scale:
+            return parabolic
+        return cubic
+
     def _solve(
         self,
     ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]: ...
@@ -1249,27 +1280,76 @@ class _FDGridGreeksMixin:
         j = self._spot_grid_index(S, spot)
         return S, V, V_prev, last_dtau, j, spot
 
+    def _intrinsic_short_circuit_greeks(
+        self, S: np.ndarray, V: np.ndarray, j: int
+    ) -> tuple[float, float] | None:
+        """Return ``(delta, gamma)`` if the spot node sits in the
+        early-exercise region of an American option, else ``None``.
+
+        When ``V[j]`` equals the intrinsic value at ``S[j]``, the node
+        lies in the early-exercise region and the local value function is
+        ``V(s) = max(K - s, 0)`` (put) or ``V(s) = max(s - K, 0)`` (call).
+        Local greeks are then exact (``delta = ±1``, ``gamma = 0``) and
+        the PDE stencil extraction is unreliable due to PSOR oscillations
+        near the exercise boundary — both parabolic and cubic stencils
+        can produce wildly wrong values because the noise is in the
+        underlying ``V`` samples, not in the stencil.
+
+        Only fires for American options on a CALL/PUT spec with strictly
+        positive intrinsic value at ``S[j]``.
+        """
+        spec = self.valuation_ctx.spec
+        if not isinstance(spec, (VanillaSpec, BarrierSpec)):
+            return None
+        if spec.exercise_type is not ExerciseType.AMERICAN:
+            return None
+        strike = float(spec.strike)
+        s_node = float(S[j])
+        if spec.option_type is OptionType.CALL:
+            intrinsic = s_node - strike
+            sign = 1.0
+        else:
+            intrinsic = strike - s_node
+            sign = -1.0
+        if intrinsic <= 0.0:
+            return None
+        # PV at the node should equal intrinsic when in the exercise region.
+        # PSOR convergence is exact at the exercise constraint up to the
+        # tolerance ``tol``; allow a small relative slack.
+        if abs(V[j] - intrinsic) > max(1e-8, 1e-6 * intrinsic):
+            return None
+        return (sign, 0.0)
+
     def delta(self) -> float:
         r"""Grid delta via parabolic-Lagrange first derivative at exactly
         ``spot`` (not at the nearest node).
 
         Collapses to the standard central difference on a uniform grid
         when ``spot`` coincides with a node.
+
+        Short-circuits to ``±1`` when the option is American and the
+        spot node sits in the early-exercise region (PV equals intrinsic);
+        the PDE stencil is unreliable there because of PSOR oscillations.
         """
         S, V, _, _, j, spot = self._grid_greeks_data()
+        short_circuit = self._intrinsic_short_circuit_greeks(S, V, j)
+        if short_circuit is not None:
+            return short_circuit[0]
         return self._grid_delta_at_spot(S, V, j, spot)
 
     def gamma(self) -> float:
         r"""Grid gamma via cubic-Lagrange second derivative at exactly
-        ``spot`` (not at the nearest node).
+        ``spot``, with a parabolic fallback when the cubic stencil
+        appears polluted by PDE noise (see ``_grid_gamma_safe``).
 
-        A 4-point cubic patch yields a second derivative that varies
-        linearly with ``x``, so evaluating at ``spot`` decouples the
-        result from local node placement — important for KI parity where
-        vanilla and KO live on different (truncated) grids.
+        Short-circuits to ``0`` when the option is American and the
+        spot node sits in the early-exercise region (PV equals intrinsic).
         """
         S, V, _, _, j, spot = self._grid_greeks_data()
-        return self._grid_gamma_at_spot(S, V, j, spot)
+        short_circuit = self._intrinsic_short_circuit_greeks(S, V, j)
+        if short_circuit is not None:
+            return short_circuit[1]
+        return self._grid_gamma_safe(S, V, j, spot)
 
     def theta(self) -> float:
         r"""Grid theta via backward difference between the last two time
@@ -2392,7 +2472,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
     ) -> float:
         _, S, V, _, _ = result
         j = _FDGridGreeksMixin._spot_grid_index(S, spot)
-        return _FDGridGreeksMixin._grid_gamma_at_spot(S, V, j, spot)
+        return _FDGridGreeksMixin._grid_gamma_safe(S, V, j, spot)
 
     @staticmethod
     def _grid_theta_from_result(
