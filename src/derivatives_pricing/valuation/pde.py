@@ -1156,6 +1156,42 @@ class _FDGridGreeksMixin:
             / (h_up * h_dn * (h_up + h_dn))
         )
 
+    @staticmethod
+    def _grid_delta_at_index(S: np.ndarray, V: np.ndarray, j: int) -> float:
+        """Return the non-uniform three-point first-derivative stencil at ``j``.
+
+        On a non-uniform grid the textbook central difference
+        ``(V[j+1] - V[j-1]) / (S[j+1] - S[j-1])`` degrades to O(h); the
+        weighted three-point stencil below restores O(h²) accuracy and
+        collapses to the central difference on a uniform grid.
+        """
+        h_up = S[j + 1] - S[j]
+        h_dn = S[j] - S[j - 1]
+        return float(
+            -h_up / (h_dn * (h_up + h_dn)) * V[j - 1]
+            + (h_up - h_dn) / (h_up * h_dn) * V[j]
+            + h_dn / (h_up * (h_up + h_dn)) * V[j + 1]
+        )
+
+    @staticmethod
+    def _grid_delta_at_spot(S: np.ndarray, V: np.ndarray, j: int, spot: float) -> float:
+        """Parabolic-Lagrange first derivative evaluated exactly at ``spot``.
+
+        Differentiates the quadratic interpolant through nodes
+        ``(S[j-1], S[j], S[j+1])`` at the actual spot rather than at the
+        nearest node ``S[j]``. This is essential for KI parity, where the
+        vanilla and KO surfaces live on different grids and ``S[j]`` may
+        differ between them by up to one grid step — subtracting deltas at
+        different actual spots biases the result.
+        """
+        x0, x1, x2 = S[j - 1], S[j], S[j + 1]
+        v0, v1, v2 = V[j - 1], V[j], V[j + 1]
+        return float(
+            v0 * (2.0 * spot - x1 - x2) / ((x0 - x1) * (x0 - x2))
+            + v1 * (2.0 * spot - x0 - x2) / ((x1 - x0) * (x1 - x2))
+            + v2 * (2.0 * spot - x0 - x1) / ((x2 - x0) * (x2 - x1))
+        )
+
     def _solve(
         self,
     ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]: ...
@@ -1178,14 +1214,14 @@ class _FDGridGreeksMixin:
         return S, V, V_prev, last_dtau, j
 
     def delta(self) -> float:
-        r"""Grid delta via central differences at the spot node.
+        r"""Grid delta via the non-uniform three-point first-derivative
+        stencil at the spot node.
 
-        .. math::
-
-            \Delta \approx \frac{V_{j+1} - V_{j-1}}{S_{j+1} - S_{j-1}}
+        Collapses to the standard central difference
+        :math:`(V_{j+1} - V_{j-1}) / (S_{j+1} - S_{j-1})` on uniform grids.
         """
         S, V, _, _, j = self._grid_greeks_data()
-        return float((V[j + 1] - V[j - 1]) / (S[j + 1] - S[j - 1]))
+        return self._grid_delta_at_index(S, V, j)
 
     def gamma(self) -> float:
         r"""Grid gamma via the standard second-order stencil.
@@ -2313,7 +2349,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
     ) -> float:
         _, S, V, _, _ = result
         j = _FDGridGreeksMixin._spot_grid_index(S, spot)
-        return float((V[j + 1] - V[j - 1]) / (S[j + 1] - S[j - 1]))
+        return _FDGridGreeksMixin._grid_delta_at_spot(S, V, j, spot)
 
     @staticmethod
     def _grid_gamma_from_result(
