@@ -367,39 +367,64 @@ def _build_log_grid(
     smax_mult: float,
     spot_steps: int,
     time_steps: int,
+    method: PDEMethod,
     anchor_spot: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """Build log-spot grid using Hull's dz heuristic when possible.
+    """Build log-spot grid.
 
-    When ``anchor_spot`` is provided, the grid is shifted so that the anchor
-    lies exactly on a grid node while still covering the target domain.
+    For the explicit-family schemes (``EXPLICIT``, ``EXPLICIT_HULL``) the
+    grid construction preserves Hull's heuristic scale
+    ``dz_hull = vol * sqrt(3 * dt)`` when the target log-domain fits within
+    ``spot_steps * dz_hull``. For ``EXPLICIT_HULL`` this is the special
+    spacing that recovers the trinomial-equivalent explicit discretization
+    with up/mid/down probabilities ``1/6, 2/3, 1/6``. Choosing a finer
+    ``dz`` than ``dz_hull`` at fixed ``dt`` no longer preserves that
+    equivalence and may violate the explicit scheme's stability or
+    monotonicity conditions.
+
+    For unconditionally stable schemes (``IMPLICIT``, ``CRANK_NICOLSON``)
+    neither concern applies, so ``spot_steps`` controls the spatial
+    density directly: ``dz = (zmax_target - zmin_target) / spot_steps``.
+
+    When ``anchor_spot`` is provided, the grid is sized so that the anchor
+    lies exactly on an interior node *and* the resulting domain is a
+    (possibly slight) superset of ``[zmin_target, zmax_target]``. For
+    CN/IMPLICIT this is achieved by recomputing ``dz`` from the binding
+    half (left or right of the anchor); for explicit schemes ``dz`` is
+    fixed by Hull's stability heuristic, so the grid is shifted in place
+    while keeping strict cover of the target domain.
     """
-    d_tau = time_to_maturity / time_steps
-    dz_hull = volatility * np.sqrt(3.0 * d_tau)
-
     smax = float(smax_mult * max(spot, strike))
     smin = float(max(max(spot, strike) / smax_mult, 1.0e-8))
     zmin_target = np.log(smin)
     zmax_target = np.log(smax)
 
-    grid_width = spot_steps * dz_hull
-    if (zmax_target - zmin_target) > grid_width:
+    if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
+        d_tau = time_to_maturity / time_steps
+        dz_hull = volatility * np.sqrt(3.0 * d_tau)
+        grid_width = spot_steps * dz_hull
+        if (zmax_target - zmin_target) > grid_width:
+            dz = (zmax_target - zmin_target) / spot_steps
+            zmin = zmin_target
+            zmax = zmax_target
+        else:
+            dz = dz_hull
+            center = np.log(spot)
+            zmin = center - 0.5 * grid_width
+            zmax = center + 0.5 * grid_width
+            if zmin > zmin_target:
+                shift = zmin_target - zmin
+                zmin += shift
+                zmax += shift
+            if zmax < zmax_target:
+                shift = zmax_target - zmax
+                zmin += shift
+                zmax += shift
+    else:
+        # Unconditionally stable schemes: honor spot_steps directly.
         dz = (zmax_target - zmin_target) / spot_steps
         zmin = zmin_target
         zmax = zmax_target
-    else:
-        dz = dz_hull
-        center = np.log(spot)
-        zmin = center - 0.5 * grid_width
-        zmax = center + 0.5 * grid_width
-        if zmin > zmin_target:
-            shift = zmin_target - zmin
-            zmin += shift
-            zmax += shift
-        if zmax < zmax_target:
-            shift = zmax_target - zmax
-            zmin += shift
-            zmax += shift
 
     if anchor_spot is not None:
         if anchor_spot <= 0.0:
@@ -409,16 +434,44 @@ def _build_log_grid(
         if not (zmin_target <= z_anchor <= zmax_target):
             raise ValidationError("anchor_spot must lie within the log-grid target domain")
 
-        j_min = max(0, int(math.ceil((z_anchor - zmin_target) / dz - 1.0e-12)))
-        j_max = min(
-            spot_steps,
-            int(math.floor(spot_steps - (zmax_target - z_anchor) / dz + 1.0e-12)),
-        )
-        if j_min > j_max:
-            raise StabilityError("Unable to align anchor_spot on the log grid with current setup")
+        if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
+            # Explicit schemes use Hull's dz_hull heuristic, which leaves
+            # ``grid_width = spot_steps * dz`` strictly larger than the
+            # target span (when not capped). dz is fixed by stability, so
+            # we shift the grid in place while keeping strict cover of
+            # ``[zmin_target, zmax_target]``.
+            j_min = max(0, int(math.ceil((z_anchor - zmin_target) / dz - 1.0e-12)))
+            j_max = min(
+                spot_steps,
+                int(math.floor(spot_steps - (zmax_target - z_anchor) / dz + 1.0e-12)),
+            )
+            if j_min > j_max:
+                raise StabilityError(
+                    "Unable to align anchor_spot on the log grid with current setup"
+                )
+            preferred_index = int(round((z_anchor - zmin) / dz))
+            j_anchor = min(max(preferred_index, j_min), j_max)
+        else:
+            # CN/IMPLICIT: dz is free, so instead of shifting a fixed-dz
+            # grid (which forces an unsatisfiable strict-cover constraint
+            # when dz exactly tiles the target span), we *grow* dz on the
+            # binding half. Pick the integer node closest to where the
+            # anchor naturally falls, then size dz from whichever side is
+            # tighter. The result is a uniform grid that:
+            #   - places the anchor exactly on an interior node,
+            #   - is strictly tight to the target on the binding side,
+            #   - has up to one cell of slack outside the target on the
+            #     other side (i.e. a slight superset of the target — never
+            #     under-covers),
+            #   - costs at most ~1/(spot_steps - 1) extra dz vs the bare-
+            #     minimum tile of the target span.
+            span = zmax_target - zmin_target
+            j_opt = int(round(spot_steps * (z_anchor - zmin_target) / span))
+            j_anchor = max(1, min(spot_steps - 1, j_opt))
+            left_dz = (z_anchor - zmin_target) / j_anchor
+            right_dz = (zmax_target - z_anchor) / (spot_steps - j_anchor)
+            dz = max(left_dz, right_dz)
 
-        preferred_index = int(round((z_anchor - zmin) / dz))
-        j_anchor = min(max(preferred_index, j_min), j_max)
         zmin = z_anchor - j_anchor * dz
 
     Z = zmin + dz * np.arange(spot_steps + 1, dtype=float)
@@ -924,6 +977,7 @@ def _fd_core(
             smax_mult=smax_mult,
             spot_steps=spot_steps,
             time_steps=time_steps,
+            method=method,
         )
 
     smin = float(S[0])
@@ -1597,27 +1651,37 @@ def _fd_barrier_ko_core(
 
     if space_grid is PDESpaceGrid.LOG_SPOT:
         if continuous:
-            # Build log grid with barrier as a boundary
-            dz_hull = volatility * np.sqrt(3.0 * (time_to_maturity / time_steps))
+            # Build log grid with barrier as a boundary.
+            # Preserve Hull's dz scale for the explicit-family schemes;
+            # CN/IMPLICIT honor spot_steps directly.
+            explicit_scheme = method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL)
             if direction is BarrierDirection.DOWN:
                 zmin = np.log(smin_target)
                 zmax_default = np.log(smax_target)
-                grid_width = spot_steps * dz_hull
-                if (zmax_default - zmin) > grid_width:
-                    dz = (zmax_default - zmin) / spot_steps
+                if explicit_scheme:
+                    dz_hull = volatility * np.sqrt(3.0 * (time_to_maturity / time_steps))
+                    grid_width = spot_steps * dz_hull
+                    if (zmax_default - zmin) > grid_width:
+                        dz = (zmax_default - zmin) / spot_steps
+                    else:
+                        dz = dz_hull
+                        zmax_default = zmin + grid_width
                 else:
-                    dz = dz_hull
-                    zmax_default = zmin + grid_width
+                    dz = (zmax_default - zmin) / spot_steps
                 Z = np.linspace(zmin, zmax_default, spot_steps + 1)
             else:
                 zmax = np.log(smax_target)
                 zmin_default = np.log(max(ref_price / smax_mult, 1.0e-8))
-                grid_width = spot_steps * dz_hull
-                if (zmax - zmin_default) > grid_width:
-                    dz = (zmax - zmin_default) / spot_steps
+                if explicit_scheme:
+                    dz_hull = volatility * np.sqrt(3.0 * (time_to_maturity / time_steps))
+                    grid_width = spot_steps * dz_hull
+                    if (zmax - zmin_default) > grid_width:
+                        dz = (zmax - zmin_default) / spot_steps
+                    else:
+                        dz = dz_hull
+                        zmin_default = zmax - grid_width
                 else:
-                    dz = dz_hull
-                    zmin_default = zmax - grid_width
+                    dz = (zmax - zmin_default) / spot_steps
                 Z = np.linspace(zmin_default, zmax, spot_steps + 1)
             S = np.exp(Z)
             grid = Z
@@ -1630,6 +1694,7 @@ def _fd_barrier_ko_core(
                 smax_mult=smax_mult,
                 spot_steps=spot_steps,
                 time_steps=time_steps,
+                method=method,
                 anchor_spot=barrier,
             )
     else:
@@ -2024,6 +2089,7 @@ def _fd_barrier_ki_core(
             smax_mult=smax_mult,
             spot_steps=spot_steps,
             time_steps=time_steps,
+            method=method,
             anchor_spot=barrier,
         )
     else:
