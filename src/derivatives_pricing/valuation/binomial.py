@@ -7,6 +7,7 @@ extensions used by the core dispatcher.
 from __future__ import annotations
 from typing import TYPE_CHECKING
 import logging
+import warnings
 import numpy as np
 import pandas as pd
 from ..enums import (
@@ -926,9 +927,29 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         if spot <= 0.0 or barrier <= 0.0 or sigma <= 0.0 or ttm <= 0.0:
             return base_steps
 
+        # If the option is already triggered at inception, `present_value()`
+        # will short-circuit through `_initial_value_if_triggered` without
+        # running the barrier tree. Neither Boyle-Lau inflation nor the
+        # cap-bind warning is meaningful in that case:
+        #   - KO: the option is dead at t=0 and PV is a closed-form rebate
+        #     discount; the barrier-aware solver never runs.
+        #   - KI: the option becomes vanilla immediately and is priced via
+        #     `_solve_backward` (not the barrier-aware solver), so barrier
+        #     alignment is irrelevant.
+        # Skip both the inflation and any warning for those cases.
+        if self._is_triggered(spot, barrier, self.spec.direction):
+            return base_steps
+
         log_distance = np.log(max(spot, barrier) / min(spot, barrier))
         divisor = log_distance * log_distance
-        if np.isclose(divisor, 0.0):
+        # Only bail if log_distance is exactly zero (barrier coincides with
+        # spot — a triggered-at-inception case handled upstream by
+        # `_initial_value_if_triggered`). We must NOT use `np.isclose` here
+        # with its default atol=1e-8 because that would silently disable the
+        # Boyle-Lau step adjustment for all near-spot barriers (any barrier
+        # closer to spot than ~1e-4 in log-space would fall inside the
+        # tolerance), exactly the regime where BL alignment matters most.
+        if divisor <= 0.0:
             return base_steps
 
         max_steps = max(1000, base_steps * 5)
@@ -936,6 +957,32 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         for i in range(1, base_steps):
             candidate = int((i * i * sigma * sigma * ttm) / divisor)
             if base_steps < candidate:
+                if candidate > max_steps:
+                    # Boyle-Lau alignment requires a tree with `candidate` time
+                    # steps to place a layer of CRR nodes exactly on the barrier
+                    # (typically because the barrier sits very close to spot).
+                    # The `max_steps` cap prevents runaway memory, so the final
+                    # tree will run at `max_steps` without barrier alignment and
+                    # will converge extremely slowly (classic Boyle-Lau bias,
+                    # O(1/√n) with a large constant). Warn the user so they
+                    # know to switch engines.
+                    log_distance_pct = 100.0 * log_distance / max(np.log(spot), 1.0e-12)
+                    warnings.warn(
+                        (
+                            "Binomial barrier pricing: Boyle-Lau step alignment "
+                            f"needs ~{candidate} time steps to place a tree layer "
+                            f"on the barrier (spot={spot:g}, barrier={barrier:g}, "
+                            f"|log(H/S)|={log_distance:.2e}, ~{log_distance_pct:.3f}%"
+                            f" of log-spot), but the step cap is {max_steps}. "
+                            f"The tree will run at {max_steps} steps without "
+                            "barrier alignment and the price will converge "
+                            "only as O(1/√n) with a large constant. For "
+                            "barriers this close to spot, PDE_FD is strongly "
+                            "recommended as the more accurate engine."
+                        ),
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 optimum_steps = min(candidate, max_steps)
                 break
         return optimum_steps
