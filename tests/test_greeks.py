@@ -14,6 +14,7 @@ from derivatives_pricing.enums import (
     AsianAveraging,
     BarrierDirection,
     BarrierAction,
+    BarrierMonitoring,
     ExerciseType,
     GreekCalculationMethod,
     OptionType,
@@ -1657,5 +1658,151 @@ def test_american_barrier_rho_binomial_vs_pde(
         rhs_name="DP_BN",
         skip_missing_rhs=False,
         atol=1e-3,
+        logger=None,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Barrier Monte Carlo greeks
+# ═══════════════════════════════════════════════════════════════════════
+# European MC barrier greeks vs BSM analytical (BSM is the ground truth).
+# American MC barrier greeks vs PDE_FD (PDE is the ground truth).
+# Tolerances are loose because MC bump-and-revalue accumulates Monte Carlo
+# variance on top of finite-difference noise; barrier payoffs amplify both.
+
+_BARRIER_MC_PATHS = 150_000
+_BARRIER_MC_STEPS = 200
+_BARRIER_MC_CFG = MonteCarloParams(random_seed=42, deg=3, barrier_aware_basis=True)
+
+
+def _dp_barrier_mc_greeks(
+    *,
+    exercise_type: ExerciseType,
+    direction: BarrierDirection,
+    action: BarrierAction,
+    barrier: float,
+    option_type: OptionType,
+    strike: float,
+    rebate: float = 0.0,
+    rebate_timing: RebateTiming = RebateTiming.AT_HIT,
+    greeks: tuple[str, ...] = _ALL_BARRIER_GREEKS,
+) -> dict[str, float]:
+    """Compute requested barrier greeks via Monte Carlo (GBMProcess underlying)."""
+    ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
+    rc = DiscountCurve.flat(_BARRIER_RATE, end_time=ttm)
+    qc = DiscountCurve.flat(_BARRIER_DIV, end_time=ttm)
+    md = MarketData(PRICING_DATE, rc, currency=CURRENCY)
+    gbm = GBMProcess(
+        md,
+        GBMParams(
+            initial_value=_BARRIER_SPOT,
+            volatility=_BARRIER_VOL,
+            dividend_curve=qc,
+        ),
+        SimulationConfig(
+            paths=_BARRIER_MC_PATHS,
+            num_steps=_BARRIER_MC_STEPS,
+            end_date=MATURITY,
+        ),
+    )
+    spec = BarrierSpec(
+        option_type=option_type,
+        exercise_type=exercise_type,
+        strike=strike,
+        maturity=MATURITY,
+        barrier=barrier,
+        direction=direction,
+        action=action,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+    )
+    ov = OptionValuation(gbm, spec, PricingMethod.MONTE_CARLO, params=_BARRIER_MC_CFG)
+    return _dp_barrier_greeks_from_valuation(ov, spot=_BARRIER_SPOT, greeks=greeks)
+
+
+# Avoid the two LSM downward-bias scenarios (DOWN-OUT put, UP-OUT call) that
+# would need much wider tolerances; they're independently covered by the
+# American KO PV tests in test_quantlib_comparison.
+_BARRIER_MC_EU_SCENARIOS = [
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        id="eu_down_out_call",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        85.0,
+        id="eu_down_in_put",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        id="eu_up_out_put",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.CALL,
+        100.0,
+        120.0,
+        id="eu_up_in_call",
+    ),
+]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "direction,action,option_type,strike,barrier",
+    _BARRIER_MC_EU_SCENARIOS,
+)
+def test_european_barrier_mc_greeks_vs_bsm(direction, action, option_type, strike, barrier):
+    """European barrier MC greeks vs BSM analytical (closed-form ground truth).
+
+    BSM here uses NUMERICAL bump-and-revalue on closed-form barrier formulas,
+    which is essentially exact. MC uses NUMERICAL bump-and-revalue on
+    simulated paths with a fixed seed.
+    """
+    dp_bsm = _dp_barrier_greeks(
+        pricing_method=PricingMethod.BSM,
+        exercise_type=ExerciseType.EUROPEAN,
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+    )
+    dp_mc = _dp_barrier_mc_greeks(
+        exercise_type=ExerciseType.EUROPEAN,
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+    )
+
+    # MC bump-and-revalue noise on barrier payoffs is substantial; loose tols.
+    tols = {"delta": 0.05, "gamma": 0.20, "vega": 0.10, "theta": 0.10, "rho": 0.05}
+    assert_greeks_close(
+        lhs=dp_mc,
+        rhs=dp_bsm,
+        tols=tols,
+        log_prefix=(
+            f"European barrier MC {direction.value}-{action.value} "
+            f"{option_type.value} K={strike:.0f} H={barrier:.0f}"
+        ),
+        lhs_name="DP_MC",
+        rhs_name="DP_BSM",
+        skip_missing_rhs=False,
+        atol=5e-3,
         logger=None,
     )

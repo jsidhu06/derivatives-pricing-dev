@@ -33,6 +33,7 @@ from derivatives_pricing.valuation import (
     UnderlyingData,
     VanillaSpec,
 )
+from derivatives_pricing.valuation.params import BinomialParams
 
 from helpers import flat_curve, PRICING_DATE, MATURITY, CURRENCY, SPOT, STRIKE, RATE, VOL
 
@@ -857,6 +858,68 @@ class TestBarrierGreeks:
         # This should not raise
         delta = self.val.delta()
         assert np.isfinite(delta)
+
+
+# ===========================================================================
+# Binomial barrier NUMERICAL guard (Boyle-Lau retopology)
+# ===========================================================================
+# Bumping spot/vol/T on a binomial barrier valuation re-runs Boyle-Lau
+# alignment with new inputs, which can pick a different num_steps for each
+# bumped tree. The resulting central difference compares two unrelated tree
+# topologies, so we explicitly block NUMERICAL bump-and-revalue greeks on
+# binomial barriers (rho excepted — the Boyle-Lau formula has no r term).
+
+
+class TestBinomialBarrierNumericalGuard:
+    """Regression tests for the binomial-barrier NUMERICAL guard policy."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        self.underlying = _underlying()
+        self.spec = _barrier_spec(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=120.0,
+        )
+        self.val = OptionValuation(
+            self.underlying,
+            self.spec,
+            PricingMethod.BINOMIAL,
+            params=BinomialParams(num_steps=200),
+        )
+
+    @pytest.mark.parametrize("greek_name", ["delta", "gamma", "theta", "vega"])
+    def test_explicit_numerical_blocked(self, greek_name):
+        """Explicit NUMERICAL on delta/gamma/theta/vega raises."""
+        fn = getattr(self.val, greek_name)
+        with pytest.raises(UnsupportedFeatureError, match="NUMERICAL"):
+            fn(greek_calc_method=GreekCalculationMethod.NUMERICAL)
+
+    def test_explicit_numerical_rho_allowed(self):
+        """Explicit NUMERICAL on rho is allowed (rate bumps don't enter
+        the Boyle-Lau formula, so the bumped trees share the same topology)."""
+        rho = self.val.rho(greek_calc_method=GreekCalculationMethod.NUMERICAL)
+        assert np.isfinite(rho)
+
+    def test_auto_select_vega_blocked(self):
+        """vega() with no explicit method routes to NUMERICAL (no tree-
+        native path) and the guard fires from the auto-select branch."""
+        with pytest.raises(UnsupportedFeatureError, match="NUMERICAL"):
+            self.val.vega()
+
+    @pytest.mark.parametrize("greek_name", ["delta", "gamma", "theta"])
+    def test_auto_select_picks_tree(self, greek_name):
+        """delta/gamma/theta with no explicit method auto-select TREE on
+        binomial, bypassing the NUMERICAL guard entirely."""
+        fn = getattr(self.val, greek_name)
+        value = fn()
+        assert np.isfinite(value)
+
+    def test_auto_select_rho_uses_numerical(self):
+        """rho() has no tree-native path so it auto-selects NUMERICAL,
+        but rho is exempt from the guard so this works."""
+        rho = self.val.rho()
+        assert np.isfinite(rho)
 
 
 # ===========================================================================
