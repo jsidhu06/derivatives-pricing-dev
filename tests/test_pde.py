@@ -963,3 +963,156 @@ def test_knock_in_triggered_at_inception_grid_greeks_match_vanilla():
     assert np.isclose(ki.gamma(), vanilla.gamma(), rtol=1.0e-6, atol=1.0e-6)
     assert np.isclose(ki.theta(), vanilla.theta(), rtol=1.0e-6, atol=1.0e-6)
     assert np.isclose(ki.rho(), vanilla.rho(), rtol=1.0e-6, atol=1.0e-6)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# American flat barrier vega — PDE FD scheme/grid self-consistency
+# ═══════════════════════════════════════════════════════════════════════════
+# American barrier vega has no cross-engine reference (binomial blocked,
+# BSM is European-only, QL barrier engines don't expose vega).  We
+# self-consistency-check PDE FD across scheme (CN vs IMPLICIT) and grid
+# topology (LOG_SPOT vs SPOT) at a high resolution (2400×800).  All three
+# configs should agree to a few percent.
+
+_AM_BARRIER_VEGA_RHO_SCENARIOS = [
+    # (direction, action, option_type, strike, barrier, rebate, rebate_timing, id)
+    (
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        5.0,
+        RebateTiming.AT_HIT,
+        "am_down_out_call_rebate",
+    ),
+    (
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        5.0,
+        RebateTiming.AT_HIT,
+        "am_up_out_put_rebate",
+    ),
+    (
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        5.0,
+        RebateTiming.AT_EXPIRY,
+        "am_down_in_call_rebate",
+    ),
+    (
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        5.0,
+        RebateTiming.AT_EXPIRY,
+        "am_up_in_put_rebate",
+    ),
+]
+
+_AM_VEGA_RHO_SPOT = 100.0
+_AM_VEGA_RHO_VOL = 0.25
+_AM_VEGA_RHO_RATE = 0.05
+_AM_VEGA_RHO_DIV = 0.02
+
+
+def _build_am_barrier_valuation(
+    *, direction, action, option_type, strike, barrier, rebate, rebate_timing, params
+) -> OptionValuation:
+    r_curve = flat_curve(PRICING_DATE, MATURITY, _AM_VEGA_RHO_RATE)
+    q_curve = flat_curve(PRICING_DATE, MATURITY, _AM_VEGA_RHO_DIV)
+    md = market_data(pricing_date=PRICING_DATE, discount_curve=r_curve)
+    ud = underlying(
+        initial_value=_AM_VEGA_RHO_SPOT,
+        volatility=_AM_VEGA_RHO_VOL,
+        market_data=md,
+        dividend_curve=q_curve,
+    )
+    barrier_spec = BarrierSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.AMERICAN,
+        strike=strike,
+        maturity=MATURITY,
+        barrier=barrier,
+        direction=direction,
+        action=action,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+    )
+    return OptionValuation(ud, barrier_spec, PricingMethod.PDE_FD, params=params)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "direction,action,option_type,strike,barrier,rebate,rebate_timing",
+    [pytest.param(*p[:-1], id=p[-1]) for p in _AM_BARRIER_VEGA_RHO_SCENARIOS],
+)
+def test_american_barrier_vega_pde_scheme_grid_consistency(
+    direction, action, option_type, strike, barrier, rebate, rebate_timing
+):
+    """American flat barrier vega should be consistent across PDE FD
+    scheme (CN vs IMPLICIT) and grid topology (LOG_SPOT vs SPOT) at high
+    resolution (2400×800).  This is the only available cross-validation
+    for American barrier vega — no other engine in the library supports
+    it (binomial barrier vega is blocked by the Boyle-Lau guard, BSM is
+    European-only, QL barrier engines don't expose vega).
+    """
+    spot_steps = 2400
+    time_steps = 800
+
+    cn_log = PDEParams(
+        spot_steps=spot_steps,
+        time_steps=time_steps,
+        method=PDEMethod.CRANK_NICOLSON,
+        space_grid=PDESpaceGrid.LOG_SPOT,
+    )
+    implicit_log = PDEParams(
+        spot_steps=spot_steps,
+        time_steps=time_steps,
+        method=PDEMethod.IMPLICIT,
+        space_grid=PDESpaceGrid.LOG_SPOT,
+    )
+    cn_spot = PDEParams(
+        spot_steps=spot_steps,
+        time_steps=time_steps,
+        method=PDEMethod.CRANK_NICOLSON,
+        space_grid=PDESpaceGrid.SPOT,
+    )
+
+    common = dict(
+        direction=direction,
+        action=action,
+        option_type=option_type,
+        strike=strike,
+        barrier=barrier,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+    )
+
+    ov_cn_log = _build_am_barrier_valuation(params=cn_log, **common)
+    ov_implicit_log = _build_am_barrier_valuation(params=implicit_log, **common)
+    ov_cn_spot = _build_am_barrier_valuation(params=cn_spot, **common)
+
+    vega_cn_log = ov_cn_log.vega()
+    vega_implicit_log = ov_implicit_log.vega()
+    vega_cn_spot = ov_cn_spot.vega()
+
+    # Reference: CN + LOG_SPOT (the default high-quality config). The other
+    # two configurations should agree closely.
+    vega_rtol, vega_atol = 0.01, 1e-3
+
+    assert np.isclose(vega_implicit_log, vega_cn_log, rtol=vega_rtol, atol=vega_atol), (
+        f"vega CN_LOG={vega_cn_log:.6f} vs IMPLICIT_LOG={vega_implicit_log:.6f}"
+    )
+    assert np.isclose(vega_cn_spot, vega_cn_log, rtol=vega_rtol, atol=vega_atol), (
+        f"vega CN_LOG={vega_cn_log:.6f} vs CN_SPOT={vega_cn_spot:.6f}"
+    )
