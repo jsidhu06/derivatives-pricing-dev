@@ -17,6 +17,7 @@ from derivatives_pricing.enums import (
     ExerciseType,
     GreekCalculationMethod,
     OptionType,
+    PDESpaceGrid,
     PricingMethod,
     RebateTiming,
 )
@@ -33,7 +34,12 @@ from derivatives_pricing.valuation import (
     UnderlyingData,
     VanillaSpec,
 )
-from derivatives_pricing.valuation.params import BinomialParams
+from derivatives_pricing.stochastic_processes import (
+    GBMParams,
+    GBMProcess,
+    SimulationConfig,
+)
+from derivatives_pricing.valuation.params import BinomialParams, MonteCarloParams, PDEParams
 
 from helpers import flat_curve, PRICING_DATE, MATURITY, CURRENCY, SPOT, STRIKE, RATE, VOL
 
@@ -356,6 +362,77 @@ class TestBarrierInOutParity:
         pv_vanilla = OptionValuation(u, vanilla_spec, PricingMethod.BSM).present_value()
 
         assert np.isclose(pv_in + pv_out, pv_vanilla, rtol=1e-10)
+
+    @pytest.mark.parametrize(
+        "option_type,direction,barrier",
+        [
+            (OptionType.CALL, BarrierDirection.DOWN, 80.0),
+            (OptionType.CALL, BarrierDirection.UP, 120.0),
+            (OptionType.PUT, BarrierDirection.DOWN, 80.0),
+            (OptionType.PUT, BarrierDirection.UP, 120.0),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "pricing_method,params,rtol",
+        [
+            pytest.param(
+                PricingMethod.PDE_FD,
+                PDEParams(spot_steps=400, time_steps=400, space_grid=PDESpaceGrid.LOG_SPOT),
+                2e-3,
+                id="pde_fd",
+            ),
+            pytest.param(
+                PricingMethod.BINOMIAL,
+                BinomialParams(num_steps=600),
+                5e-3,
+                id="binomial",
+            ),
+        ],
+    )
+    def test_in_out_parity_numerical_engines(
+        self, option_type, direction, barrier, pricing_method, params, rtol
+    ):
+        """knock_in + knock_out == vanilla on PDE_FD and Binomial engines.
+
+        BSM parity holds exactly because of in/out complement formulas; the
+        numerical engines have discretisation residual, so tolerances are
+        looser than the analytical BSM parity test above.
+        """
+        common = dict(
+            option_type=option_type,
+            direction=direction,
+            barrier=barrier,
+            strike=STRIKE,
+            maturity=MATURITY,
+        )
+        pv_in = OptionValuation(
+            self.underlying,
+            _barrier_spec(**common, action=BarrierAction.IN),
+            pricing_method,
+            params=params,
+        ).present_value()
+        pv_out = OptionValuation(
+            self.underlying,
+            _barrier_spec(**common, action=BarrierAction.OUT),
+            pricing_method,
+            params=params,
+        ).present_value()
+
+        vanilla_spec = VanillaSpec(
+            option_type=option_type,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=STRIKE,
+            maturity=MATURITY,
+        )
+        pv_vanilla = OptionValuation(
+            self.underlying, vanilla_spec, pricing_method, params=params
+        ).present_value()
+
+        assert np.isclose(pv_in + pv_out, pv_vanilla, rtol=rtol, atol=1e-4), (
+            f"In/out parity violated on {pricing_method.name}: "
+            f"in={pv_in:.6f} + out={pv_out:.6f} = {pv_in + pv_out:.6f} "
+            f"vs vanilla={pv_vanilla:.6f}"
+        )
 
 
 # ===========================================================================
@@ -808,6 +885,99 @@ class TestBarrierDiscreteMonitoring:
         pv_vanilla = OptionValuation(u, vanilla_spec, PricingMethod.BSM).present_value()
 
         assert np.isclose(pv_in + pv_out, pv_vanilla, rtol=1e-10)
+
+
+# ===========================================================================
+# Discrete monitoring — BG-corrected analytical vs pathwise MC cross-check
+# ===========================================================================
+# The BSM discrete-monitoring path applies the Broadie-Glasserman-Kou
+# continuity correction to the continuous closed-form (shift the effective
+# barrier by β·σ·√Δt). The MC path explicitly checks the barrier at each
+# monitoring date on simulated paths — structurally unrelated to BG. If the
+# BG formula is wrong, these two will disagree.
+
+
+def _mc_gbm(
+    spot: float = SPOT,
+    vol: float = VOL,
+    market_data: MarketData | None = None,
+    dividend_curve: DiscountCurve | None = None,
+    paths: int = 200_000,
+    num_steps: int = 252,
+) -> GBMProcess:
+    if market_data is None:
+        market_data = _market_data()
+    return GBMProcess(
+        market_data,
+        GBMParams(initial_value=spot, volatility=vol, dividend_curve=dividend_curve),
+        SimulationConfig(paths=paths, num_steps=num_steps, end_date=MATURITY),
+    )
+
+
+class TestBarrierDiscreteBGvsMC:
+    """Cross-validate the BG continuity correction against pathwise MC."""
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize(
+        "option_type,direction,action,barrier,num_observations",
+        [
+            pytest.param(
+                OptionType.CALL,
+                BarrierDirection.UP,
+                BarrierAction.OUT,
+                120.0,
+                12,
+                id="up_out_call_monthly",
+            ),
+            pytest.param(
+                OptionType.PUT,
+                BarrierDirection.DOWN,
+                BarrierAction.OUT,
+                80.0,
+                12,
+                id="down_out_put_monthly",
+            ),
+            pytest.param(
+                OptionType.CALL,
+                BarrierDirection.UP,
+                BarrierAction.IN,
+                120.0,
+                24,
+                id="up_in_call_biweekly",
+            ),
+        ],
+    )
+    def test_bg_analytical_matches_mc_pathwise(
+        self, option_type, direction, action, barrier, num_observations
+    ):
+        """BSM (BG-corrected analytical) ≈ MC (pathwise checks) for
+        discrete-monitoring barriers. The two implementations are
+        structurally unrelated — agreement validates the BG formula."""
+        spec = _barrier_spec(
+            option_type=option_type,
+            direction=direction,
+            action=action,
+            barrier=barrier,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=num_observations,
+        )
+        pv_bsm = OptionValuation(_underlying(), spec, PricingMethod.BSM).present_value()
+
+        gbm = _mc_gbm(num_steps=max(200, num_observations * 10))
+        pv_mc = OptionValuation(
+            gbm,
+            spec,
+            PricingMethod.MONTE_CARLO,
+            params=MonteCarloParams(random_seed=42, log_timings=True),
+        ).present_value()
+
+        # MC noise + BG approximation residual. BG is O((Δt_obs)^(3/2))
+        # accurate — for monthly monitoring with σ=0.20 the residual can
+        # reach a few percent on its own, with MC noise on top. ~5% is a
+        # meaningful bound: a broken BG formula would miss by >10%.
+        assert np.isclose(pv_bsm, pv_mc, rtol=0.05, atol=5e-3), (
+            f"BG vs MC mismatch: BSM={pv_bsm:.6f} MC={pv_mc:.6f}"
+        )
 
 
 # ===========================================================================

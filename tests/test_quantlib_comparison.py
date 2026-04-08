@@ -2631,3 +2631,136 @@ def test_barrier_american_ki_vs_quantlib(
     )
     assert np.isclose(dp_bn, ql_bn, rtol=3e-3, atol=1e-3), f"DP_BN {dp_bn:.6f} vs QL_BN {ql_bn:.6f}"
     assert np.isclose(dp_mc, ql_bn, rtol=0.02, atol=2e-3), f"DP_MC {dp_mc:.6f} vs QL_BN {ql_bn:.6f}"
+
+
+# ── European barrier + discrete dividends: DP PDE vs QL FD ───────────────
+# BSM can't handle discrete dividends (escrow-adjusted formulas don't apply
+# to path-dependent barriers). Binomial and PDE both can. Here we
+# cross-validate DP PDE_FD against QL FdBlackScholesBarrierEngine with a
+# DividendVector — the only external reference that handles the combination.
+
+
+def _ql_barrier_fd_with_discrete_divs(
+    *,
+    direction: BarrierDirection,
+    action: BarrierAction,
+    barrier: float,
+    option_type: OptionType,
+    strike: float,
+    discrete_dividends: Sequence[tuple[dt.datetime, float]],
+    grid_points: int = 800,
+    time_steps: int = 800,
+) -> float:
+    eval_date = ql.Date(PRICING_DATE.day, PRICING_DATE.month, PRICING_DATE.year)
+    ql.Settings.instance().evaluationDate = eval_date
+    ql_dc = ql.Actual365Fixed()
+    spot_h = ql.QuoteHandle(ql.SimpleQuote(_BARRIER_SPOT))
+    rf_h = ql.YieldTermStructureHandle(ql.FlatForward(eval_date, _BARRIER_RATE, ql_dc))
+    # No continuous div yield — all dividends are cash-discrete here.
+    div_h = ql.YieldTermStructureHandle(ql.FlatForward(eval_date, 0.0, ql_dc))
+    vol_h = ql.BlackVolTermStructureHandle(
+        ql.BlackConstantVol(eval_date, ql.TARGET(), _BARRIER_VOL, ql_dc)
+    )
+    proc = ql.BlackScholesMertonProcess(spot_h, div_h, rf_h, vol_h)
+
+    ql_type = ql.Option.Put if option_type is OptionType.PUT else ql.Option.Call
+    payoff = ql.PlainVanillaPayoff(ql_type, strike)
+    exercise = ql.EuropeanExercise(
+        ql.Date(_BARRIER_MATURITY.day, _BARRIER_MATURITY.month, _BARRIER_MATURITY.year)
+    )
+    bt = _QL_BARRIER_TYPE[(direction, action)]
+    opt = ql.BarrierOption(bt, barrier, 0.0, payoff, exercise)
+
+    div_vector = _quantlib_dividend_schedule(discrete_dividends)
+    opt.setPricingEngine(ql.FdBlackScholesBarrierEngine(proc, div_vector, time_steps, grid_points))
+    return opt.NPV()
+
+
+_BARRIER_DISCRETE_DIV_SCENARIOS = [
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        id="down_out_call",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.CALL,
+        100.0,
+        120.0,
+        id="up_in_call",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        id="up_out_put",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "direction,action,option_type,strike,barrier",
+    _BARRIER_DISCRETE_DIV_SCENARIOS,
+)
+def test_barrier_european_discrete_divs_pde_vs_quantlib(
+    direction, action, option_type, strike, barrier
+):
+    """European barrier + discrete cash dividends: DP PDE_FD vs QL FD.
+
+    The interaction between the dividend jump and the barrier boundary is
+    non-trivial — post-ex spots can land on the knockout side of the
+    barrier purely from the discrete jump. This test catches bugs in the
+    `_apply_dividend_jump` coupling with the barrier boundary conditions.
+    """
+    discrete_divs = [
+        (PRICING_DATE + dt.timedelta(days=90), 2.0),
+        (PRICING_DATE + dt.timedelta(days=270), 2.0),
+    ]
+
+    ttm = calculate_year_fraction(PRICING_DATE, _BARRIER_MATURITY)
+    rc = DiscountCurve.flat(_BARRIER_RATE, end_time=ttm)
+    md = MarketData(PRICING_DATE, rc, currency=CURRENCY)
+    ud = UnderlyingData(
+        initial_value=_BARRIER_SPOT,
+        volatility=_BARRIER_VOL,
+        market_data=md,
+        discrete_dividends=discrete_divs,
+    )
+    spec = _barrier_spec(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        exercise_type=ExerciseType.EUROPEAN,
+    )
+    dp_pde = OptionValuation(ud, spec, PricingMethod.PDE_FD, _BARRIER_PDE_CFG).present_value()
+
+    ql_fd = _ql_barrier_fd_with_discrete_divs(
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        discrete_dividends=discrete_divs,
+    )
+    logger.info(
+        "Barrier discrete-div %s-%s %s K=%.0f H=%.0f | DP_PDE=%.6f QL_FD=%.6f",
+        direction.value,
+        action.value,
+        option_type.value,
+        strike,
+        barrier,
+        dp_pde,
+        ql_fd,
+    )
+
+    assert np.isclose(dp_pde, ql_fd, rtol=0.01, atol=1e-3), (
+        f"DP_PDE {dp_pde:.6f} vs QL_FD {ql_fd:.6f}"
+    )
