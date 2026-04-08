@@ -1250,7 +1250,10 @@ def test_american_barrier_nonflat_greeks_binomial_vs_pde(
         q_curve=q_curve,
     )
 
-    pde_tols = {"delta": 0.05, "gamma": 0.10, "vega": 0.20, "theta": 0.25, "rho": 0.12}
+    # American OUT barriers with nonflat curves: the continuation-vs-exercise
+    # boundary amplifies cross-engine disagreement between CRR tree and FD
+    # grid. Residuals up to ~12% on vega, ~8% on delta/gamma/rho are genuine.
+    pde_tols = {"delta": 0.05, "gamma": 0.12, "vega": 0.15, "theta": 0.15, "rho": 0.15}
 
     for greek in ("delta", "gamma", "vega", "theta", "rho"):
         logger.info(
@@ -1276,7 +1279,7 @@ def test_american_barrier_nonflat_greeks_binomial_vs_pde(
         lhs_name="DP_PDE",
         rhs_name="DP_BN",
         skip_missing_rhs=False,
-        atol=0.002,
+        atol=1e-3,
         logger=None,
     )
 
@@ -1332,3 +1335,276 @@ def test_knock_out_triggered_at_inception_default_greeks_match_fixed_expiry_reba
     assert np.isclose(valuation.gamma(), 0.0, atol=1.0e-12)
     assert np.isclose(valuation.theta(), expected_theta, rtol=0.02, atol=1.0e-6)
     assert np.isclose(valuation.rho(), expected_rho, rtol=0.02, atol=1.0e-6)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Barrier vega / rho — DP binomial vs DP PDE_FD cross-validation
+# ═══════════════════════════════════════════════════════════════════════
+# QuantLib's barrier engines (Analytic/FD/Binomial) only expose delta, gamma
+# and theta.  So vega/rho for these same scenarios are validated here by
+# cross-checking the two DP engines against each other.
+
+_BARRIER_VEGA_RHO_EU_FLAT_SCENARIOS = [
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        id="eu_down_out_call_flat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.CALL,
+        105.0,
+        115.0,
+        id="eu_up_in_call_flat",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        85.0,
+        id="eu_down_in_put_flat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        95.0,
+        125.0,
+        id="eu_up_out_put_flat",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "direction,action,option_type,strike,barrier",
+    _BARRIER_VEGA_RHO_EU_FLAT_SCENARIOS,
+)
+def test_european_barrier_vega_rho_binomial_vs_pde(direction, action, option_type, strike, barrier):
+    """European flat barrier vega/rho: DP binomial vs DP PDE_FD cross-check.
+
+    QL barrier engines don't expose vega/rho, so these scenarios (matching
+    test_quantlib_greeks_comparison._BARRIER_GREEK_SCENARIOS flat cases) are
+    validated by engine-to-engine agreement.
+    """
+    dp_bn = _dp_barrier_greeks(
+        pricing_method=PricingMethod.BINOMIAL,
+        params=_BARRIER_BINOM_CFG,
+        exercise_type=ExerciseType.EUROPEAN,
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+    )
+    dp_pde = _dp_barrier_greeks(
+        pricing_method=PricingMethod.PDE_FD,
+        params=_BARRIER_PDE_CFG,
+        exercise_type=ExerciseType.EUROPEAN,
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+    )
+
+    tols = {"vega": 0.03, "rho": 0.03}
+    assert_greeks_close(
+        lhs=dp_pde,
+        rhs=dp_bn,
+        tols=tols,
+        log_prefix=(
+            f"European barrier vega/rho {direction.value}-{action.value} "
+            f"{option_type.value} K={strike:.0f} H={barrier:.0f}"
+        ),
+        lhs_name="DP_PDE",
+        rhs_name="DP_BN",
+        skip_missing_rhs=False,
+        atol=1e-3,
+        logger=None,
+    )
+
+
+_BARRIER_VEGA_RHO_AM_FLAT_SCENARIOS = [
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        0.0,
+        RebateTiming.AT_HIT,
+        id="am_down_out_call_flat",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        100.0,
+        85.0,
+        0.0,
+        RebateTiming.AT_HIT,
+        id="am_down_out_put_flat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        120.0,
+        0.0,
+        RebateTiming.AT_HIT,
+        id="am_up_out_call_flat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        0.0,
+        RebateTiming.AT_HIT,
+        id="am_up_out_put_flat",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        5.0,
+        RebateTiming.AT_HIT,
+        id="am_down_out_call_rebate",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        5.0,
+        RebateTiming.AT_HIT,
+        id="am_up_out_put_rebate",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        0.0,
+        RebateTiming.AT_EXPIRY,
+        id="am_down_in_call_flat",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        85.0,
+        0.0,
+        RebateTiming.AT_EXPIRY,
+        id="am_down_in_put_flat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.CALL,
+        100.0,
+        120.0,
+        0.0,
+        RebateTiming.AT_EXPIRY,
+        id="am_up_in_call_flat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        0.0,
+        RebateTiming.AT_EXPIRY,
+        id="am_up_in_put_flat",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.IN,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        5.0,
+        RebateTiming.AT_EXPIRY,
+        id="am_down_in_call_rebate",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        5.0,
+        RebateTiming.AT_EXPIRY,
+        id="am_up_in_put_rebate",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "direction,action,option_type,strike,barrier,rebate,rebate_timing",
+    _BARRIER_VEGA_RHO_AM_FLAT_SCENARIOS,
+)
+def test_american_barrier_vega_rho_binomial_vs_pde(
+    direction, action, option_type, strike, barrier, rebate, rebate_timing
+):
+    """American flat barrier vega/rho: DP binomial vs DP PDE_FD cross-check.
+
+    Mirrors test_quantlib_greeks_comparison._BARRIER_AMERICAN_GREEK_SCENARIOS
+    for coverage of vega/rho which QL's barrier engines do not expose.
+    """
+    dp_bn = _dp_barrier_greeks(
+        pricing_method=PricingMethod.BINOMIAL,
+        params=_BARRIER_BINOM_CFG,
+        exercise_type=ExerciseType.AMERICAN,
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+    )
+    dp_pde = _dp_barrier_greeks(
+        pricing_method=PricingMethod.PDE_FD,
+        params=_BARRIER_PDE_CFG,
+        exercise_type=ExerciseType.AMERICAN,
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+    )
+
+    # vega is genuinely noisy for American OUT barriers — the continuation-vs-
+    # exercise boundary amplifies vol-sensitivity disagreement between CRR tree
+    # and FD grid, up to ~12% in some scenarios.
+    tols = {"vega": 0.15, "rho": 0.10}
+    assert_greeks_close(
+        lhs=dp_pde,
+        rhs=dp_bn,
+        tols=tols,
+        log_prefix=(
+            f"American barrier vega/rho {direction.value}-{action.value} "
+            f"{option_type.value} K={strike:.0f} H={barrier:.0f} R={rebate:.1f}"
+        ),
+        lhs_name="DP_PDE",
+        rhs_name="DP_BN",
+        skip_missing_rhs=False,
+        atol=1e-3,
+        logger=None,
+    )

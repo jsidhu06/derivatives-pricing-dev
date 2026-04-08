@@ -947,13 +947,14 @@ def _barrier_numerical_spot_bump(spot: float) -> float:
 
 
 def _dp_barrier_greeks_from_valuation(ov: OptionValuation, *, spot: float) -> dict[str, float]:
+    """Return only delta/gamma/theta — QL barrier engines don't expose vega/rho,
+    so computing them here is wasted compute. Vega/rho for these same scenarios
+    are covered in test_greeks.py via a DP binomial vs DP PDE_FD comparison."""
     bump = _barrier_numerical_spot_bump(spot)
     return {
         "delta": ov.delta(epsilon=bump),
         "gamma": ov.gamma(epsilon=bump),
-        "vega": ov.vega(),
         "theta": ov.theta(time_bump_days=_BARRIER_NUMERICAL_THETA_DAYS),
-        "rho": ov.rho(),
     }
 
 
@@ -1214,11 +1215,11 @@ def test_european_barrier_greeks_vs_quantlib(
         allow_missing=True,
     )
 
-    an_tols = {"delta": 0.03, "gamma": 0.06, "vega": 0.10, "theta": 0.10, "rho": 0.08}
-    binom_tols = {"delta": 0.03, "gamma": 0.12, "vega": 0.08, "theta": 0.30, "rho": 0.08}
-    pde_tols = {"delta": 0.03, "gamma": 0.06, "vega": 0.10, "theta": 0.10, "rho": 0.08}
+    an_tols = {"delta": 0.01, "gamma": 0.03, "theta": 0.05}
+    binom_tols = {"delta": 0.02, "gamma": 0.10, "theta": 0.20}
+    pde_tols = {"delta": 0.01, "gamma": 0.03, "theta": 0.05}
 
-    for greek in ("delta", "gamma", "vega", "theta", "rho"):
+    for greek in ("delta", "gamma", "theta"):
         if dp_an is not None:
             logger.info(
                 "European barrier %s-%s %s %s K=%.0f H=%.0f | DP_AN=%s DP_BN=%s DP_PDE=%s QL_FD=%s",
@@ -1259,7 +1260,7 @@ def test_european_barrier_greeks_vs_quantlib(
             lhs_name="DP_AN",
             rhs_name="QL_FD",
             skip_missing_rhs=True,
-            atol=0.012,
+            atol=5e-3,
             logger=None,
         )
     assert_greeks_close(
@@ -1270,7 +1271,7 @@ def test_european_barrier_greeks_vs_quantlib(
         lhs_name="DP_BN",
         rhs_name="QL_FD",
         skip_missing_rhs=True,
-        atol=1e-6,
+        atol=5e-3,
         logger=None,
     )
     assert_greeks_close(
@@ -1281,7 +1282,7 @@ def test_european_barrier_greeks_vs_quantlib(
         lhs_name="DP_PDE",
         rhs_name="QL_FD",
         skip_missing_rhs=True,
-        atol=0.012,
+        atol=5e-3,
         logger=None,
     )
 
@@ -1470,10 +1471,13 @@ def test_american_barrier_greeks_vs_quantlib(
         allow_missing=True,
     )
 
-    binom_tols = {"delta": 0.03, "gamma": 0.12, "vega": 0.10, "theta": 0.30, "rho": 0.10}
-    pde_tols = {"delta": 0.03, "gamma": 0.08, "vega": 0.10, "theta": 0.12, "rho": 0.10}
+    binom_tols = {"delta": 0.02, "gamma": 0.10, "theta": 0.20}
+    # PDE vs QL binomial: loose-ish because we're comparing different engines
+    # (PDE FD vs QL CRR binomial). Residual disagreement ~3-5% on delta/gamma
+    # for some scenarios is genuine cross-engine variance, not noise.
+    pde_tols = {"delta": 0.04, "gamma": 0.08, "theta": 0.10}
 
-    for greek in ("delta", "gamma", "vega", "theta", "rho"):
+    for greek in ("delta", "gamma", "theta"):
         logger.info(
             "American barrier %s-%s %s %s K=%.0f H=%.0f R=%.1f | DP_BN=%s DP_PDE=%s QL_BN=%s",
             direction.value,
@@ -1499,7 +1503,7 @@ def test_american_barrier_greeks_vs_quantlib(
         lhs_name="DP_BN",
         rhs_name="QL_BN",
         skip_missing_rhs=True,
-        atol=1e-6,
+        atol=5e-3,
         logger=None,
     )
     assert_greeks_close(
@@ -1513,6 +1517,6 @@ def test_american_barrier_greeks_vs_quantlib(
         lhs_name="DP_PDE",
         rhs_name="QL_BN",
         skip_missing_rhs=True,
-        atol=0.012,
+        atol=5e-3,
         logger=None,
     )

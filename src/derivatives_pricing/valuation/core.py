@@ -1098,6 +1098,19 @@ class OptionValuation:
                 f"(bump-and-revalue), got {greek_calc_method.name}."
             )
 
+        # Barrier options have engine-native Greeks (TREE / GRID) and numerical
+        # bump-and-revalue, but closed-form analytical Greeks are not currently
+        # supported on the BSM analytical engine — _AnalyticalBarrierValuation
+        # does not expose per-greek methods. Reject ANALYTICAL explicitly.
+        if (
+            isinstance(self._spec, BarrierSpec)
+            and greek_calc_method is GreekCalculationMethod.ANALYTICAL
+        ):
+            raise UnsupportedFeatureError(
+                "Barrier options do not support GreekCalculationMethod.ANALYTICAL. "
+                "Use TREE (BINOMIAL), GRID (PDE_FD), or NUMERICAL (bump-and-revalue)."
+            )
+
         capability_flags = {
             "tree_capable": tree_capable,
             "grid_capable": grid_capable,
