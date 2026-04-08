@@ -643,7 +643,13 @@ class OptionValuation:
             Rho reported per 1% parallel rate move.
         """
         self._validate_bump(rate_bump, greek_calc_method, "rate_bump")
-        method = self._resolve_greek_method(greek_calc_method)
+        # Rho is exempt from the barrier-binomial NUMERICAL guard: bumping
+        # the rate does not change the Boyle-Lau barrier-aligned step count
+        # (the formula depends only on σ, T and log(H/S)), so the up/down
+        # trees share the same topology and the central difference is valid.
+        method = self._resolve_greek_method(
+            greek_calc_method, allow_barrier_binomial_numerical=True
+        )
         if method is GreekCalculationMethod.PATHWISE:
             return float(self._impl.rho_pathwise())
         if method is GreekCalculationMethod.LIKELIHOOD_RATIO:
@@ -1063,6 +1069,7 @@ class OptionValuation:
         *,
         tree_capable: bool = False,
         grid_capable: bool = False,
+        allow_barrier_binomial_numerical: bool = False,
     ) -> GreekCalculationMethod:
         """Resolve and validate the Greek computation method.
 
@@ -1070,6 +1077,10 @@ class OptionValuation:
         chosen automatically (ANALYTICAL → TREE → GRID → PATHWISE → NUMERICAL).
         When an explicit method is supplied it is validated against the
         current pricing engine and capability flags.
+
+        ``allow_barrier_binomial_numerical`` opts out of the final guard that
+        blocks NUMERICAL bump-and-revalue greeks on the binomial engine for
+        barrier options. Only rho is exempt — see the guard body for context.
         """
         if greek_calc_method is not None and not isinstance(
             greek_calc_method, GreekCalculationMethod
@@ -1081,10 +1092,14 @@ class OptionValuation:
 
         # --- auto-select when caller passes None ---
         if greek_calc_method is None:
-            return self._auto_select_greek_method(
+            resolved = self._auto_select_greek_method(
                 tree_capable=tree_capable,
                 grid_capable=grid_capable,
             )
+            self._reject_barrier_binomial_numerical(
+                resolved, allow=allow_barrier_binomial_numerical
+            )
+            return resolved
 
         # --- validate explicit choice ---
 
@@ -1137,7 +1152,48 @@ class OptionValuation:
         ):
             self._validate_mc_greek_method(greek_calc_method)
 
+        self._reject_barrier_binomial_numerical(
+            greek_calc_method, allow=allow_barrier_binomial_numerical
+        )
         return greek_calc_method
+
+    def _reject_barrier_binomial_numerical(
+        self,
+        method: GreekCalculationMethod,
+        *,
+        allow: bool,
+    ) -> None:
+        """Block NUMERICAL bump-and-revalue greeks on binomial barrier specs.
+
+        Bumping spot, volatility or time for a barrier option re-invokes
+        ``_resolve_effective_num_steps`` on each bumped valuation, and the
+        Boyle-Lau barrier-alignment formula
+        ``candidate = i² σ² T / log(H/S)²`` depends on every one of those
+        inputs.  The bumped trees therefore end up with *different* step
+        counts from the center tree, so a central difference is comparing
+        two unrelated tree topologies rather than approximating ``∂V/∂x``.
+        Rho is exempt because the risk-free rate does not enter the
+        Boyle-Lau formula, so rate bumps reuse the same tree
+        topology and the finite difference is well-defined.
+        """
+        if allow:
+            return
+        if method is not GreekCalculationMethod.NUMERICAL:
+            return
+        if not isinstance(self._spec, BarrierSpec):
+            return
+        if self._pricing_method is not PricingMethod.BINOMIAL:
+            return
+        raise UnsupportedFeatureError(
+            "Binomial NUMERICAL bump-and-revalue greeks are not supported "
+            "for barrier options (rho is exempt). Bumping spot, volatility "
+            "or time causes Boyle-Lau barrier alignment to pick a different "
+            "tree step count for each bumped valuation, so the central "
+            "difference compares two different tree topologies. "
+            "Use GreekCalculationMethod.TREE for delta/gamma/theta, or "
+            "switch to PricingMethod.PDE_FD for vega and for NUMERICAL "
+            "bump-and-revalue on the full grid."
+        )
 
     def _auto_select_greek_method(
         self,

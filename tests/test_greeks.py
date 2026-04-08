@@ -1039,15 +1039,37 @@ def _barrier_numerical_spot_bump(spot: float) -> float:
     return float(spot) * _BARRIER_NUMERICAL_SPOT_BUMP_RATIO
 
 
-def _dp_barrier_greeks_from_valuation(ov: OptionValuation, *, spot: float) -> dict[str, float]:
+_ALL_BARRIER_GREEKS: tuple[str, ...] = ("delta", "gamma", "vega", "theta", "rho")
+
+
+def _dp_barrier_greeks_from_valuation(
+    ov: OptionValuation,
+    *,
+    spot: float,
+    greeks: tuple[str, ...] = _ALL_BARRIER_GREEKS,
+) -> dict[str, float]:
+    """Compute the requested barrier greeks for a valuation.
+
+    Only the greeks named in ``greeks`` are computed, so callers that
+    need a subset (e.g. just rho, or just vega/rho) avoid the compute
+    cost of the others.  Binomial barrier valuations must omit "vega"
+    because there is no tree-native vega and NUMERICAL bump-and-revalue
+    is blocked on binomial barriers (Boyle-Lau retopologises the tree on
+    each vol bump).
+    """
     bump = _barrier_numerical_spot_bump(spot)
-    return {
-        "delta": ov.delta(epsilon=bump),
-        "gamma": ov.gamma(epsilon=bump),
-        "vega": ov.vega(),
-        "theta": ov.theta(time_bump_days=_BARRIER_NUMERICAL_THETA_DAYS),
-        "rho": ov.rho(),
-    }
+    result: dict[str, float] = {}
+    if "delta" in greeks:
+        result["delta"] = ov.delta(epsilon=bump)
+    if "gamma" in greeks:
+        result["gamma"] = ov.gamma(epsilon=bump)
+    if "vega" in greeks:
+        result["vega"] = ov.vega()
+    if "theta" in greeks:
+        result["theta"] = ov.theta(time_bump_days=_BARRIER_NUMERICAL_THETA_DAYS)
+    if "rho" in greeks:
+        result["rho"] = ov.rho()
+    return result
 
 
 def _fmt_greek_value(value: float | None) -> str:
@@ -1070,8 +1092,9 @@ def _dp_barrier_greeks(
     rebate_timing: RebateTiming = RebateTiming.AT_HIT,
     r_curve: DiscountCurve | None = None,
     q_curve: DiscountCurve | None = None,
+    greeks: tuple[str, ...] = _ALL_BARRIER_GREEKS,
 ) -> dict[str, float]:
-    """Compute barrier Greeks via a selected DP pricing engine."""
+    """Compute the requested barrier Greeks via a selected DP pricing engine."""
     ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
     rc = r_curve if r_curve is not None else DiscountCurve.flat(_BARRIER_RATE, end_time=ttm)
     qc = q_curve if q_curve is not None else DiscountCurve.flat(_BARRIER_DIV, end_time=ttm)
@@ -1094,7 +1117,7 @@ def _dp_barrier_greeks(
         rebate_timing=rebate_timing,
     )
     ov = OptionValuation(ud, spec, pricing_method, params=params)
-    return _dp_barrier_greeks_from_valuation(ov, spot=spot)
+    return _dp_barrier_greeks_from_valuation(ov, spot=spot, greeks=greeks)
 
 
 def _make_barrier_valuation(
@@ -1221,6 +1244,10 @@ def test_american_barrier_nonflat_greeks_binomial_vs_pde(
     non-flat term structures, so these scenarios are validated internally using
     DP binomial as the baseline reference.
     """
+    # Vega is excluded on both sides: binomial barrier vega is blocked
+    # (no tree-native path; NUMERICAL guard catches Boyle-Lau retopology),
+    # so there is no cross-engine counterpart to compare PDE vega against.
+    nonflat_greeks = ("delta", "gamma", "theta", "rho")
     dp_bn = _dp_barrier_greeks(
         pricing_method=PricingMethod.BINOMIAL,
         params=_BARRIER_BINOM_CFG,
@@ -1234,6 +1261,7 @@ def test_american_barrier_nonflat_greeks_binomial_vs_pde(
         rebate_timing=rebate_timing,
         r_curve=r_curve,
         q_curve=q_curve,
+        greeks=nonflat_greeks,
     )
     dp_pde = _dp_barrier_greeks(
         pricing_method=PricingMethod.PDE_FD,
@@ -1248,14 +1276,18 @@ def test_american_barrier_nonflat_greeks_binomial_vs_pde(
         rebate_timing=rebate_timing,
         r_curve=r_curve,
         q_curve=q_curve,
+        greeks=nonflat_greeks,
     )
 
     # American OUT barriers with nonflat curves: the continuation-vs-exercise
     # boundary amplifies cross-engine disagreement between CRR tree and FD
-    # grid. Residuals up to ~12% on vega, ~8% on delta/gamma/rho are genuine.
-    pde_tols = {"delta": 0.05, "gamma": 0.12, "vega": 0.15, "theta": 0.15, "rho": 0.15}
+    # grid. Residuals up to ~8% on delta/gamma/rho are genuine. Vega is not
+    # cross-checked because binomial barrier vega is unavailable (no tree-
+    # native path; NUMERICAL bump-and-revalue blocked by the Boyle-Lau
+    # retopology guard). PDE vega is validated elsewhere via direct tests.
+    pde_tols = {"delta": 0.05, "gamma": 0.12, "theta": 0.15, "rho": 0.15}
 
-    for greek in ("delta", "gamma", "vega", "theta", "rho"):
+    for greek in ("delta", "gamma", "theta", "rho"):
         logger.info(
             "American barrier nonflat %s-%s %s %s K=%.0f H=%.0f | DP_BN=%s DP_PDE=%s",
             direction.value,
@@ -1338,11 +1370,21 @@ def test_knock_out_triggered_at_inception_default_greeks_match_fixed_expiry_reba
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Barrier vega / rho — DP binomial vs DP PDE_FD cross-validation
+# Barrier vega / rho — cross-engine validation
 # ═══════════════════════════════════════════════════════════════════════
-# QuantLib's barrier engines (Analytic/FD/Binomial) only expose delta, gamma
-# and theta.  So vega/rho for these same scenarios are validated here by
-# cross-checking the two DP engines against each other.
+# QuantLib's barrier engines (Analytic/FD/Binomial) don't expose vega/rho,
+# so we validate DP's numerical vega/rho with an internal cross-check.
+#
+# European: BSM (closed-form barrier formulas, NUMERICAL bump-and-revalue)
+#   vs PDE_FD (NUMERICAL).  Binomial is NOT used for the vega cross-check
+#   because the binomial barrier engine blocks NUMERICAL vega: bumping vol
+#   retopologises the Boyle-Lau-aligned tree so the central difference
+#   compares two different trees.
+#
+# American: only rho is cross-checked (binomial vs PDE) — rho is exempt
+#   from the binomial-barrier NUMERICAL guard because rate bumps don't
+#   enter the Boyle-Lau alignment formula.  American vega has no cross-
+#   engine counterpart: BSM is European-only, binomial is blocked.
 
 _BARRIER_VEGA_RHO_EU_FLAT_SCENARIOS = [
     pytest.param(
@@ -1384,22 +1426,26 @@ _BARRIER_VEGA_RHO_EU_FLAT_SCENARIOS = [
     "direction,action,option_type,strike,barrier",
     _BARRIER_VEGA_RHO_EU_FLAT_SCENARIOS,
 )
-def test_european_barrier_vega_rho_binomial_vs_pde(direction, action, option_type, strike, barrier):
-    """European flat barrier vega/rho: DP binomial vs DP PDE_FD cross-check.
+def test_european_barrier_vega_rho_bsm_vs_pde(direction, action, option_type, strike, barrier):
+    """European flat barrier vega/rho: DP BSM vs DP PDE_FD cross-check.
 
     QL barrier engines don't expose vega/rho, so these scenarios (matching
     test_quantlib_greeks_comparison._BARRIER_GREEK_SCENARIOS flat cases) are
-    validated by engine-to-engine agreement.
+    validated via BSM (NUMERICAL bump of closed-form barrier formulas) vs
+    PDE_FD (NUMERICAL bump of the full FD grid).  Binomial is deliberately
+    excluded: bumping vol retopologises the Boyle-Lau-aligned tree and the
+    central difference becomes invalid.
     """
-    dp_bn = _dp_barrier_greeks(
-        pricing_method=PricingMethod.BINOMIAL,
-        params=_BARRIER_BINOM_CFG,
+    vega_rho = ("vega", "rho")
+    dp_bsm = _dp_barrier_greeks(
+        pricing_method=PricingMethod.BSM,
         exercise_type=ExerciseType.EUROPEAN,
         direction=direction,
         action=action,
         barrier=barrier,
         option_type=option_type,
         strike=strike,
+        greeks=vega_rho,
     )
     dp_pde = _dp_barrier_greeks(
         pricing_method=PricingMethod.PDE_FD,
@@ -1410,19 +1456,20 @@ def test_european_barrier_vega_rho_binomial_vs_pde(direction, action, option_typ
         barrier=barrier,
         option_type=option_type,
         strike=strike,
+        greeks=vega_rho,
     )
 
-    tols = {"vega": 0.03, "rho": 0.03}
+    tols = {"vega": 0.02, "rho": 0.02}
     assert_greeks_close(
         lhs=dp_pde,
-        rhs=dp_bn,
+        rhs=dp_bsm,
         tols=tols,
         log_prefix=(
             f"European barrier vega/rho {direction.value}-{action.value} "
             f"{option_type.value} K={strike:.0f} H={barrier:.0f}"
         ),
         lhs_name="DP_PDE",
-        rhs_name="DP_BN",
+        rhs_name="DP_BSM",
         skip_missing_rhs=False,
         atol=1e-3,
         logger=None,
@@ -1557,14 +1604,18 @@ _BARRIER_VEGA_RHO_AM_FLAT_SCENARIOS = [
     "direction,action,option_type,strike,barrier,rebate,rebate_timing",
     _BARRIER_VEGA_RHO_AM_FLAT_SCENARIOS,
 )
-def test_american_barrier_vega_rho_binomial_vs_pde(
+def test_american_barrier_rho_binomial_vs_pde(
     direction, action, option_type, strike, barrier, rebate, rebate_timing
 ):
-    """American flat barrier vega/rho: DP binomial vs DP PDE_FD cross-check.
+    """American flat barrier rho: DP binomial vs DP PDE_FD cross-check.
 
     Mirrors test_quantlib_greeks_comparison._BARRIER_AMERICAN_GREEK_SCENARIOS
-    for coverage of vega/rho which QL's barrier engines do not expose.
+    for coverage of rho which QL's barrier engines do not expose. Vega is
+    not cross-checked for American barriers: binomial barrier vega is
+    blocked by the NUMERICAL guard (rate bumps are exempt; vol bumps are
+    not), and BSM has no American support.
     """
+    rho_only = ("rho",)
     dp_bn = _dp_barrier_greeks(
         pricing_method=PricingMethod.BINOMIAL,
         params=_BARRIER_BINOM_CFG,
@@ -1576,6 +1627,7 @@ def test_american_barrier_vega_rho_binomial_vs_pde(
         strike=strike,
         rebate=rebate,
         rebate_timing=rebate_timing,
+        greeks=rho_only,
     )
     dp_pde = _dp_barrier_greeks(
         pricing_method=PricingMethod.PDE_FD,
@@ -1588,18 +1640,17 @@ def test_american_barrier_vega_rho_binomial_vs_pde(
         strike=strike,
         rebate=rebate,
         rebate_timing=rebate_timing,
+        greeks=rho_only,
     )
 
-    # vega is genuinely noisy for American OUT barriers — the continuation-vs-
-    # exercise boundary amplifies vol-sensitivity disagreement between CRR tree
-    # and FD grid, up to ~12% in some scenarios.
-    tols = {"vega": 0.15, "rho": 0.10}
+    # In reality, we can be much tighter for the non DOWN-OUT put, UP-OUT call cases
+    tols = {"rho": 0.10}
     assert_greeks_close(
         lhs=dp_pde,
         rhs=dp_bn,
         tols=tols,
         log_prefix=(
-            f"American barrier vega/rho {direction.value}-{action.value} "
+            f"American barrier rho {direction.value}-{action.value} "
             f"{option_type.value} K={strike:.0f} H={barrier:.0f} R={rebate:.1f}"
         ),
         lhs_name="DP_PDE",

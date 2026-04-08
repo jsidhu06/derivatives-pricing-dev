@@ -946,16 +946,36 @@ def _barrier_numerical_spot_bump(spot: float) -> float:
     return float(spot) * _BARRIER_NUMERICAL_SPOT_BUMP_RATIO
 
 
-def _dp_barrier_greeks_from_valuation(ov: OptionValuation, *, spot: float) -> dict[str, float]:
-    """Return only delta/gamma/theta — QL barrier engines don't expose vega/rho,
-    so computing them here is wasted compute. Vega/rho for these same scenarios
-    are covered in test_greeks.py via a DP binomial vs DP PDE_FD comparison."""
+_QL_BARRIER_COMPARABLE_GREEKS: tuple[str, ...] = ("delta", "gamma", "theta")
+
+
+def _dp_barrier_greeks_from_valuation(
+    ov: OptionValuation,
+    *,
+    spot: float,
+    greeks: tuple[str, ...] = _QL_BARRIER_COMPARABLE_GREEKS,
+) -> dict[str, float]:
+    """Compute the requested barrier greeks for a valuation.
+
+    Default set is delta/gamma/theta because QL barrier engines don't
+    expose vega/rho, so computing them here is wasted compute. Vega/rho
+    for these same scenarios are cross-validated in test_greeks.py
+    (European: BSM vs PDE; American: binomial vs PDE for rho only —
+    binomial barrier vega is unavailable).
+    """
     bump = _barrier_numerical_spot_bump(spot)
-    return {
-        "delta": ov.delta(epsilon=bump),
-        "gamma": ov.gamma(epsilon=bump),
-        "theta": ov.theta(time_bump_days=_BARRIER_NUMERICAL_THETA_DAYS),
-    }
+    result: dict[str, float] = {}
+    if "delta" in greeks:
+        result["delta"] = ov.delta(epsilon=bump)
+    if "gamma" in greeks:
+        result["gamma"] = ov.gamma(epsilon=bump)
+    if "vega" in greeks:
+        result["vega"] = ov.vega()
+    if "theta" in greeks:
+        result["theta"] = ov.theta(time_bump_days=_BARRIER_NUMERICAL_THETA_DAYS)
+    if "rho" in greeks:
+        result["rho"] = ov.rho()
+    return result
 
 
 def _fmt_greek_value(value: float | None) -> str:
@@ -1031,8 +1051,9 @@ def _dp_barrier_greeks(
     rebate_timing: RebateTiming = RebateTiming.AT_HIT,
     r_curve: DiscountCurve | None = None,
     q_curve: DiscountCurve | None = None,
+    greeks: tuple[str, ...] = _QL_BARRIER_COMPARABLE_GREEKS,
 ) -> dict[str, float]:
-    """Compute barrier Greeks via a selected DP pricing engine."""
+    """Compute the requested barrier Greeks via a selected DP pricing engine."""
     ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
     rc = r_curve if r_curve is not None else DiscountCurve.flat(_BARRIER_RATE, end_time=ttm)
     qc = q_curve if q_curve is not None else DiscountCurve.flat(_BARRIER_DIV, end_time=ttm)
@@ -1055,7 +1076,7 @@ def _dp_barrier_greeks(
         rebate_timing=rebate_timing,
     )
     ov = OptionValuation(ud, spec, pricing_method, params=params)
-    return _dp_barrier_greeks_from_valuation(ov, spot=_BARRIER_SPOT)
+    return _dp_barrier_greeks_from_valuation(ov, spot=_BARRIER_SPOT, greeks=greeks)
 
 
 _BARRIER_GREEK_SCENARIOS = [
