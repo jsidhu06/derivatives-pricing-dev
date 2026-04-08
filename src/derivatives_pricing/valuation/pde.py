@@ -1985,7 +1985,7 @@ def _subgrid_pde_step(
     r_dt : ``r * d_tau`` for Hull explicit discounting (0 otherwise).
     """
     V = V.copy()
-    ci = j_sub - 1  # coefficient indices into full-interior arrays
+    ci: np.ndarray = j_sub - 1  # coefficient indices into full-interior arrays
     a_s, b_s, c_s = a[ci], b[ci], c[ci]
 
     if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
@@ -2299,11 +2299,11 @@ def _fd_barrier_ki_core(
             # Inner BC: V_act at barrier; outer BC: rebate PV or vanilla
             rebate_bv = rebate * df_tT
             if direction is BarrierDirection.DOWN:
-                left_inact = V_act[j_H]  # inner (barrier side)
+                left_inact = float(V_act[j_H])  # inner (barrier side)
                 right_inact = rebate_bv  # far side → 0 if no rebate
             else:
                 left_inact = rebate_bv  # far side → 0 if no rebate
-                right_inact = V_act[j_H]  # inner (barrier side)
+                right_inact = float(V_act[j_H])  # inner (barrier side)
 
             if j_inact.size > 0:
                 V_inact = _subgrid_pde_step(
@@ -2344,11 +2344,11 @@ def _fd_barrier_ki_core(
             tau_key = round(tau_curr, 12)
             is_monitoring_step = monitoring_tau_set is not None and tau_key in monitoring_tau_set
             if direction is BarrierDirection.DOWN:
-                left_inact = V_act[0] if is_monitoring_step else V_act_prev[0]
+                left_inact = float(V_act[0] if is_monitoring_step else V_act_prev[0])
                 right_inact = rebate_bv
             else:
                 left_inact = rebate_bv
-                right_inact = V_act[-1] if is_monitoring_step else V_act_prev[-1]
+                right_inact = float(V_act[-1] if is_monitoring_step else V_act_prev[-1])
             if method_used in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
                 V_inact = _explicit_step(
                     V_inact_prev,

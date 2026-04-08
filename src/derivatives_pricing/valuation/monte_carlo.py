@@ -1419,8 +1419,8 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
         rebate = float(self.spec.rebate)
         rebate_timing = self.spec.rebate_timing
 
-        ever_hit = np.zeros(n_paths, dtype=bool)
-        first_hit_step = np.full(n_paths, -1, dtype=int)
+        ever_hit: np.ndarray = np.zeros(n_paths, dtype=bool)
+        first_hit_step: np.ndarray = np.full(n_paths, -1, dtype=int)
 
         if inception_hit:
             ever_hit[:] = True
@@ -1438,6 +1438,7 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
             first_hit_step[newly_hit] = idx
             ever_hit |= step_hit
 
+        weight: np.ndarray
         if action is BarrierAction.OUT:
             weight = (~ever_hit).astype(float)
         else:

@@ -889,7 +889,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
 
     def _monitoring_step_mask(self, num_steps: int) -> np.ndarray:
         if self.spec.monitoring is BarrierMonitoring.CONTINUOUS:
-            mask = np.ones(num_steps + 1, dtype=bool)
+            mask: np.ndarray = np.ones(num_steps + 1, dtype=bool)
             mask[0] = False
             return mask
 
@@ -1039,7 +1039,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         if self.spec.rebate_timing is RebateTiming.AT_HIT:
             return np.full(num_steps + 1, rebate, dtype=float)
 
-        to_maturity = np.ones(num_steps + 1, dtype=float)
+        to_maturity: np.ndarray = np.ones(num_steps + 1, dtype=float)
         if num_steps > 0:
             to_maturity[:num_steps] = np.cumprod(discount_factors[::-1])[::-1]
         return rebate * to_maturity
@@ -1114,7 +1114,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         inactive = np.zeros_like(spot_lattice)
 
         active[: num_steps + 1, num_steps] = intrinsic[: num_steps + 1, num_steps]
-        inactive_terminal = np.full(num_steps + 1, float(self.spec.rebate), dtype=float)
+        inactive_terminal: np.ndarray = np.full(num_steps + 1, float(self.spec.rebate), dtype=float)
         if monitoring_mask[num_steps]:
             terminal_hit = self._hit_mask(
                 spot_lattice[: num_steps + 1, num_steps],
@@ -1190,6 +1190,8 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
             solved = self.solve()
 
         if self.spec.action is BarrierAction.OUT:
+            assert isinstance(solved, np.ndarray)
             return float(solved[0, 0])
+        assert isinstance(solved, tuple)
         _, inactive = solved
         return float(inactive[0, 0])
