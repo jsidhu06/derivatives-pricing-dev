@@ -201,8 +201,8 @@ class _BinomialValuationBase:
                 return np.maximum(instrument_values - K, 0)
             return np.maximum(K - instrument_values, 0)
 
-        payoff_fn = self.valuation_ctx.spec.payoff  # type: ignore[union-attr]
-        return payoff_fn(instrument_values)
+        assert hasattr(self.valuation_ctx.spec, "payoff")
+        return self.valuation_ctx.spec.payoff(instrument_values)  # type: ignore[union-attr]
 
     def _solve_backward(self, *, early_exercise: bool) -> np.ndarray:
         """Run CRR backward induction, optionally with early exercise.
@@ -844,7 +844,7 @@ class _BinomialAsianValuation(_BinomialValuationBase):
 class _BinomialBarrierValuation(_BinomialValuationBase):
     """Barrier option valuation using a CRR binomial tree.
 
-    Continuous barriers use QuantLib-style Boyle-Lau step adjustment on top of
+    Continuous barriers use Boyle-Lau step adjustment on top of
     the user-provided base ``num_steps``. Knock-out options are solved directly
     via barrier-aware backward induction; knock-in options use an explicit
     active/inactive two-state recursion so American knock-ins and KI rebates are

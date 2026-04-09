@@ -404,10 +404,8 @@ class _MCEuropeanValuation(_MCValuationBase):
         if self.valuation_ctx.option_type in (OptionType.CALL, OptionType.PUT):
             return _vanilla_payoff(self.valuation_ctx.option_type, K, maturity_value)
 
-        payoff_fn = getattr(self.valuation_ctx.spec, "payoff", None)
-        if payoff_fn is None:
-            raise ValidationError("Unsupported option type for Monte Carlo valuation.")
-        return payoff_fn(maturity_value)
+        assert hasattr(self.valuation_ctx.spec, "payoff")
+        return self.valuation_ctx.spec.payoff(maturity_value)  # type: ignore[union-attr]
 
     def present_value(self) -> float:
         """Return the scalar present value."""
