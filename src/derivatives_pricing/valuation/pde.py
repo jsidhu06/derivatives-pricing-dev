@@ -125,13 +125,13 @@ def _solve_tridiagonal_thomas(
 def _build_tau_grid(
     time_to_maturity: float,
     time_steps: int,
-    dividend_taus: list[float],
+    extra_taus: list[float],
 ) -> np.ndarray:
-    """Build a tau (time remaining) grid that includes dividend dates."""
+    """Build a tau grid that snaps to dividend and monitoring dates."""
     base = np.linspace(0.0, time_to_maturity, time_steps + 1)
-    if not dividend_taus:
+    if not extra_taus:
         return base
-    grid = np.unique(np.concatenate([base, np.array(dividend_taus, dtype=float)]))
+    grid = np.unique(np.concatenate([base, np.array(extra_taus, dtype=float)]))
     grid.sort()
     return grid
 
@@ -349,12 +349,14 @@ def _boundary_values(
     # ------------------------------------------------------------------
     assert option_type is not None and strike is not None
     if option_type is OptionType.PUT:
-        left = strike if early_exercise else strike * df_tT
+        intrinsic = max(strike - smin, 0.0)
+        continuation = strike * df_tT - smin * dq_tT
+        left = max(continuation, intrinsic) if early_exercise else continuation
         right = 0.0
     else:
         left = 0.0
         continuation = smax * dq_tT - strike * df_tT
-        intrinsic = smax - strike
+        intrinsic = max(smax - strike, 0.0)
         right = max(continuation, intrinsic) if early_exercise else max(continuation, 0.0)
     return float(left), float(right)
 
@@ -1016,6 +1018,7 @@ def _fd_core(
     intrinsic = payoff if early_exercise else None
 
     schedule = dividend_schedule or []
+    # Round keys to 12dp to absorb float arithmetic noise; lookups must also round.
     dividend_map = {round(tau, 12): amount for tau, amount in schedule}
 
     # Maturity-date dividend (tau=0): apply as an immediate jump
@@ -1553,6 +1556,57 @@ def _barrier_monitoring_taus(
     return taus
 
 
+def _build_ko_continuous_log_grid(
+    *,
+    smin_target: float,
+    smax_target: float,
+    ref_price: float,
+    smax_mult: float,
+    direction: BarrierDirection,
+    volatility: float,
+    time_to_maturity: float,
+    spot_steps: int,
+    time_steps: int,
+    method: PDEMethod,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Build a log-spot grid with the barrier as a boundary node.
+
+    For explicit-family schemes, preserves Hull's dz scale;
+    CN/IMPLICIT honor spot_steps directly.
+    """
+    explicit_scheme = method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL)
+    if direction is BarrierDirection.DOWN:
+        zmin = np.log(smin_target)
+        zmax_default = np.log(smax_target)
+        if explicit_scheme:
+            dz_hull = volatility * np.sqrt(3.0 * (time_to_maturity / time_steps))
+            grid_width = spot_steps * dz_hull
+            if (zmax_default - zmin) > grid_width:
+                dz = (zmax_default - zmin) / spot_steps
+            else:
+                dz = dz_hull
+                zmax_default = zmin + grid_width
+        else:
+            dz = (zmax_default - zmin) / spot_steps
+        Z = np.linspace(zmin, zmax_default, spot_steps + 1)
+    else:
+        zmax = np.log(smax_target)
+        zmin_default = np.log(max(ref_price / smax_mult, 1.0e-8))
+        if explicit_scheme:
+            dz_hull = volatility * np.sqrt(3.0 * (time_to_maturity / time_steps))
+            grid_width = spot_steps * dz_hull
+            if (zmax - zmin_default) > grid_width:
+                dz = (zmax - zmin_default) / spot_steps
+            else:
+                dz = dz_hull
+                zmin_default = zmax - grid_width
+        else:
+            dz = (zmax - zmin_default) / spot_steps
+        Z = np.linspace(zmin_default, zmax, spot_steps + 1)
+    S = np.exp(Z)
+    return Z, S, dz
+
+
 def _fd_barrier_ko_core(
     *,
     spot: float,
@@ -1568,7 +1622,7 @@ def _fd_barrier_ko_core(
     monitoring: BarrierMonitoring,
     rebate: float,
     rebate_timing: RebateTiming,
-    monitoring_taus: list[float] | None,  # required (non-None) for DISCRETE
+    monitoring_taus: list[float] | None,  # required (not None) for DISCRETE
     smax_mult: float,
     spot_steps: int,
     time_steps: int,
@@ -1632,40 +1686,18 @@ def _fd_barrier_ko_core(
 
     if space_grid is PDESpaceGrid.LOG_SPOT:
         if continuous:
-            # Build log grid with barrier as a boundary.
-            # Preserve Hull's dz scale for the explicit-family schemes;
-            # CN/IMPLICIT honor spot_steps directly.
-            explicit_scheme = method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL)
-            if direction is BarrierDirection.DOWN:
-                zmin = np.log(smin_target)
-                zmax_default = np.log(smax_target)
-                if explicit_scheme:
-                    dz_hull = volatility * np.sqrt(3.0 * (time_to_maturity / time_steps))
-                    grid_width = spot_steps * dz_hull
-                    if (zmax_default - zmin) > grid_width:
-                        dz = (zmax_default - zmin) / spot_steps
-                    else:
-                        dz = dz_hull
-                        zmax_default = zmin + grid_width
-                else:
-                    dz = (zmax_default - zmin) / spot_steps
-                Z = np.linspace(zmin, zmax_default, spot_steps + 1)
-            else:
-                zmax = np.log(smax_target)
-                zmin_default = np.log(max(ref_price / smax_mult, 1.0e-8))
-                if explicit_scheme:
-                    dz_hull = volatility * np.sqrt(3.0 * (time_to_maturity / time_steps))
-                    grid_width = spot_steps * dz_hull
-                    if (zmax - zmin_default) > grid_width:
-                        dz = (zmax - zmin_default) / spot_steps
-                    else:
-                        dz = dz_hull
-                        zmin_default = zmax - grid_width
-                else:
-                    dz = (zmax - zmin_default) / spot_steps
-                Z = np.linspace(zmin_default, zmax, spot_steps + 1)
-            S = np.exp(Z)
-            grid = Z
+            grid, S, dz = _build_ko_continuous_log_grid(
+                smin_target=smin_target,
+                smax_target=smax_target,
+                ref_price=ref_price,
+                smax_mult=smax_mult,
+                direction=direction,
+                volatility=volatility,
+                time_to_maturity=time_to_maturity,
+                spot_steps=spot_steps,
+                time_steps=time_steps,
+                method=method,
+            )
         else:
             grid, S, dz = _build_log_grid(
                 spot=spot,
@@ -1722,6 +1754,7 @@ def _fd_barrier_ko_core(
 
     # ── Dividend schedule ─────────────────────────────────────────────
     schedule = dividend_schedule or []
+    # Round keys to 12dp to absorb float arithmetic noise; lookups must also round.
     dividend_map = {round(tau, 12): amount for tau, amount in schedule}
     mat_div = dividend_map.pop(0.0, None)
     if mat_div is not None:
@@ -1734,14 +1767,14 @@ def _fd_barrier_ko_core(
 
     # ── Merge monitoring taus into grid ───────────────────────────────
     dividend_taus = list(dividend_map.keys())
-    all_extra_taus = dividend_taus.copy()
+    extra_taus = dividend_taus.copy()
     monitoring_tau_set: set[float] | None = None
     if not continuous:
         assert monitoring_taus is not None  # validated above
-        all_extra_taus.extend(monitoring_taus)
+        extra_taus.extend(monitoring_taus)
         monitoring_tau_set = {round(t, 12) for t in monitoring_taus}
 
-    tau_grid = _build_tau_grid(time_to_maturity, time_steps, all_extra_taus)
+    tau_grid = _build_tau_grid(time_to_maturity, time_steps, extra_taus)
 
     if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL) and space_grid is PDESpaceGrid.SPOT:
         _check_explicit_spot_stability(
@@ -1830,7 +1863,7 @@ def _fd_barrier_ko_core(
                     right = 0.0
                 else:
                     continuation = smax * dq_tT - strike * df_tT
-                    intrinsic_bv = smax - strike
+                    intrinsic_bv = max(smax - strike, 0.0)
                     right = (
                         max(continuation, intrinsic_bv)
                         if early_exercise
@@ -1840,7 +1873,9 @@ def _fd_barrier_ko_core(
                 # Barrier at right boundary, vanilla far-field at left
                 right = barrier_bv
                 if option_type is OptionType.PUT:
-                    left = strike if early_exercise else strike * df_tT
+                    intrinsic_bv = max(strike - smin, 0.0)
+                    continuation = strike * df_tT - smin * dq_tT
+                    left = max(continuation, intrinsic_bv) if early_exercise else continuation
                 else:
                     left = 0.0
         else:
@@ -2106,6 +2141,7 @@ def _fd_barrier_ki_core(
 
     # ── Dividend schedule ─────────────────────────────────────────────
     schedule = dividend_schedule or []
+    # Round keys to 12dp to absorb float arithmetic noise; lookups must also round.
     dividend_map = {round(tau, 12): amount for tau, amount in schedule}
 
     mat_div = dividend_map.pop(0.0, None)
@@ -2122,14 +2158,14 @@ def _fd_barrier_ki_core(
 
     # ── Merge monitoring taus into time grid ──────────────────────────
     dividend_taus = list(dividend_map.keys())
-    all_extra_taus = dividend_taus.copy()
+    extra_taus = dividend_taus.copy()
     monitoring_tau_set: set[float] | None = None
     if not continuous:
         assert monitoring_taus is not None
-        all_extra_taus.extend(monitoring_taus)
+        extra_taus.extend(monitoring_taus)
         monitoring_tau_set = {round(t, 12) for t in monitoring_taus}
 
-    tau_grid = _build_tau_grid(time_to_maturity, time_steps, all_extra_taus)
+    tau_grid = _build_tau_grid(time_to_maturity, time_steps, extra_taus)
 
     # ── Barrier index for sub-grid coupling ──────────────────────────
     # Find the grid node closest to the barrier level.
@@ -2469,10 +2505,10 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
             for tau, _ in solve_args["dividend_schedule"] or []
             if 1.0e-12 < tau < time_to_maturity - 1.0e-12
         ]
-        all_extra_taus = dividend_taus.copy()
+        extra_taus = dividend_taus.copy()
         if solve_args["monitoring_taus"] is not None:
-            all_extra_taus.extend(solve_args["monitoring_taus"])
-        tau_grid = _build_tau_grid(time_to_maturity, int(solve_args["time_steps"]), all_extra_taus)
+            extra_taus.extend(solve_args["monitoring_taus"])
+        tau_grid = _build_tau_grid(time_to_maturity, int(solve_args["time_steps"]), extra_taus)
         if tau_grid.size < 2:
             return 0.0
         return float(tau_grid[-1] - tau_grid[-2])
