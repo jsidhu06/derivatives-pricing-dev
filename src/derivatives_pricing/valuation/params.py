@@ -49,7 +49,7 @@ class MonteCarloParams:
         regression basis with barrier-distance features and a local near/far
         split for American knock-out options. This is mainly useful where
         the continuation surface changes sharply near the absorbing barrier.
-        Default: ``False``.
+        Default: ``True``. Ignored for non-barrier options.
     """
 
     random_seed: int | None = None
@@ -59,7 +59,7 @@ class MonteCarloParams:
     log_timings: bool = False
     std_error_warn_ratio: float | None = 0.1
     control_variate_european: bool = False
-    barrier_aware_basis: bool = False
+    barrier_aware_basis: bool = True
 
     def __post_init__(self) -> None:
         if self.deg < 1:

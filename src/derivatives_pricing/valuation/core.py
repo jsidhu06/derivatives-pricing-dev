@@ -37,6 +37,7 @@ from ..enums import (
     ExerciseType,
     PricingMethod,
     GreekCalculationMethod,
+    PDESpaceGrid,
 )
 from .monte_carlo import (
     _MCEuropeanValuation,
@@ -275,7 +276,7 @@ class OptionValuation:
 
         # Resolve params
         self._params: ValuationParams | None = self._resolve_params(
-            pricing_method=pricing_method, params=params
+            pricing_method=pricing_method, params=params, spec=spec
         )
 
         # --- currency resolution & check (default match) ---
@@ -815,13 +816,22 @@ class OptionValuation:
         *,
         pricing_method: PricingMethod,
         params: ValuationParams | None,
+        spec: VanillaSpec | PayoffSpec | AsianSpec | BarrierSpec,
     ) -> ValuationParams | None:
+        is_barrier = isinstance(spec, BarrierSpec)
         if params is None:
             if pricing_method is PricingMethod.MONTE_CARLO:
                 return MonteCarloParams()
             if pricing_method is PricingMethod.BINOMIAL:
-                return BinomialParams()
+                # Barriers need finer grids for accurate barrier placement
+                return BinomialParams(num_steps=1000) if is_barrier else BinomialParams()
             if pricing_method is PricingMethod.PDE_FD:
+                if is_barrier:
+                    return PDEParams(
+                        spot_steps=2400,
+                        time_steps=800,
+                        space_grid=PDESpaceGrid.LOG_SPOT,
+                    )
                 return PDEParams()
             return None
 
