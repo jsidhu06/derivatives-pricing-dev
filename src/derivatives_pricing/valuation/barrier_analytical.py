@@ -299,26 +299,26 @@ def _hull_barrier_terms(
     """
     sigma_sqrt_T = sigma * np.sqrt(T)
 
-    x1 = np.log(S / K) / sigma_sqrt_T + lam * sigma_sqrt_T
-    x2 = np.log(S / H) / sigma_sqrt_T + lam * sigma_sqrt_T
-    y1 = np.log(H**2 / (S * K)) / sigma_sqrt_T + lam * sigma_sqrt_T
-    y2 = np.log(H / S) / sigma_sqrt_T + lam * sigma_sqrt_T
+    d1 = np.log(S / K) / sigma_sqrt_T + lam * sigma_sqrt_T
+    x1 = np.log(S / H) / sigma_sqrt_T + lam * sigma_sqrt_T
+    y = np.log(H**2 / (S * K)) / sigma_sqrt_T + lam * sigma_sqrt_T
+    y1 = np.log(H / S) / sigma_sqrt_T + lam * sigma_sqrt_T
 
     # Term A: vanilla-like
-    A = phi * S * df_q * norm.cdf(phi * x1) - phi * K * df_r * norm.cdf(phi * (x1 - sigma_sqrt_T))
+    A = phi * S * df_q * norm.cdf(phi * d1) - phi * K * df_r * norm.cdf(phi * (d1 - sigma_sqrt_T))
 
     # Term B: truncated at barrier
-    B = phi * S * df_q * norm.cdf(phi * x2) - phi * K * df_r * norm.cdf(phi * (x2 - sigma_sqrt_T))
+    B = phi * S * df_q * norm.cdf(phi * x1) - phi * K * df_r * norm.cdf(phi * (x1 - sigma_sqrt_T))
 
     # Term C: reflected vanilla
-    C = phi * S * df_q * (H / S) ** (2.0 * lam) * norm.cdf(eta * y1) - phi * K * df_r * (H / S) ** (
+    C = phi * S * df_q * (H / S) ** (2.0 * lam) * norm.cdf(eta * y) - phi * K * df_r * (H / S) ** (
         2.0 * lam - 2.0
-    ) * norm.cdf(eta * (y1 - sigma_sqrt_T))
+    ) * norm.cdf(eta * (y - sigma_sqrt_T))
 
     # Term D: reflected truncated
-    D = phi * S * df_q * (H / S) ** (2.0 * lam) * norm.cdf(eta * y2) - phi * K * df_r * (H / S) ** (
+    D = phi * S * df_q * (H / S) ** (2.0 * lam) * norm.cdf(eta * y1) - phi * K * df_r * (H / S) ** (
         2.0 * lam - 2.0
-    ) * norm.cdf(eta * (y2 - sigma_sqrt_T))
+    ) * norm.cdf(eta * (y1 - sigma_sqrt_T))
 
     return A, B, C, D
 
