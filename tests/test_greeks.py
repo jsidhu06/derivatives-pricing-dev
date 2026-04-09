@@ -1423,6 +1423,7 @@ _BARRIER_VEGA_RHO_EU_FLAT_SCENARIOS = [
 ]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "direction,action,option_type,strike,barrier",
     _BARRIER_VEGA_RHO_EU_FLAT_SCENARIOS,
@@ -1477,7 +1478,7 @@ def test_european_barrier_vega_rho_bsm_vs_pde(direction, action, option_type, st
     )
 
 
-_BARRIER_VEGA_RHO_AM_FLAT_SCENARIOS = [
+_BARRIER_RHO_AM_FLAT_SCENARIOS = [
     pytest.param(
         BarrierDirection.DOWN,
         BarrierAction.OUT,
@@ -1601,9 +1602,10 @@ _BARRIER_VEGA_RHO_AM_FLAT_SCENARIOS = [
 ]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "direction,action,option_type,strike,barrier,rebate,rebate_timing",
-    _BARRIER_VEGA_RHO_AM_FLAT_SCENARIOS,
+    _BARRIER_RHO_AM_FLAT_SCENARIOS,
 )
 def test_american_barrier_rho_binomial_vs_pde(
     direction, action, option_type, strike, barrier, rebate, rebate_timing
