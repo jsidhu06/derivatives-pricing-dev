@@ -58,6 +58,7 @@ from ..exceptions import (
 )
 from .contracts import BarrierSpec, PayoffSpec, PayoffBoundaryModel, VanillaSpec, WingBoundary
 from .params import PDEParams
+from .barrier_analytical import _is_triggered
 
 if TYPE_CHECKING:
     from .core import OptionValuation, UnderlyingData
@@ -2436,16 +2437,10 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         assert isinstance(valuation_ctx.params, PDEParams)
         self.pde_params: PDEParams = valuation_ctx.params
 
-    @staticmethod
-    def _is_triggered(spot: float, barrier: float, direction: BarrierDirection) -> bool:
-        if direction is BarrierDirection.DOWN:
-            return spot <= barrier
-        return spot >= barrier
-
     def _is_triggered_at_inception(self) -> bool:
         spot = float(self.underlying.initial_value)
         barrier = float(self._spec.barrier)
-        if not self._is_triggered(spot, barrier, self._spec.direction):
+        if not _is_triggered(spot, barrier, self._spec.direction):
             return False
 
         if self._spec.monitoring is BarrierMonitoring.CONTINUOUS:

@@ -27,6 +27,7 @@ from ..exceptions import (
     ValidationError,
 )
 from .params import BinomialParams
+from .barrier_analytical import _is_triggered
 
 if TYPE_CHECKING:
     from .core import AsianSpec, BarrierSpec, OptionValuation, UnderlyingData
@@ -857,12 +858,6 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         self._effective_steps = self._resolve_effective_num_steps()
 
     @staticmethod
-    def _is_triggered(spot: float, barrier: float, direction: BarrierDirection) -> bool:
-        if direction is BarrierDirection.UP:
-            return spot >= barrier
-        return spot <= barrier
-
-    @staticmethod
     def _hit_mask(
         spots: np.ndarray,
         barrier: float,
@@ -931,7 +926,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         #     `_solve_backward` (not the barrier-aware solver), so barrier
         #     alignment is irrelevant.
         # Skip both the inflation and any warning for those cases.
-        if self._is_triggered(spot, barrier, self.spec.direction):
+        if _is_triggered(spot, barrier, self.spec.direction):
             return base_steps
 
         log_distance = np.log(max(spot, barrier) / min(spot, barrier))
@@ -993,7 +988,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         present_value().
         """
         if self.spec.action is BarrierAction.OUT:
-            if self._is_triggered(
+            if _is_triggered(
                 float(self.underlying.initial_value),
                 float(self.spec.barrier),
                 self.spec.direction,
@@ -1001,7 +996,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
                 return self._resolved_knock_out_lattice()
             return self._solve_knock_out(early_exercise=early_exercise)
 
-        if self._is_triggered(
+        if _is_triggered(
             float(self.underlying.initial_value),
             float(self.spec.barrier),
             self.spec.direction,
@@ -1012,7 +1007,8 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         return inactive
 
     def _tree_greeks_data(self) -> tuple[np.ndarray, np.ndarray, float]:
-        """Return the barrier lattice used for tree-greek extraction."""
+        """Return the barrier option lattice, spot lattice and time delta used for tree-greek
+        extraction."""
         num_steps = self._effective_num_steps()
         _, _, spot_lattice = self._setup_binomial_parameters()
         early_exercise = self.spec.exercise_type is ExerciseType.AMERICAN
@@ -1147,7 +1143,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         return active, inactive
 
     def _initial_value_if_triggered(self, *, early_exercise: bool) -> float | None:
-        if not self._is_triggered(
+        if not _is_triggered(
             float(self.underlying.initial_value),
             float(self.spec.barrier),
             self.spec.direction,

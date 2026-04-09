@@ -39,7 +39,6 @@ from ..enums import (
     RebateTiming,
 )
 from ..exceptions import UnsupportedFeatureError
-from ..utils import calculate_year_fraction
 from .contracts import VanillaSpec
 
 if TYPE_CHECKING:
@@ -50,7 +49,7 @@ if TYPE_CHECKING:
 # ── Shared helpers ──────────────────────────────────────────────────
 
 
-def _initial_barrier_state(
+def _is_triggered(
     spot: float,
     barrier: float,
     direction: BarrierDirection,
@@ -445,11 +444,7 @@ class _AnalyticalBarrierValuation:
         H = float(spec.barrier)
         sigma = float(underlying.volatility)
 
-        T = calculate_year_fraction(
-            ctx.pricing_date,
-            ctx.maturity,
-            day_count_convention=ctx.day_count_convention,
-        )
+        T = self.valuation_ctx._maturity_year_fraction()
 
         # Discount factors from curves
         df_r = float(ctx.discount_curve.df(T))
@@ -461,7 +456,7 @@ class _AnalyticalBarrierValuation:
         q = -np.log(df_q) / T
 
         # ── Check if barrier already triggered at inception ──
-        if _initial_barrier_state(S, H, spec.direction):
+        if _is_triggered(S, H, spec.direction):
             return self._triggered_at_inception(df_r, spec)
 
         # ── Discrete monitoring: Broadie-Glasserman adjustment ──

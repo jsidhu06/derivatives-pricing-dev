@@ -25,7 +25,7 @@ from ..exceptions import (
     ValidationError,
 )
 from .params import MonteCarloParams
-from .barrier_analytical import _initial_barrier_state
+from .barrier_analytical import _is_triggered
 
 
 if TYPE_CHECKING:
@@ -1357,7 +1357,7 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
         )
         discount_factors = self.valuation_ctx.discount_curve.df(t_grid)
 
-        inception_hit = _initial_barrier_state(spot0, H, direction)
+        inception_hit = _is_triggered(spot0, H, direction)
 
         monitoring_idx = self._monitoring_idx(time_grid)
         monitoring_idx = monitoring_idx[monitoring_idx <= time_index_end]
@@ -1628,7 +1628,7 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
         ever_hit = np.zeros((n_times, n_paths), dtype=bool)
         first_hit_step = np.full(n_paths, -1, dtype=int)
 
-        if _initial_barrier_state(spot0, H, direction):
+        if _is_triggered(spot0, H, direction):
             ever_hit[0] = True
             first_hit_step[:] = 0
 
