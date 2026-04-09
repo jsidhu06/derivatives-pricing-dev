@@ -1902,6 +1902,7 @@ _BARRIER_SCENARIOS = [
 ]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "direction,action,option_type,strike,barrier,rebate,r_curve,q_curve",
     _BARRIER_SCENARIOS,
@@ -2082,6 +2083,7 @@ _BARRIER_REBATE_SCENARIOS = [
 ]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "direction,action,option_type,strike,barrier,rebate,rebate_timing,r_curve,q_curve",
     _BARRIER_REBATE_SCENARIOS,
@@ -2350,15 +2352,15 @@ def test_barrier_binomial_american_vs_quantlib(
 # American barrier KO — DP PDE vs QL BinomialCRR
 _BARRIER_AMERICAN_KO_SCENARIOS = [
     # Flat curves — KO only (American KI not supported)
-    # pytest.param(
-    #     BarrierDirection.DOWN,
-    #     BarrierAction.OUT,
-    #     OptionType.CALL,
-    #     100.0,
-    #     85.0,
-    #     0.0,
-    #     id="am_down_out_call_flat",
-    # ),
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        0.0,
+        id="am_down_out_call_flat",
+    ),
     pytest.param(
         BarrierDirection.DOWN,
         BarrierAction.OUT,
@@ -2377,15 +2379,15 @@ _BARRIER_AMERICAN_KO_SCENARIOS = [
         0.0,
         id="am_up_out_call_flat",
     ),
-    # pytest.param(
-    #     BarrierDirection.UP,
-    #     BarrierAction.OUT,
-    #     OptionType.PUT,
-    #     100.0,
-    #     120.0,
-    #     0.0,
-    #     id="am_up_out_put_flat",
-    # ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        0.0,
+        id="am_up_out_put_flat",
+    ),
     # With rebate (AT_HIT)
     pytest.param(
         BarrierDirection.DOWN,
@@ -2408,6 +2410,7 @@ _BARRIER_AMERICAN_KO_SCENARIOS = [
 ]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "direction,action,option_type,strike,barrier,rebate",
     _BARRIER_AMERICAN_KO_SCENARIOS,
@@ -2561,6 +2564,7 @@ _BARRIER_AMERICAN_KI_SCENARIOS = [
 ]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "direction,action,option_type,strike,barrier,rebate",
     _BARRIER_AMERICAN_KI_SCENARIOS,

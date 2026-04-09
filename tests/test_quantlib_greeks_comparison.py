@@ -59,7 +59,7 @@ from derivatives_pricing.utils import calculate_year_fraction
 if TYPE_CHECKING:
     import QuantLib as ql_typing
 
-# pytestmark = pytest.mark.slow
+pytestmark = pytest.mark.slow
 
 ql = pytest.importorskip("QuantLib")
 
