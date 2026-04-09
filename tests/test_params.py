@@ -20,6 +20,7 @@ class TestMonteCarloParams:
         assert p.deg == 3
         assert p.ridge_lambda == 1e-8
         assert p.min_itm == 25
+        assert p.barrier_aware_basis is True
 
     def test_rejects_deg_below_1(self):
         with pytest.raises(ValidationError, match="deg must be >= 1"):
@@ -44,6 +45,10 @@ class TestMonteCarloParams:
     def test_none_std_error_warn_ratio_accepted(self):
         p = MonteCarloParams(std_error_warn_ratio=None)
         assert p.std_error_warn_ratio is None
+
+    def test_rejects_non_bool_barrier_aware_basis(self):
+        with pytest.raises(ValidationError, match="barrier_aware_basis must be a bool"):
+            MonteCarloParams(barrier_aware_basis=1)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
