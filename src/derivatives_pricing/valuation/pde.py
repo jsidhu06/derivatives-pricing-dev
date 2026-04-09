@@ -1430,6 +1430,8 @@ class _FDValuationBase(_FDGridGreeksMixin):
     def __init__(self, valuation_ctx: OptionValuation) -> None:
         self.valuation_ctx = valuation_ctx
         self.underlying = valuation_ctx.underlying  # type: ignore[assignment]
+        assert isinstance(valuation_ctx.params, PDEParams)
+        self.pde_params = valuation_ctx.params
 
     def solve(self) -> tuple[float, np.ndarray, np.ndarray]:
         """Compute the full FD solution on the spot grid at pricing time."""
@@ -1438,9 +1440,7 @@ class _FDValuationBase(_FDGridGreeksMixin):
 
     def _solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the PDE finite-difference solve."""
-        params = self.valuation_ctx.params
-        if not isinstance(params, PDEParams):
-            raise ConfigurationError("PDE valuation requires PDEParams on OptionValuation")
+        params = self.pde_params
 
         if self._early_exercise:
             logger.debug(
@@ -1517,11 +1517,8 @@ class _FDValuationBase(_FDGridGreeksMixin):
 
     def present_value(self) -> float:
         """Return present value from the PDE solve."""
-        params = self.valuation_ctx.params
-        if not isinstance(params, PDEParams):
-            raise ConfigurationError("PDE valuation requires PDEParams on OptionValuation")
         label = "PDE American" if self._early_exercise else "PDE European"
-        with log_timing(logger, f"{label} present_value", params.log_timings):
+        with log_timing(logger, f"{label} present_value", self.pde_params.log_timings):
             pv, *_ = self._solve()
         return float(pv)
 
@@ -2436,9 +2433,8 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         self.valuation_ctx = valuation_ctx
         self.underlying = valuation_ctx.underlying  # type: ignore[assignment]
         self._spec: BarrierSpec = valuation_ctx.spec  # type: ignore[assignment]
-
-        if not isinstance(self._spec, BarrierSpec):
-            raise ConfigurationError("_FDBarrierValuation requires a BarrierSpec.")
+        assert isinstance(valuation_ctx.params, PDEParams)
+        self.pde_params: PDEParams = valuation_ctx.params
 
     @staticmethod
     def _is_triggered(spot: float, barrier: float, direction: BarrierDirection) -> bool:
@@ -2553,9 +2549,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
     def _base_solve_args(self) -> dict:
         """Build keyword arguments shared by both KO and KI solvers."""
-        params = self.valuation_ctx.params
-        if not isinstance(params, PDEParams):
-            raise ConfigurationError("PDE valuation requires PDEParams on OptionValuation")
+        params = self.pde_params
 
         spec = self._spec
         ctx = self.valuation_ctx
@@ -2731,9 +2725,6 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
     def present_value(self) -> float:
         """Return present value from the PDE barrier solve."""
-        params = self.valuation_ctx.params
-        if not isinstance(params, PDEParams):
-            raise ConfigurationError("PDE valuation requires PDEParams on OptionValuation")
         if self._is_triggered_at_inception():
             if self._spec.action is BarrierAction.OUT:
                 triggered_value = self._resolved_knock_out_value()
@@ -2743,6 +2734,6 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
             return self._vanilla_equivalent_valuation().present_value()
         spec = self._spec
         label = f"PDE barrier {'American' if spec.exercise_type is ExerciseType.AMERICAN else 'European'}"
-        with log_timing(logger, f"{label} present_value", params.log_timings):
+        with log_timing(logger, f"{label} present_value", self.pde_params.log_timings):
             pv, *_ = self._solve()
         return float(pv)

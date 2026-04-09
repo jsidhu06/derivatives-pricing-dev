@@ -22,7 +22,6 @@ from ..enums import (
 from ..utils import calculate_year_fraction, pv_discrete_dividends, log_timing
 from ..exceptions import (
     ArbitrageViolationError,
-    ConfigurationError,
     NumericalError,
     UnsupportedFeatureError,
     ValidationError,
@@ -42,11 +41,8 @@ class _BinomialValuationBase:
     def __init__(self, valuation_ctx: OptionValuation) -> None:
         self.valuation_ctx = valuation_ctx
         self.underlying: UnderlyingData = valuation_ctx.underlying  # type: ignore[assignment]
-        if not isinstance(valuation_ctx.params, BinomialParams):
-            raise ConfigurationError(
-                "Binomial valuation requires BinomialParams on OptionValuation"
-            )
-        self.binom_params: BinomialParams = valuation_ctx.params
+        assert isinstance(valuation_ctx.params, BinomialParams)
+        self.binom_params = valuation_ctx.params
 
     def _effective_num_steps(self) -> int:
         """Return the canonical tree depth for this engine instance."""
@@ -858,8 +854,6 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
     def __init__(self, valuation_ctx: OptionValuation) -> None:
         super().__init__(valuation_ctx)
         self.spec: BarrierSpec = valuation_ctx.spec  # type: ignore[assignment]
-        if not hasattr(self.spec, "barrier"):
-            raise ConfigurationError("_BinomialBarrierValuation requires a BarrierSpec.")
         self._effective_steps = self._resolve_effective_num_steps()
 
     @staticmethod

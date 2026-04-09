@@ -987,8 +987,7 @@ class OptionValuation:
         params = self._params
 
         if self._pricing_method is PricingMethod.BINOMIAL:
-            if not isinstance(params, BinomialParams):
-                raise ConfigurationError("Expected BinomialParams for binomial pricing.")
+            assert isinstance(params, BinomialParams)
             if params.asian_tree_averages is None:
                 raise UnsupportedFeatureError(
                     "Asian control_variate_european requires Hull tree averages "

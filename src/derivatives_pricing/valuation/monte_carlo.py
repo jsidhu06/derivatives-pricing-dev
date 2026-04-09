@@ -20,7 +20,6 @@ from ..enums import (
     RebateTiming,
 )
 from ..exceptions import (
-    ConfigurationError,
     NumericalError,
     UnsupportedFeatureError,
     ValidationError,
@@ -379,16 +378,10 @@ class _MCValuationBase:
 
     def __init__(self, valuation_ctx: OptionValuation) -> None:
         self.valuation_ctx = valuation_ctx
-        if not isinstance(valuation_ctx.params, MonteCarloParams):
-            raise ConfigurationError(
-                "Monte Carlo valuation requires MonteCarloParams on OptionValuation"
-            )
-        self.mc_params: MonteCarloParams = valuation_ctx.params
-        if not isinstance(valuation_ctx.underlying, PathSimulation):
-            raise ConfigurationError(
-                "Monte Carlo valuation requires a PathSimulation underlying on OptionValuation"
-            )
-        self.underlying: PathSimulation = valuation_ctx.underlying
+        assert isinstance(valuation_ctx.params, MonteCarloParams)
+        self.mc_params = valuation_ctx.params
+        assert isinstance(valuation_ctx.underlying, PathSimulation)
+        self.underlying = valuation_ctx.underlying
 
 
 class _MCEuropeanValuation(_MCValuationBase):

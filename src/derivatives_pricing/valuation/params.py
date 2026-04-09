@@ -49,7 +49,7 @@ class MonteCarloParams:
         regression basis with barrier-distance features and a local near/far
         split for American knock-out options. This is mainly useful where
         the continuation surface changes sharply near the absorbing barrier.
-        Default: ``True``. Ignored for non-barrier options.
+        Default: ``True``. Only applicable to KO barrier options; ignored otherwise.
     """
 
     random_seed: int | None = None
