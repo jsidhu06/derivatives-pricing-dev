@@ -20,7 +20,7 @@ class TestMonteCarloParams:
         assert p.deg == 3
         assert p.ridge_lambda == 1e-8
         assert p.min_itm == 25
-        assert p.barrier_aware_basis is False
+        assert p.barrier_aware_basis is True
 
     def test_rejects_deg_below_1(self):
         with pytest.raises(ValidationError, match="deg must be >= 1"):

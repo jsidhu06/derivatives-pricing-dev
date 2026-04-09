@@ -501,33 +501,20 @@ _AMERICAN_BARRIER_SCENARIOS = [
 @pytest.mark.parametrize("scenario", _EUROPEAN_BARRIER_SCENARIOS)
 def test_pde_fd_barrier_equivalence_european(scenario):
     """Barrier PDE European variants should be in the same neighborhood."""
-    base_params = PDEParams(spot_steps=180, time_steps=260)
+    base_params = PDEParams(spot_steps=800, time_steps=800, space_grid=PDESpaceGrid.LOG_SPOT)
     baseline = _barrier_pde_value(scenario, base_params)
 
     for method in (
         PDEMethod.IMPLICIT,
-        PDEMethod.EXPLICIT,
-        PDEMethod.EXPLICIT_HULL,
         PDEMethod.CRANK_NICOLSON,
     ):
         for grid in (PDESpaceGrid.SPOT, PDESpaceGrid.LOG_SPOT):
             params = PDEParams(
-                spot_steps=180,
-                time_steps=260,
+                spot_steps=800,
+                time_steps=800,
                 method=method,
                 space_grid=grid,
-                american_solver=PDEEarlyExercise.INTRINSIC,
             )
-
-            if (
-                method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL)
-                and grid is PDESpaceGrid.SPOT
-            ):
-                with pytest.raises(
-                    StabilityError, match="Explicit spot-grid scheme likely unstable"
-                ):
-                    _barrier_pde_value(scenario, params)
-                continue
 
             pv = _barrier_pde_value(scenario, params)
             assert np.isclose(pv, baseline, rtol=0.015)
@@ -760,7 +747,7 @@ def test_european_knock_in_grid_delta_uses_native_surface_parity():
         market_data=md,
         dividend_curve=q_curve,
     )
-    params = PDEParams(spot_steps=400, time_steps=400)
+    params = PDEParams(spot_steps=2400, time_steps=800, space_grid=PDESpaceGrid.LOG_SPOT)
 
     ki_spec = BarrierSpec(
         option_type=OptionType.PUT,

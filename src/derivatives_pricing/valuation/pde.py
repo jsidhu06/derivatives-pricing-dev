@@ -1212,23 +1212,6 @@ class _FDGridGreeksMixin:
         )
 
     @staticmethod
-    def _grid_delta_at_index(S: np.ndarray, V: np.ndarray, j: int) -> float:
-        """Return the non-uniform three-point first-derivative stencil at ``j``.
-
-        On a non-uniform grid the textbook central difference
-        ``(V[j+1] - V[j-1]) / (S[j+1] - S[j-1])`` degrades to O(h); the
-        weighted three-point stencil below restores O(h²) accuracy and
-        collapses to the central difference on a uniform grid.
-        """
-        h_up = S[j + 1] - S[j]
-        h_dn = S[j] - S[j - 1]
-        return float(
-            -h_up / (h_dn * (h_up + h_dn)) * V[j - 1]
-            + (h_up - h_dn) / (h_up * h_dn) * V[j]
-            + h_dn / (h_up * (h_up + h_dn)) * V[j + 1]
-        )
-
-    @staticmethod
     def _grid_delta_at_spot(S: np.ndarray, V: np.ndarray, j: int, spot: float) -> float:
         """Parabolic-Lagrange first derivative evaluated exactly at ``spot``.
 
