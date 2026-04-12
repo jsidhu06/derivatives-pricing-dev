@@ -37,7 +37,6 @@ from ..enums import (
     ExerciseType,
     PricingMethod,
     GreekCalculationMethod,
-    PDESpaceGrid,
 )
 from .monte_carlo import (
     _MCEuropeanValuation,
@@ -823,16 +822,9 @@ class OptionValuation:
             if pricing_method is PricingMethod.MONTE_CARLO:
                 return MonteCarloParams()
             if pricing_method is PricingMethod.BINOMIAL:
-                # Barriers need finer grids for accurate barrier placement
-                return BinomialParams(num_steps=1000) if is_barrier else BinomialParams()
+                return BinomialParams.for_barriers() if is_barrier else BinomialParams()
             if pricing_method is PricingMethod.PDE_FD:
-                if is_barrier:
-                    return PDEParams(
-                        spot_steps=2400,
-                        time_steps=800,
-                        space_grid=PDESpaceGrid.LOG_SPOT,
-                    )
-                return PDEParams()
+                return PDEParams.for_barriers() if is_barrier else PDEParams()
             return None
 
         if pricing_method is PricingMethod.MONTE_CARLO:
@@ -929,14 +921,13 @@ class OptionValuation:
                 "control_variate_european is only supported for BINOMIAL, PDE_FD, "
                 "and MONTE_CARLO pricing."
             )
-        if not isinstance(self._spec, VanillaSpec):
+        if isinstance(self._spec, PayoffSpec):
             raise UnsupportedFeatureError(
-                "Vanilla control_variate_european requires spec to be of type VanillaSpec. "
-                "PayoffSpec is not supported."
+                "control_variate_european is not supported for PayoffSpec."
             )
         if self._option_type not in (OptionType.CALL, OptionType.PUT):
             raise UnsupportedFeatureError(
-                "Vanilla control_variate_european requires a CALL or PUT option type."
+                "control_variate_european requires a CALL or PUT option type."
             )
 
         euro_spec = dc_replace(self._spec, exercise_type=ExerciseType.EUROPEAN)
@@ -1145,7 +1136,7 @@ class OptionValuation:
         if rule is not None:
             required_method, cap_flag, supported_greeks = rule
             if self._pricing_method is not required_method:
-                raise UnsupportedFeatureError(
+                raise ValidationError(
                     f"{greek_calc_method.value.capitalize()} greeks are only available for "
                     f"{required_method.name} pricing method."
                 )

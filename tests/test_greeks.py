@@ -547,7 +547,7 @@ class TestGreekErrorHandling(TestGreeksSetup):
         valuation = self._make_val(self._make_ud(), spec, PricingMethod.BINOMIAL)
 
         with pytest.raises(
-            UnsupportedFeatureError, match=r"Analytical greeks are only available for BSM.*"
+            ValidationError, match=r"Analytical greeks are only available for BSM.*"
         ):
             valuation.delta(greek_calc_method=GreekCalculationMethod.ANALYTICAL)
 
@@ -555,9 +555,7 @@ class TestGreekErrorHandling(TestGreeksSetup):
         spec = self._make_spec(option_type=OptionType.CALL)
         valuation = self._make_val(self._make_ud(), spec, PricingMethod.BSM)
 
-        with pytest.raises(
-            UnsupportedFeatureError, match=r"Tree greeks are only available for BINOMIAL.*"
-        ):
+        with pytest.raises(ValidationError, match=r"Tree greeks are only available for BINOMIAL.*"):
             valuation.delta(greek_calc_method=GreekCalculationMethod.TREE)
 
     def test_tree_greek_for_vega_raises_error(self):
@@ -1201,6 +1199,28 @@ _BARRIER_AMERICAN_NONFLAT_GREEK_SCENARIOS = [
     ),
     pytest.param(
         BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        0.0,
+        RebateTiming.AT_HIT,
+        *_barrier_nonflat_curves(),
+        id="am_down_out_call_nonflat",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.CALL,
+        95.0,
+        110.0,
+        0.0,
+        RebateTiming.AT_EXPIRY,
+        *_barrier_nonflat_curves(),
+        id="am_up_in_call_nonflat",
+    ),
+    pytest.param(
+        BarrierDirection.DOWN,
         BarrierAction.IN,
         OptionType.CALL,
         95.0,
@@ -1279,14 +1299,25 @@ def test_american_barrier_nonflat_greeks_binomial_vs_pde(
         q_curve=q_curve,
         greeks=nonflat_greeks,
     )
+    # DOWN-OUT put / UP-OUT call: the KO barrier truncates the payoff
+    # region, amplifying CRR tree bias vs the FD grid.  Residuals up to ~12%
+    # on theta/rho are genuine and converge as binomial steps increase.
+    # All other scenarios agree to within ~1.1%.
 
-    # American OUT barriers with nonflat curves: the continuation-vs-exercise
-    # boundary amplifies cross-engine disagreement between CRR tree and FD
-    # grid. Residuals up to ~8% on delta/gamma/rho are genuine. Vega is not
-    # cross-checked because binomial barrier vega is unavailable (no tree-
-    # native path; NUMERICAL bump-and-revalue blocked by the Boyle-Lau
-    # retopology guard). PDE vega is validated elsewhere via direct tests.
-    pde_tols = {"delta": 0.05, "gamma": 0.12, "theta": 0.15, "rho": 0.15}
+    reverse_barrier_ko = (
+        direction is BarrierDirection.DOWN
+        and action is BarrierAction.OUT
+        and option_type is OptionType.PUT
+    ) or (
+        direction is BarrierDirection.UP
+        and action is BarrierAction.OUT
+        and option_type is OptionType.CALL
+    )
+    bn_tols = (
+        {"delta": 0.05, "gamma": 0.12, "theta": 0.15, "rho": 0.15}
+        if reverse_barrier_ko
+        else {"delta": 0.015, "gamma": 0.015, "theta": 0.015, "rho": 0.015}
+    )
 
     for greek in ("delta", "gamma", "theta", "rho"):
         logger.info(
@@ -1302,15 +1333,15 @@ def test_american_barrier_nonflat_greeks_binomial_vs_pde(
         )
 
     assert_greeks_close(
-        lhs=dp_pde,
-        rhs=dp_bn,
-        tols=pde_tols,
+        lhs=dp_bn,
+        rhs=dp_pde,
+        tols=bn_tols,
         log_prefix=(
-            f"American barrier nonflat PDE {direction.value}-{action.value} {option_type.value} "
+            f"American barrier nonflat BN {direction.value}-{action.value} {option_type.value} "
             f"K={strike:.0f} H={barrier:.0f}"
         ),
-        lhs_name="DP_PDE",
-        rhs_name="DP_BN",
+        lhs_name="DP_BN",
+        rhs_name="DP_PDE",
         skip_missing_rhs=False,
         atol=1e-3,
         logger=None,
@@ -1646,12 +1677,21 @@ def test_american_barrier_rho_binomial_vs_pde(
         greeks=rho_only,
     )
 
-    # In reality, we can be much tighter for the non DOWN-OUT put, UP-OUT call cases
-    tols = {"rho": 0.10}
+    reverse_barrier_ko = (
+        direction is BarrierDirection.DOWN
+        and action is BarrierAction.OUT
+        and option_type is OptionType.PUT
+    ) or (
+        direction is BarrierDirection.UP
+        and action is BarrierAction.OUT
+        and option_type is OptionType.CALL
+    )
+
+    rtol = {"rho": 0.015} if not reverse_barrier_ko else {"rho": 0.1}
     assert_greeks_close(
         lhs=dp_pde,
         rhs=dp_bn,
-        tols=tols,
+        tols=rtol,
         log_prefix=(
             f"American barrier rho {direction.value}-{action.value} "
             f"{option_type.value} K={strike:.0f} H={barrier:.0f} R={rebate:.1f}"

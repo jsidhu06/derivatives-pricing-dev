@@ -393,9 +393,12 @@ def _build_log_grid(
     lies exactly on an interior node *and* the resulting domain is a
     (possibly slight) superset of ``[zmin_target, zmax_target]``. For
     CN/IMPLICIT this is achieved by recomputing ``dz`` from the binding
-    half (left or right of the anchor); for explicit schemes ``dz`` is
-    fixed by Hull's stability heuristic, so the grid is shifted in place
-    while keeping strict cover of the target domain.
+    half (left or right of the anchor), i.e. the side that requires the
+    larger uniform ``dz`` to keep the anchor on-node while still covering
+    the target domain. The other side can then have up to roughly one cell
+    of slack. For explicit schemes ``dz`` is fixed by Hull's stability
+    heuristic, so the grid is shifted in place while keeping strict cover
+    of the target domain.
     """
     smax = float(smax_mult * max(spot, strike))
     smin = float(max(max(spot, strike) / smax_mult, 1.0e-8))
@@ -442,7 +445,9 @@ def _build_log_grid(
             # ``grid_width = spot_steps * dz`` strictly larger than the
             # target span (when not capped). dz is fixed by stability, so
             # we shift the grid in place while keeping strict cover of
-            # ``[zmin_target, zmax_target]``.
+            # ``[zmin_target, zmax_target]``. If the target span is already
+            # capped exactly by ``spot_steps * dz``, exact anchoring is only
+            # possible when the anchor happens to lie on that fixed grid.
             j_min = max(0, int(math.ceil((z_anchor - zmin_target) / dz - 1.0e-12)))
             j_max = min(
                 spot_steps,
@@ -459,8 +464,10 @@ def _build_log_grid(
             # grid (which forces an unsatisfiable strict-cover constraint
             # when dz exactly tiles the target span), we *grow* dz on the
             # binding half. Pick the integer node closest to where the
-            # anchor naturally falls, then size dz from whichever side is
-            # tighter. The result is a uniform grid that:
+            # anchor naturally falls, then compute the dz required to cover
+            # the left and right halves separately; whichever side requires
+            # the larger dz is the binding side, and the other side absorbs
+            # the slack. The result is a uniform grid that:
             #   - places the anchor exactly on an interior node,
             #   - is strictly tight to the target on the binding side,
             #   - has up to one cell of slack outside the target on the
@@ -2454,7 +2461,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         self.underlying = valuation_ctx.underlying  # type: ignore[assignment]
         self._spec: BarrierSpec = valuation_ctx.spec  # type: ignore[assignment]
         assert isinstance(valuation_ctx.params, PDEParams)
-        self.pde_params: PDEParams = valuation_ctx.params
+        self.pde_params = valuation_ctx.params
 
     def _is_triggered_at_inception(self) -> bool:
         spot = float(self.underlying.initial_value)

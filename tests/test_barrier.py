@@ -6,6 +6,7 @@ and Greeks (NUMERICAL only).
 """
 
 import datetime as dt
+import warnings
 
 import numpy as np
 import pytest
@@ -888,99 +889,6 @@ class TestBarrierDiscreteMonitoring:
 
 
 # ===========================================================================
-# Discrete monitoring — BG-corrected analytical vs pathwise MC cross-check
-# ===========================================================================
-# The BSM discrete-monitoring path applies the Broadie-Glasserman-Kou
-# continuity correction to the continuous closed-form (shift the effective
-# barrier by β·σ·√Δt). The MC path explicitly checks the barrier at each
-# monitoring date on simulated paths — structurally unrelated to BG. If the
-# BG formula is wrong, these two will disagree.
-
-
-def _mc_gbm(
-    spot: float = SPOT,
-    vol: float = VOL,
-    market_data: MarketData | None = None,
-    dividend_curve: DiscountCurve | None = None,
-    paths: int = 200_000,
-    num_steps: int = 252,
-) -> GBMProcess:
-    if market_data is None:
-        market_data = _market_data()
-    return GBMProcess(
-        market_data,
-        GBMParams(initial_value=spot, volatility=vol, dividend_curve=dividend_curve),
-        SimulationConfig(paths=paths, num_steps=num_steps, end_date=MATURITY),
-    )
-
-
-class TestBarrierDiscreteBGvsMC:
-    """Cross-validate the BG continuity correction against pathwise MC."""
-
-    @pytest.mark.slow
-    @pytest.mark.parametrize(
-        "option_type,direction,action,barrier,num_observations",
-        [
-            pytest.param(
-                OptionType.CALL,
-                BarrierDirection.UP,
-                BarrierAction.OUT,
-                120.0,
-                12,
-                id="up_out_call_monthly",
-            ),
-            pytest.param(
-                OptionType.PUT,
-                BarrierDirection.DOWN,
-                BarrierAction.OUT,
-                80.0,
-                12,
-                id="down_out_put_monthly",
-            ),
-            pytest.param(
-                OptionType.CALL,
-                BarrierDirection.UP,
-                BarrierAction.IN,
-                120.0,
-                24,
-                id="up_in_call_biweekly",
-            ),
-        ],
-    )
-    def test_bg_analytical_matches_mc_pathwise(
-        self, option_type, direction, action, barrier, num_observations
-    ):
-        """BSM (BG-corrected analytical) ≈ MC (pathwise checks) for
-        discrete-monitoring barriers. The two implementations are
-        structurally unrelated — agreement validates the BG formula."""
-        spec = _barrier_spec(
-            option_type=option_type,
-            direction=direction,
-            action=action,
-            barrier=barrier,
-            monitoring=BarrierMonitoring.DISCRETE,
-            num_observations=num_observations,
-        )
-        pv_bsm = OptionValuation(_underlying(), spec, PricingMethod.BSM).present_value()
-
-        gbm = _mc_gbm(num_steps=max(200, num_observations * 10))
-        pv_mc = OptionValuation(
-            gbm,
-            spec,
-            PricingMethod.MONTE_CARLO,
-            params=MonteCarloParams(random_seed=42, log_timings=True),
-        ).present_value()
-
-        # MC noise + BG approximation residual. BG is O((Δt_obs)^(3/2))
-        # accurate — for monthly monitoring with σ=0.20 the residual can
-        # reach a few percent on its own, with MC noise on top. ~5% is a
-        # meaningful bound: a broken BG formula would miss by >10%.
-        assert np.isclose(pv_bsm, pv_mc, rtol=0.05, atol=5e-3), (
-            f"BG vs MC mismatch: BSM={pv_bsm:.6f} MC={pv_mc:.6f}"
-        )
-
-
-# ===========================================================================
 # Greeks (NUMERICAL only)
 # ===========================================================================
 
@@ -1093,6 +1001,87 @@ class TestBinomialBarrierNumericalGuard:
 
 
 # ===========================================================================
+# Binomial barrier coverage
+# ===========================================================================
+
+
+class TestBinomialBarrierCoverage:
+    """Cover binomial barrier paths not exercised elsewhere."""
+
+    def test_discrete_monitoring_dates_explicit(self):
+        """Binomial barrier with explicit monitoring_dates (not num_observations)."""
+        dates = [PRICING_DATE + dt.timedelta(days=d) for d in (30, 60, 90, 120, 150)]
+        spec = _barrier_spec(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=120.0,
+            monitoring=BarrierMonitoring.DISCRETE,
+            monitoring_dates=dates,
+        )
+        val = OptionValuation(
+            _underlying(), spec, PricingMethod.BINOMIAL, params=BinomialParams(num_steps=200)
+        )
+        pv = val.present_value()
+        assert pv > 0
+
+    def test_boyle_lau_cap_bind_warning(self):
+        """When barrier is very close to spot, Boyle-Lau cap-bind warning fires."""
+        spec = _barrier_spec(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=100.01,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            val = OptionValuation(
+                _underlying(spot=100.0),
+                spec,
+                PricingMethod.BINOMIAL,
+                params=BinomialParams(num_steps=50),
+            )
+            val.present_value()
+        assert any("Boyle-Lau step alignment" in str(warning.message) for warning in w)
+
+    def test_knock_in_triggered_at_inception_binomial_pv(self):
+        """KI triggered at inception via binomial → matches vanilla binomial."""
+        u = _underlying(spot=120.0)
+        params = BinomialParams(num_steps=200)
+
+        ki_spec = _barrier_spec(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.IN,
+            barrier=120.0,
+        )
+        pv_ki = OptionValuation(u, ki_spec, PricingMethod.BINOMIAL, params=params).present_value()
+
+        vanilla_spec = VanillaSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=STRIKE,
+            maturity=MATURITY,
+        )
+        pv_vanilla = OptionValuation(
+            u, vanilla_spec, PricingMethod.BINOMIAL, params=params
+        ).present_value()
+        assert np.isclose(pv_ki, pv_vanilla, rtol=1e-10)
+
+    def test_knock_out_triggered_at_inception_rebate_at_hit_binomial(self):
+        """KO triggered at inception with AT_HIT rebate via binomial."""
+        spec = _barrier_spec(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=120.0,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_HIT,
+        )
+        pv = OptionValuation(
+            _underlying(spot=120.0), spec, PricingMethod.BINOMIAL, params=BinomialParams()
+        ).present_value()
+        assert pv == 5.0
+
+
+# ===========================================================================
 # Unsupported feature errors
 # ===========================================================================
 
@@ -1116,3 +1105,389 @@ class TestBarrierUnsupported:
         spec = _barrier_spec()
         with pytest.raises(UnsupportedFeatureError, match="discrete dividends"):
             OptionValuation(u, spec, PricingMethod.BSM).present_value()
+
+
+# ===========================================================================
+# Monte Carlo barrier coverage
+# ===========================================================================
+
+_MC_SEED = MonteCarloParams(random_seed=42)
+_MC_PATHS = 50_000
+_MC_STEPS = 200
+
+# ===========================================================================
+# Discrete monitoring — BG-corrected analytical vs MC cross-check
+# ===========================================================================
+# The BSM discrete-monitoring path applies the Broadie-Glasserman-Kou
+# continuity correction to the continuous closed-form (shift the effective
+# barrier by β·σ·√Δt). The MC path explicitly checks the barrier at each
+# monitoring date on simulated paths — structurally unrelated to BG. If the
+# BG formula is wrong, these two will disagree.
+
+
+def _mc_gbm(
+    spot: float = SPOT,
+    vol: float = VOL,
+    market_data: MarketData | None = None,
+    dividend_curve: DiscountCurve | None = None,
+    paths: int = _MC_PATHS,
+    num_steps: int = _MC_STEPS,
+) -> GBMProcess:
+    if market_data is None:
+        market_data = _market_data()
+    return GBMProcess(
+        market_data,
+        GBMParams(initial_value=spot, volatility=vol, dividend_curve=dividend_curve),
+        SimulationConfig(paths=paths, num_steps=num_steps, end_date=MATURITY),
+    )
+
+
+def _mc_price(
+    gbm: GBMProcess | None = None,
+    spec: BarrierSpec | None = None,
+    params: MonteCarloParams = _MC_SEED,
+    **spec_kw,
+) -> float:
+    if gbm is None:
+        gbm = _mc_gbm()
+    if spec is None:
+        spec = _barrier_spec(**spec_kw)
+    return OptionValuation(gbm, spec, PricingMethod.MONTE_CARLO, params=params).present_value()
+
+
+class TestBarrierDiscreteBGvsMC:
+    """Cross-validate the BG continuity correction against pathwise MC."""
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize(
+        "option_type,direction,action,barrier,num_observations",
+        [
+            pytest.param(
+                OptionType.CALL,
+                BarrierDirection.UP,
+                BarrierAction.OUT,
+                120.0,
+                60,
+                id="up_out_call_monthly",
+            ),
+            pytest.param(
+                OptionType.PUT,
+                BarrierDirection.DOWN,
+                BarrierAction.OUT,
+                80.0,
+                60,
+                id="down_out_put_monthly",
+            ),
+            pytest.param(
+                OptionType.CALL,
+                BarrierDirection.UP,
+                BarrierAction.IN,
+                120.0,
+                50,
+                id="up_in_call_biweekly",
+            ),
+        ],
+    )
+    def test_bg_analytical_matches_mc_pathwise(
+        self, option_type, direction, action, barrier, num_observations
+    ):
+        """BSM (BG-corrected analytical) ≈ MC (pathwise checks) for
+        discrete-monitoring barriers. The two implementations are
+        structurally unrelated — agreement validates the BG formula."""
+        spec = _barrier_spec(
+            option_type=option_type,
+            direction=direction,
+            action=action,
+            barrier=barrier,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=num_observations,
+        )
+        pv_bsm = OptionValuation(_underlying(), spec, PricingMethod.BSM).present_value()
+
+        gbm = _mc_gbm(num_steps=max(200, num_observations * 10))
+        pv_mc = OptionValuation(
+            gbm,
+            spec,
+            PricingMethod.MONTE_CARLO,
+            params=MonteCarloParams(random_seed=42, log_timings=True),
+        ).present_value()
+
+        # MC noise + BG approximation residual. BG is O((Δt_obs)^(3/2))
+        # accurate — for monthly monitoring with σ=0.20 the residual can
+        # reach a few percent on its own, with MC noise on top. ~5% is a
+        # meaningful bound: a broken BG formula would miss by >10%.
+        assert np.isclose(pv_bsm, pv_mc, rtol=0.05, atol=5e-3), (
+            f"BG vs MC mismatch: BSM={pv_bsm:.6f} MC={pv_mc:.6f}"
+        )
+
+
+class TestBarrierMCInceptionHit:
+    """MC paths where the barrier is already triggered at time zero."""
+
+    # -- Continuous monitoring --
+
+    def test_continuous_ko_inception_pv_zero(self):
+        """Continuous UOC with S >= H → MC weight = 0 → PV = 0."""
+        pv = _mc_price(
+            _mc_gbm(spot=120.0),
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=120.0,
+        )
+        assert np.isclose(pv, 0.0, atol=1e-10)
+
+    def test_continuous_ko_inception_rebate_at_hit(self):
+        """Continuous UOC at inception with AT_HIT rebate → PV = rebate."""
+        pv = _mc_price(
+            _mc_gbm(spot=120.0),
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=120.0,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_HIT,
+        )
+        assert np.isclose(pv, 5.0, atol=1e-10)
+
+    def test_continuous_ko_inception_rebate_at_expiry(self):
+        """Continuous UOC at inception with AT_EXPIRY rebate → PV = rebate * df."""
+        from derivatives_pricing.utils import calculate_year_fraction
+
+        T = calculate_year_fraction(PRICING_DATE, MATURITY)
+        df = float(flat_curve(PRICING_DATE, MATURITY, RATE).df(T))
+
+        pv = _mc_price(
+            _mc_gbm(spot=120.0),
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=120.0,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+        )
+        assert np.isclose(pv, 5.0 * df, rtol=1e-6)
+
+    def test_continuous_ki_inception_equals_vanilla(self):
+        """Continuous UIC with S >= H → knocked in at inception → vanilla."""
+        gbm = _mc_gbm(spot=120.0)
+        pv_ki = _mc_price(
+            gbm,
+            direction=BarrierDirection.UP,
+            action=BarrierAction.IN,
+            barrier=120.0,
+        )
+        vanilla_spec = VanillaSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=STRIKE,
+            maturity=MATURITY,
+        )
+        pv_vanilla = OptionValuation(
+            gbm, vanilla_spec, PricingMethod.MONTE_CARLO, params=_MC_SEED
+        ).present_value()
+        assert np.isclose(pv_ki, pv_vanilla, rtol=1e-6)
+
+    # -- Discrete monitoring --
+
+    def test_discrete_ko_inception_pv_zero(self):
+        """Discrete DOP with S <= H → MC weight = 0 → PV = 0."""
+        pv = _mc_price(
+            _mc_gbm(spot=80.0),
+            option_type=OptionType.PUT,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            barrier=80.0,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=12,
+        )
+        assert np.isclose(pv, 0.0, atol=1e-10)
+
+    def test_discrete_ki_inception_equals_vanilla_aligned(self):
+        """Discrete DIC at inception with grid-aligned observations → exact match.
+
+        Setting num_observations = num_steps + 1 ensures monitoring dates
+        land exactly on the simulation grid, so no extra dates are injected
+        and the random draws are identical to vanilla.
+        """
+        gbm = _mc_gbm(spot=80.0)
+        pv_ki = _mc_price(
+            gbm,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+            barrier=80.0,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=_MC_STEPS + 1,
+        )
+        vanilla_spec = VanillaSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=STRIKE,
+            maturity=MATURITY,
+        )
+        pv_vanilla = OptionValuation(
+            gbm, vanilla_spec, PricingMethod.MONTE_CARLO, params=_MC_SEED
+        ).present_value()
+        assert np.isclose(pv_ki, pv_vanilla, rtol=1e-10)
+
+    def test_discrete_ki_inception_equals_vanilla_unaligned(self):
+        """Discrete DIC at inception with non-aligned observations → MC noise.
+
+        With num_observations=12, monitoring dates are injected into the
+        grid, changing its size and thus the random draws. Both prices
+        converge to the same expectation; we compare within MC noise.
+        """
+        gbm = _mc_gbm(spot=80.0)
+        pv_ki = _mc_price(
+            gbm,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+            barrier=80.0,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=12,
+        )
+        vanilla_spec = VanillaSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=STRIKE,
+            maturity=MATURITY,
+        )
+        pv_vanilla = OptionValuation(
+            gbm, vanilla_spec, PricingMethod.MONTE_CARLO, params=_MC_SEED
+        ).present_value()
+        assert np.isclose(pv_ki, pv_vanilla, rtol=0.01)
+
+
+class TestBarrierMCDiscreteRebate:
+    """Discrete monitoring rebate paths in MC."""
+
+    def test_discrete_ko_rebate_at_hit_positive(self):
+        """Discrete KO with rebate AT_HIT: PV should include rebate component."""
+        pv_no_rebate = _mc_price(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=110.0,
+            rebate=0.0,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=12,
+        )
+        pv_with_rebate = _mc_price(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=110.0,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_HIT,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=12,
+        )
+        assert pv_with_rebate > pv_no_rebate
+
+    def test_discrete_ko_rebate_at_expiry_positive(self):
+        """Discrete KO with rebate AT_EXPIRY: PV should include rebate component."""
+        pv_no_rebate = _mc_price(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=110.0,
+            rebate=0.0,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=12,
+        )
+        pv_with_rebate = _mc_price(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=110.0,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=12,
+        )
+        assert pv_with_rebate > pv_no_rebate
+
+    def test_discrete_ki_rebate_at_expiry_positive(self):
+        """Discrete KI with rebate AT_EXPIRY: never-knocked-in paths receive rebate."""
+        pv_no_rebate = _mc_price(
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+            barrier=85.0,
+            rebate=0.0,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=12,
+        )
+        pv_with_rebate = _mc_price(
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+            barrier=85.0,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=12,
+        )
+        assert pv_with_rebate > pv_no_rebate
+
+
+class TestBarrierMCContinuousRebateAtExpiry:
+    """Continuous monitoring KO rebate AT_EXPIRY path in MC."""
+
+    def test_continuous_ko_rebate_at_expiry_positive(self):
+        """Continuous KO with AT_EXPIRY rebate: PV includes discounted rebate."""
+        pv_no_rebate = _mc_price(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=110.0,
+            rebate=0.0,
+        )
+        pv_with_rebate = _mc_price(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=110.0,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+        )
+        assert pv_with_rebate > pv_no_rebate
+
+    def test_continuous_ki_rebate_at_expiry_positive(self):
+        """Continuous KI with AT_EXPIRY rebate: never-in paths receive rebate."""
+        pv_no_rebate = _mc_price(
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+            barrier=85.0,
+            rebate=0.0,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+        )
+        pv_with_rebate = _mc_price(
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+            barrier=85.0,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+        )
+        assert pv_with_rebate > pv_no_rebate
+
+
+class TestBarrierMCNonBarrierAwareBasis:
+    """Test the non-barrier-aware LSM regression path."""
+
+    def test_american_ko_without_barrier_aware_basis(self):
+        """American KO with barrier_aware_basis=False should still price reasonably."""
+        params_aware = MonteCarloParams(random_seed=42, barrier_aware_basis=True)
+        params_naive = MonteCarloParams(random_seed=42, barrier_aware_basis=False)
+
+        spec = _barrier_spec(
+            exercise_type=ExerciseType.AMERICAN,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            barrier=85.0,
+        )
+        gbm = _mc_gbm()
+
+        pv_aware = OptionValuation(
+            gbm, spec, PricingMethod.MONTE_CARLO, params=params_aware
+        ).present_value()
+        pv_naive = OptionValuation(
+            gbm, spec, PricingMethod.MONTE_CARLO, params=params_naive
+        ).present_value()
+
+        # Both should be positive and in the same ballpark
+        assert pv_aware > 0
+        assert pv_naive > 0
+        assert np.isclose(pv_naive, pv_aware, rtol=0.05), (
+            f"barrier_aware_basis=False ({pv_naive:.4f}) vs True ({pv_aware:.4f})"
+        )

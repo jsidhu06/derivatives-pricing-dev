@@ -6,7 +6,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/derivatives_pricing)](https://pypi.org/project/derivatives-pricing/)
 
 A Python package for options pricing and Greeks computation, with a unified API
-across analytical, binomial tree, PDE, and Monte Carlo methods.
+across analytical, binomial tree, finite difference and Monte Carlo methods.
 
 Built for teaching, research, and production-adjacent workflows.
 
@@ -16,29 +16,32 @@ Built for teaching, research, and production-adjacent workflows.
 
 ### Pricing Coverage
 
-| | Vanilla | | Asian | | Custom | |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Method** | **European** | **American** | **European** | **American** | **European** | **American** |
-| BSM | ✅ | — | ✅ | — | — | — |
-| Binomial | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| PDE | ✅ | ✅ | — | — | ✅ | ✅ |
-| Monte Carlo | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| | Vanilla | Asian | Barrier | Custom |
+|---|:---:|:---:|:---:|:---:|
+| BSM | E | E | E | — |
+| Binomial | E/A | E/A | E/A | E/A |
+| PDE_FD | E/A | — | E/A | E/A |
+| Monte Carlo | E/A | E/A | E/A | E/A |
+
+E = European, A = American
 
 **Method details:** BSM uses closed-form Black-Scholes-Merton; Binomial uses Cox-Ross-Rubinstein trees;
-PDE supports implicit, explicit, and Crank-Nicolson finite difference schemes;
+PDE_FD uses implicit, explicit, and Crank-Nicolson finite difference schemes;
 Monte Carlo uses Longstaff-Schwartz for American-style exercise.
 Asian analytical pricing uses Turnbull-Wakeman (arithmetic) and Kemna-Vorst (geometric),
-with Hull averaging on binomial trees.
+with Hull averaging on binomial trees. Barrier pricing supports continuous and discrete monitoring,
+knock-in and knock-out structures, and rebates.
 
 ---
 
 ### Additional Capabilities
 
 - **Greeks** — analytical, tree, grid, pathwise, likelihood-ratio, and numerical bump-and-revalue (delta, gamma, vega, theta, rho)
-- **Implied volatility** — Newton-Raphson, Bisection, and Brent solvers with arbitrage-bounds checking
+- **Implied volatility** — Newton-Raphson, bisection, and Brent solvers with arbitrage-bounds checking
 - **Stochastic processes** — Geometric Brownian Motion, Jump Diffusion (Merton), Square-Root Diffusion (CIR)
 - **Discount curves** — log-linear interpolation on arbitrary term structures; deterministic time-varying forward rate and dividend curves
 - **Discrete dividends** — supported across all pricing methods
+- **Barrier options** — continuous and discrete monitoring, knock-in/knock-out, rebates (at-hit and at-expiry)
 - **Control variates** — European analytical control variates for American pricing variance reduction
 - **Custom payoffs** — user-defined payoff functions via `PayoffSpec`
 
@@ -46,8 +49,9 @@ with Hull averaging on binomial trees.
 
 ## Why derivatives-pricing?
 
-- Consistent API across analytical, tree, PDE, and Monte Carlo methods  
+- Consistent API across analytical, tree, finite difference, and Monte Carlo methods  
 - Designed for transparency and clarity of implementation  
+- Includes vanilla, Asian, barrier, and custom-payoff workflows behind the same facade  
 - Suitable for teaching, experimentation, research, and production-adjacent workflows  
 - Extensible architecture for new models and payoffs  
 
@@ -59,7 +63,7 @@ Install from PyPI:
 
 ```bash
 pip install derivatives-pricing
-# or pip install derivatives-pricing[numba] for optional PDE solver acceleration
+# or pip install derivatives-pricing[numba] for optional PDE_FD solver acceleration
 ```
 
 For development:
@@ -103,15 +107,16 @@ print(f"{'Delta:':<8} {val.delta():>10.4f}")
 The repo includes two companion directories:
 
 - **`examples/`** — concise notebooks showing how to call the public API for each feature
-  (European options, Americans, PDE, Asian, Greeks, jump diffusion, discount curves).
+  (European options, Americans, barriers, PDE_FD, Asian, Greeks, jump diffusion, discount curves).
 - **`tutorials/`** — deeper walkthroughs that teach the theory behind each pricing method
-  (BSM, binomial trees, finite differences, Monte Carlo, Asian averaging).
+  (BSM, binomial trees, finite differences, Monte Carlo, Asian averaging, barrier pricing).
   Tutorials may access private/internal classes for demonstration purposes.
 
 ## Tests
 
 ```bash
 pytest -q
+# or pytest -q --runslow (to include slow tests)
 ```
 
 ## Project Structure
@@ -126,14 +131,15 @@ src/derivatives_pricing/
 ├── utils.py                  # Day-count, forward price, put-call parity
 ├── valuation/
 │   ├── asian_analytical.py   # Turnbull-Wakeman, Kemna-Vorst
+│   ├── barrier_analytical.py # Analytical barrier pricing
 │   ├── binomial.py           # Cox-Ross-Rubinstein tree
 │   ├── bsm.py                # Closed-form Black-Scholes-Merton
-│   ├── contracts.py          # VanillaSpec, PayoffSpec, AsianSpec
+│   ├── contracts.py          # VanillaSpec, BarrierSpec, PayoffSpec, AsianSpec
 │   ├── core.py               # OptionValuation facade, UnderlyingData
 │   ├── implied_volatility.py # IV solver
-│   ├── monte_carlo.py        # Monte Carlo with Longstaff-Schwartz
+│   ├── monte_carlo.py        # Monte Carlo with Longstaff-Schwartz and barrier pricing
 │   ├── params.py             # MonteCarloParams, BinomialParams, PDEParams
-│   └── pde.py                # Finite difference (implicit, explicit, Crank-Nicolson)
+│   └── pde.py                # Finite difference (implicit, explicit, Crank-Nicolson, barriers)
 tests/                        # Test suite
 examples/                     # API usage notebooks
 tutorials/                    # Theory deep-dive notebooks
@@ -141,7 +147,7 @@ tutorials/                    # Theory deep-dive notebooks
 
 ## Roadmap
 
-Planned: barrier options, stochastic volatility models.
+Planned: stochastic volatility models.
 
 Found a bug or have a feature request? [Open an issue](https://github.com/jsidhu06/derivatives-pricing/issues).
 
