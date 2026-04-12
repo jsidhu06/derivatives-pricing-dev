@@ -889,99 +889,6 @@ class TestBarrierDiscreteMonitoring:
 
 
 # ===========================================================================
-# Discrete monitoring — BG-corrected analytical vs pathwise MC cross-check
-# ===========================================================================
-# The BSM discrete-monitoring path applies the Broadie-Glasserman-Kou
-# continuity correction to the continuous closed-form (shift the effective
-# barrier by β·σ·√Δt). The MC path explicitly checks the barrier at each
-# monitoring date on simulated paths — structurally unrelated to BG. If the
-# BG formula is wrong, these two will disagree.
-
-
-def _mc_gbm(
-    spot: float = SPOT,
-    vol: float = VOL,
-    market_data: MarketData | None = None,
-    dividend_curve: DiscountCurve | None = None,
-    paths: int = 200_000,
-    num_steps: int = 252,
-) -> GBMProcess:
-    if market_data is None:
-        market_data = _market_data()
-    return GBMProcess(
-        market_data,
-        GBMParams(initial_value=spot, volatility=vol, dividend_curve=dividend_curve),
-        SimulationConfig(paths=paths, num_steps=num_steps, end_date=MATURITY),
-    )
-
-
-class TestBarrierDiscreteBGvsMC:
-    """Cross-validate the BG continuity correction against pathwise MC."""
-
-    @pytest.mark.slow
-    @pytest.mark.parametrize(
-        "option_type,direction,action,barrier,num_observations",
-        [
-            pytest.param(
-                OptionType.CALL,
-                BarrierDirection.UP,
-                BarrierAction.OUT,
-                120.0,
-                12,
-                id="up_out_call_monthly",
-            ),
-            pytest.param(
-                OptionType.PUT,
-                BarrierDirection.DOWN,
-                BarrierAction.OUT,
-                80.0,
-                12,
-                id="down_out_put_monthly",
-            ),
-            pytest.param(
-                OptionType.CALL,
-                BarrierDirection.UP,
-                BarrierAction.IN,
-                120.0,
-                24,
-                id="up_in_call_biweekly",
-            ),
-        ],
-    )
-    def test_bg_analytical_matches_mc_pathwise(
-        self, option_type, direction, action, barrier, num_observations
-    ):
-        """BSM (BG-corrected analytical) ≈ MC (pathwise checks) for
-        discrete-monitoring barriers. The two implementations are
-        structurally unrelated — agreement validates the BG formula."""
-        spec = _barrier_spec(
-            option_type=option_type,
-            direction=direction,
-            action=action,
-            barrier=barrier,
-            monitoring=BarrierMonitoring.DISCRETE,
-            num_observations=num_observations,
-        )
-        pv_bsm = OptionValuation(_underlying(), spec, PricingMethod.BSM).present_value()
-
-        gbm = _mc_gbm(num_steps=max(200, num_observations * 10))
-        pv_mc = OptionValuation(
-            gbm,
-            spec,
-            PricingMethod.MONTE_CARLO,
-            params=MonteCarloParams(random_seed=42, log_timings=True),
-        ).present_value()
-
-        # MC noise + BG approximation residual. BG is O((Δt_obs)^(3/2))
-        # accurate — for monthly monitoring with σ=0.20 the residual can
-        # reach a few percent on its own, with MC noise on top. ~5% is a
-        # meaningful bound: a broken BG formula would miss by >10%.
-        assert np.isclose(pv_bsm, pv_mc, rtol=0.05, atol=5e-3), (
-            f"BG vs MC mismatch: BSM={pv_bsm:.6f} MC={pv_mc:.6f}"
-        )
-
-
-# ===========================================================================
 # Greeks (NUMERICAL only)
 # ===========================================================================
 
@@ -1208,17 +1115,30 @@ _MC_SEED = MonteCarloParams(random_seed=42)
 _MC_PATHS = 50_000
 _MC_STEPS = 200
 
+# ===========================================================================
+# Discrete monitoring — BG-corrected analytical vs MC cross-check
+# ===========================================================================
+# The BSM discrete-monitoring path applies the Broadie-Glasserman-Kou
+# continuity correction to the continuous closed-form (shift the effective
+# barrier by β·σ·√Δt). The MC path explicitly checks the barrier at each
+# monitoring date on simulated paths — structurally unrelated to BG. If the
+# BG formula is wrong, these two will disagree.
+
 
 def _mc_gbm(
     spot: float = SPOT,
     vol: float = VOL,
+    market_data: MarketData | None = None,
     dividend_curve: DiscountCurve | None = None,
+    paths: int = _MC_PATHS,
+    num_steps: int = _MC_STEPS,
 ) -> GBMProcess:
-    md = _market_data()
+    if market_data is None:
+        market_data = _market_data()
     return GBMProcess(
-        md,
+        market_data,
         GBMParams(initial_value=spot, volatility=vol, dividend_curve=dividend_curve),
-        SimulationConfig(paths=_MC_PATHS, end_date=MATURITY, num_steps=_MC_STEPS),
+        SimulationConfig(paths=paths, num_steps=num_steps, end_date=MATURITY),
     )
 
 
@@ -1233,6 +1153,72 @@ def _mc_price(
     if spec is None:
         spec = _barrier_spec(**spec_kw)
     return OptionValuation(gbm, spec, PricingMethod.MONTE_CARLO, params=params).present_value()
+
+
+class TestBarrierDiscreteBGvsMC:
+    """Cross-validate the BG continuity correction against pathwise MC."""
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize(
+        "option_type,direction,action,barrier,num_observations",
+        [
+            pytest.param(
+                OptionType.CALL,
+                BarrierDirection.UP,
+                BarrierAction.OUT,
+                120.0,
+                60,
+                id="up_out_call_monthly",
+            ),
+            pytest.param(
+                OptionType.PUT,
+                BarrierDirection.DOWN,
+                BarrierAction.OUT,
+                80.0,
+                60,
+                id="down_out_put_monthly",
+            ),
+            pytest.param(
+                OptionType.CALL,
+                BarrierDirection.UP,
+                BarrierAction.IN,
+                120.0,
+                50,
+                id="up_in_call_biweekly",
+            ),
+        ],
+    )
+    def test_bg_analytical_matches_mc_pathwise(
+        self, option_type, direction, action, barrier, num_observations
+    ):
+        """BSM (BG-corrected analytical) ≈ MC (pathwise checks) for
+        discrete-monitoring barriers. The two implementations are
+        structurally unrelated — agreement validates the BG formula."""
+        spec = _barrier_spec(
+            option_type=option_type,
+            direction=direction,
+            action=action,
+            barrier=barrier,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=num_observations,
+        )
+        pv_bsm = OptionValuation(_underlying(), spec, PricingMethod.BSM).present_value()
+
+        gbm = _mc_gbm(num_steps=max(200, num_observations * 10))
+        pv_mc = OptionValuation(
+            gbm,
+            spec,
+            PricingMethod.MONTE_CARLO,
+            params=MonteCarloParams(random_seed=42, log_timings=True),
+        ).present_value()
+
+        # MC noise + BG approximation residual. BG is O((Δt_obs)^(3/2))
+        # accurate — for monthly monitoring with σ=0.20 the residual can
+        # reach a few percent on its own, with MC noise on top. ~5% is a
+        # meaningful bound: a broken BG formula would miss by >10%.
+        assert np.isclose(pv_bsm, pv_mc, rtol=0.05, atol=5e-3), (
+            f"BG vs MC mismatch: BSM={pv_bsm:.6f} MC={pv_mc:.6f}"
+        )
 
 
 class TestBarrierMCInceptionHit:
