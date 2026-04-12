@@ -7,6 +7,7 @@ that explicitly documents the configuration options available for that method.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace as dc_replace
+from typing import Any
 import warnings
 
 from ..enums import PDEEarlyExercise, PDEMethod, PDESpaceGrid
@@ -131,7 +132,7 @@ class BinomialParams:
     log_timings: bool = False
 
     @classmethod
-    def for_barriers(cls, **overrides: object) -> BinomialParams:
+    def for_barriers(cls, **overrides: Any) -> BinomialParams:
         """Create params that mirror the library's internal barrier defaults.
 
         Returns a ``BinomialParams`` instance with higher step count suitable
@@ -247,7 +248,7 @@ class PDEParams:
     log_timings: bool = False
 
     @classmethod
-    def for_barriers(cls, **overrides: object) -> PDEParams:
+    def for_barriers(cls, **overrides: Any) -> PDEParams:
         """Create params that mirror the library's internal barrier defaults.
 
         Returns a ``PDEParams`` instance with a finer grid and log-spot
