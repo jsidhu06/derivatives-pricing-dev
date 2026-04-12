@@ -37,7 +37,6 @@ from ..enums import (
     ExerciseType,
     PricingMethod,
     GreekCalculationMethod,
-    PDESpaceGrid,
 )
 from .monte_carlo import (
     _MCEuropeanValuation,
@@ -823,16 +822,9 @@ class OptionValuation:
             if pricing_method is PricingMethod.MONTE_CARLO:
                 return MonteCarloParams()
             if pricing_method is PricingMethod.BINOMIAL:
-                # Barriers need finer grids for accurate barrier placement
-                return BinomialParams(num_steps=1000) if is_barrier else BinomialParams()
+                return BinomialParams.for_barriers() if is_barrier else BinomialParams()
             if pricing_method is PricingMethod.PDE_FD:
-                if is_barrier:
-                    return PDEParams(
-                        spot_steps=2400,
-                        time_steps=800,
-                        space_grid=PDESpaceGrid.LOG_SPOT,
-                    )
-                return PDEParams()
+                return PDEParams.for_barriers() if is_barrier else PDEParams()
             return None
 
         if pricing_method is PricingMethod.MONTE_CARLO:
