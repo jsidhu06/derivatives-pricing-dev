@@ -255,6 +255,42 @@ def _year_fractions(
     )
 
 
+def _is_pricing_time(
+    pricing_date,
+    current_time,
+    day_count_convention: DayCountConvention,
+) -> bool:
+    """Return whether *current_time* is effectively equal to *pricing_date*."""
+    t = calculate_year_fraction(
+        pricing_date,
+        current_time,
+        day_count_convention=day_count_convention,
+    )
+    return abs(t) <= 1.0 / (_YEAR_DAYS[day_count_convention] * 86400)
+
+
+def _time_zero_lsm_value(
+    discounted_continuation: np.ndarray,
+    *,
+    immediate_exercise: float | None,
+) -> np.ndarray:
+    """Return the time-zero LSM value.
+
+    At t=0 the spot is identical across all paths, so the immediate intrinsic
+    is a scalar and the LSM continuation estimate is the *mean* of discounted
+    next-step values.  The exercise decision compares those two scalars.
+
+    - Exercise → all paths take the constant intrinsic.
+    - Don't exercise → each path keeps its own discounted next-step value
+    """
+    if immediate_exercise is None:
+        return discounted_continuation.astype(float, copy=True)
+    continuation_0 = float(np.mean(discounted_continuation))
+    if immediate_exercise > continuation_0:
+        return np.full_like(discounted_continuation, immediate_exercise, dtype=float)
+    return discounted_continuation.astype(float, copy=True)
+
+
 class _MCValuationBase:
     """Common base for all Monte Carlo valuation engines."""
 
@@ -665,7 +701,8 @@ class _MCAmericanValuation(_MCValuationBase):
             )
 
         df0 = discount_factors[1] / discount_factors[0]
-        return df0 * values[1]
+        immediate_0 = float(np.mean(intrinsic_values[0]))
+        return _time_zero_lsm_value(df0 * values[1], immediate_exercise=immediate_0)
 
 
 class _MCAsianBase(_MCValuationBase):
@@ -1011,13 +1048,19 @@ class _MCAsianAmericanValuation(_MCAsianBase):
         num_fixings = averaging_paths.shape[0]
         n_paths = averaging_paths.shape[1]
         deg = self.mc_params.deg
+        first_fixing_is_pricing_date = _is_pricing_time(
+            self.valuation_ctx.pricing_date,
+            time_list[0],
+            self.underlying.day_count_convention,
+        )
 
         # Terminal payoff
         values = np.zeros((num_fixings, n_paths))
         values[-1] = intrinsic[-1]
 
         # Backward induction
-        for t in range(num_fixings - 2, 0, -1):
+        stop = 0 if first_fixing_is_pricing_date else -1
+        for t in range(num_fixings - 2, stop, -1):
             df_step = discount_factors[t + 1] / discount_factors[t]
             itm = intrinsic[t] > 0
 
@@ -1038,8 +1081,12 @@ class _MCAsianAmericanValuation(_MCAsianBase):
                 df_step * values[t + 1],
             )
 
-        df0 = discount_factors[1] / discount_factors[0]
-        return df0 * values[1]
+        if first_fixing_is_pricing_date:
+            df0 = discount_factors[1] / discount_factors[0]
+            immediate_0 = float(np.mean(intrinsic[0]))
+            return _time_zero_lsm_value(df0 * values[1], immediate_exercise=immediate_0)
+
+        return discount_factors[0] * values[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1799,7 +1846,22 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
             day_count_convention=self.underlying.day_count_convention,
         )
         discount_factors = self.valuation_ctx.discount_curve.df(t_grid)
-        n_times = spot_paths.shape[0]
+        n_times, n_paths = spot_paths.shape
+        hit_at_inception = bool(ever_hit[0, 0])
+
+        # KO triggered at inception: option is dead, no exercise possible.
+        # Mirrors the European short-circuit; rebate (if any) is paid per
+        # the rebate_timing rule.  Bypasses the LSM backward induction.
+        if self.spec.action is BarrierAction.OUT and hit_at_inception:
+            rebate = float(self.spec.rebate)
+            if rebate <= 0.0:
+                value_0 = 0.0
+            elif self.spec.rebate_timing is RebateTiming.AT_HIT:
+                value_0 = rebate
+            else:
+                value_0 = rebate * float(discount_factors[-1])
+            return np.full(n_paths, value_0, dtype=float)
+
         values = self._initial_barrier_values(intrinsic, ever_hit)
 
         # Backward induction
@@ -1824,8 +1886,15 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
                     discount_factors=discount_factors,
                 )
 
+        # t=0: compare expected continuation against immediate exercise.
+        # KI is only exercisable if already triggered at inception; otherwise
+        # there is no immediate-exercise option (continuation only).
         df0 = discount_factors[1] / discount_factors[0]
-        return df0 * values[1]
+        if self.spec.action is BarrierAction.IN and not hit_at_inception:
+            immediate_0 = None
+        else:
+            immediate_0 = float(np.mean(intrinsic[0]))
+        return _time_zero_lsm_value(df0 * values[1], immediate_exercise=immediate_0)
 
     def present_value(self) -> float:
         """Calculate PV using Longstaff-Schwartz MC for American barrier option."""

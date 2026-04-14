@@ -1221,25 +1221,36 @@ class TestBarrierDiscreteBGvsMC:
         )
 
 
+_EXERCISE_TYPES = [ExerciseType.EUROPEAN, ExerciseType.AMERICAN]
+
+
+@pytest.mark.parametrize("exercise_type", _EXERCISE_TYPES)
 class TestBarrierMCInceptionHit:
-    """MC paths where the barrier is already triggered at time zero."""
+    """MC paths where the barrier is already triggered at time zero.
+
+    Inception-hit semantics are identical for European and American exercise
+    (option is dead/active at t=0; no exercise decisions yet matter), so each
+    test is parametrized over both exercise types.
+    """
 
     # -- Continuous monitoring --
 
-    def test_continuous_ko_inception_pv_zero(self):
+    def test_continuous_ko_inception_pv_zero(self, exercise_type):
         """Continuous UOC with S >= H → MC weight = 0 → PV = 0."""
         pv = _mc_price(
             _mc_gbm(spot=120.0),
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=120.0,
         )
         assert np.isclose(pv, 0.0, atol=1e-10)
 
-    def test_continuous_ko_inception_rebate_at_hit(self):
+    def test_continuous_ko_inception_rebate_at_hit(self, exercise_type):
         """Continuous UOC at inception with AT_HIT rebate → PV = rebate."""
         pv = _mc_price(
             _mc_gbm(spot=120.0),
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=120.0,
@@ -1248,7 +1259,7 @@ class TestBarrierMCInceptionHit:
         )
         assert np.isclose(pv, 5.0, atol=1e-10)
 
-    def test_continuous_ko_inception_rebate_at_expiry(self):
+    def test_continuous_ko_inception_rebate_at_expiry(self, exercise_type):
         """Continuous UOC at inception with AT_EXPIRY rebate → PV = rebate * df."""
         from derivatives_pricing.utils import calculate_year_fraction
 
@@ -1257,6 +1268,7 @@ class TestBarrierMCInceptionHit:
 
         pv = _mc_price(
             _mc_gbm(spot=120.0),
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=120.0,
@@ -1265,18 +1277,19 @@ class TestBarrierMCInceptionHit:
         )
         assert np.isclose(pv, 5.0 * df, rtol=1e-6)
 
-    def test_continuous_ki_inception_equals_vanilla(self):
+    def test_continuous_ki_inception_equals_vanilla(self, exercise_type):
         """Continuous UIC with S >= H → knocked in at inception → vanilla."""
         gbm = _mc_gbm(spot=120.0)
         pv_ki = _mc_price(
             gbm,
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.IN,
             barrier=120.0,
         )
         vanilla_spec = VanillaSpec(
             option_type=OptionType.CALL,
-            exercise_type=ExerciseType.EUROPEAN,
+            exercise_type=exercise_type,
             strike=STRIKE,
             maturity=MATURITY,
         )
@@ -1287,11 +1300,12 @@ class TestBarrierMCInceptionHit:
 
     # -- Discrete monitoring --
 
-    def test_discrete_ko_inception_pv_zero(self):
+    def test_discrete_ko_inception_pv_zero(self, exercise_type):
         """Discrete DOP with S <= H → MC weight = 0 → PV = 0."""
         pv = _mc_price(
             _mc_gbm(spot=80.0),
             option_type=OptionType.PUT,
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.OUT,
             barrier=80.0,
@@ -1300,7 +1314,7 @@ class TestBarrierMCInceptionHit:
         )
         assert np.isclose(pv, 0.0, atol=1e-10)
 
-    def test_discrete_ki_inception_equals_vanilla_aligned(self):
+    def test_discrete_ki_inception_equals_vanilla_aligned(self, exercise_type):
         """Discrete DIC at inception with grid-aligned observations → exact match.
 
         Setting num_observations = num_steps + 1 ensures monitoring dates
@@ -1310,6 +1324,7 @@ class TestBarrierMCInceptionHit:
         gbm = _mc_gbm(spot=80.0)
         pv_ki = _mc_price(
             gbm,
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.IN,
             barrier=80.0,
@@ -1318,7 +1333,7 @@ class TestBarrierMCInceptionHit:
         )
         vanilla_spec = VanillaSpec(
             option_type=OptionType.CALL,
-            exercise_type=ExerciseType.EUROPEAN,
+            exercise_type=exercise_type,
             strike=STRIKE,
             maturity=MATURITY,
         )
@@ -1327,7 +1342,7 @@ class TestBarrierMCInceptionHit:
         ).present_value()
         assert np.isclose(pv_ki, pv_vanilla, rtol=1e-10)
 
-    def test_discrete_ki_inception_equals_vanilla_unaligned(self):
+    def test_discrete_ki_inception_equals_vanilla_unaligned(self, exercise_type):
         """Discrete DIC at inception with non-aligned observations → MC noise.
 
         With num_observations=12, monitoring dates are injected into the
@@ -1337,6 +1352,7 @@ class TestBarrierMCInceptionHit:
         gbm = _mc_gbm(spot=80.0)
         pv_ki = _mc_price(
             gbm,
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.IN,
             barrier=80.0,
@@ -1345,7 +1361,7 @@ class TestBarrierMCInceptionHit:
         )
         vanilla_spec = VanillaSpec(
             option_type=OptionType.CALL,
-            exercise_type=ExerciseType.EUROPEAN,
+            exercise_type=exercise_type,
             strike=STRIKE,
             maturity=MATURITY,
         )
@@ -1355,12 +1371,14 @@ class TestBarrierMCInceptionHit:
         assert np.isclose(pv_ki, pv_vanilla, rtol=0.01)
 
 
+@pytest.mark.parametrize("exercise_type", _EXERCISE_TYPES)
 class TestBarrierMCDiscreteRebate:
     """Discrete monitoring rebate paths in MC."""
 
-    def test_discrete_ko_rebate_at_hit_positive(self):
+    def test_discrete_ko_rebate_at_hit_positive(self, exercise_type):
         """Discrete KO with rebate AT_HIT: PV should include rebate component."""
         pv_no_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=110.0,
@@ -1369,6 +1387,7 @@ class TestBarrierMCDiscreteRebate:
             num_observations=12,
         )
         pv_with_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=110.0,
@@ -1379,9 +1398,10 @@ class TestBarrierMCDiscreteRebate:
         )
         assert pv_with_rebate > pv_no_rebate
 
-    def test_discrete_ko_rebate_at_expiry_positive(self):
+    def test_discrete_ko_rebate_at_expiry_positive(self, exercise_type):
         """Discrete KO with rebate AT_EXPIRY: PV should include rebate component."""
         pv_no_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=110.0,
@@ -1390,6 +1410,7 @@ class TestBarrierMCDiscreteRebate:
             num_observations=12,
         )
         pv_with_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=110.0,
@@ -1400,9 +1421,10 @@ class TestBarrierMCDiscreteRebate:
         )
         assert pv_with_rebate > pv_no_rebate
 
-    def test_discrete_ki_rebate_at_expiry_positive(self):
+    def test_discrete_ki_rebate_at_expiry_positive(self, exercise_type):
         """Discrete KI with rebate AT_EXPIRY: never-knocked-in paths receive rebate."""
         pv_no_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.IN,
             barrier=85.0,
@@ -1412,6 +1434,7 @@ class TestBarrierMCDiscreteRebate:
             num_observations=12,
         )
         pv_with_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.IN,
             barrier=85.0,
@@ -1423,18 +1446,21 @@ class TestBarrierMCDiscreteRebate:
         assert pv_with_rebate > pv_no_rebate
 
 
+@pytest.mark.parametrize("exercise_type", _EXERCISE_TYPES)
 class TestBarrierMCContinuousRebateAtExpiry:
     """Continuous monitoring KO rebate AT_EXPIRY path in MC."""
 
-    def test_continuous_ko_rebate_at_expiry_positive(self):
+    def test_continuous_ko_rebate_at_expiry_positive(self, exercise_type):
         """Continuous KO with AT_EXPIRY rebate: PV includes discounted rebate."""
         pv_no_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=110.0,
             rebate=0.0,
         )
         pv_with_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=110.0,
@@ -1443,9 +1469,10 @@ class TestBarrierMCContinuousRebateAtExpiry:
         )
         assert pv_with_rebate > pv_no_rebate
 
-    def test_continuous_ki_rebate_at_expiry_positive(self):
+    def test_continuous_ki_rebate_at_expiry_positive(self, exercise_type):
         """Continuous KI with AT_EXPIRY rebate: never-in paths receive rebate."""
         pv_no_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.IN,
             barrier=85.0,
@@ -1453,6 +1480,7 @@ class TestBarrierMCContinuousRebateAtExpiry:
             rebate_timing=RebateTiming.AT_EXPIRY,
         )
         pv_with_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.IN,
             barrier=85.0,
