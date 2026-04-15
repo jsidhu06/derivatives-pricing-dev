@@ -456,7 +456,7 @@ class _AnalyticalBarrierValuation:
         q = -np.log(df_q) / T
 
         # ── Check if barrier already triggered at inception ──
-        if _is_triggered(S, H, spec.direction):
+        if ctx._barrier_observed_at_inception():
             return self._triggered_at_inception(df_r, spec)
 
         # ── Discrete monitoring: Broadie-Glasserman adjustment ──

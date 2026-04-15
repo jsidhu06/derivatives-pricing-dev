@@ -58,7 +58,6 @@ from ..exceptions import (
 )
 from .contracts import BarrierSpec, PayoffSpec, PayoffBoundaryModel, VanillaSpec, WingBoundary
 from .params import PDEParams
-from .barrier_analytical import _is_triggered
 
 if TYPE_CHECKING:
     from .core import OptionValuation, UnderlyingData
@@ -2511,21 +2510,11 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         assert isinstance(valuation_ctx.params, PDEParams)
         self.pde_params = valuation_ctx.params
 
-    def _is_triggered_at_inception(self) -> bool:
-        spot = float(self.underlying.initial_value)
-        barrier = float(self._spec.barrier)
-        if not _is_triggered(spot, barrier, self._spec.direction):
-            return False
-
-        if self._spec.monitoring is BarrierMonitoring.CONTINUOUS:
-            return True
-
-        monitoring_dates = self.valuation_ctx._barrier_monitoring_dates()
-        assert monitoring_dates is not None
-        return any(date == self.valuation_ctx.pricing_date for date in monitoring_dates)
-
     def _resolved_knock_out_value(self) -> float | None:
-        if self._spec.action is not BarrierAction.OUT or not self._is_triggered_at_inception():
+        if (
+            self._spec.action is not BarrierAction.OUT
+            or not self.valuation_ctx._barrier_observed_at_inception()
+        ):
             return None
 
         if self._spec.rebate <= 0.0:
@@ -2706,7 +2695,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
     def delta(self) -> float:
         spec = self._spec
-        if self._is_triggered_at_inception():
+        if self.valuation_ctx._barrier_observed_at_inception():
             if spec.action is BarrierAction.OUT:
                 return 0.0
             return self._vanilla_equivalent_valuation().delta(greek_calc_method=None)
@@ -2723,7 +2712,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
     def gamma(self) -> float:
         """Return grid gamma, using native-surface parity for European KI barriers."""
         spec = self._spec
-        if self._is_triggered_at_inception():
+        if self.valuation_ctx._barrier_observed_at_inception():
             if spec.action is BarrierAction.OUT:
                 return 0.0
             return self._vanilla_equivalent_valuation().gamma(greek_calc_method=None)
@@ -2739,7 +2728,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
     def theta(self) -> float:
         spec = self._spec
-        if self._is_triggered_at_inception():
+        if self.valuation_ctx._barrier_observed_at_inception():
             if spec.action is BarrierAction.OUT:
                 return self._resolved_knock_out_theta()
             return self._vanilla_equivalent_valuation().theta(greek_calc_method=None)
@@ -2794,7 +2783,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
     def present_value(self) -> float:
         """Return present value from the PDE barrier solve."""
-        if self._is_triggered_at_inception():
+        if self.valuation_ctx._barrier_observed_at_inception():
             if self._spec.action is BarrierAction.OUT:
                 triggered_value = self._resolved_knock_out_value()
                 if triggered_value is None:

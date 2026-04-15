@@ -54,7 +54,7 @@ from .binomial import (
 )
 from .bsm import _BSMEuropeanValuation
 from .asian_analytical import _AnalyticalAsianValuation
-from .barrier_analytical import _AnalyticalBarrierValuation
+from .barrier_analytical import _AnalyticalBarrierValuation, _is_triggered
 from .pde import _FDEuropeanValuation, _FDAmericanValuation, _FDBarrierValuation
 from ..rates import DiscountCurve
 from ..market_environment import MarketData
@@ -890,6 +890,28 @@ class OptionValuation:
                 periods=spec.num_observations,
             ).to_pydatetime()
         )
+
+    def _barrier_observed_at_inception(self) -> bool:
+        """Return ``True`` only if the barrier has been hit AND that hit is
+        observable at the pricing date.
+
+        Continuous monitoring treats every instant as an observation, so a
+        spot past the barrier at ``t=0`` is an immediate trigger.  Discrete
+        monitoring only observes the barrier at explicit monitoring dates;
+        the pricing date qualifies only if it appears in that schedule.
+        """
+        assert isinstance(self._spec, BarrierSpec), (
+            "_barrier_observed_at_inception called on non-BarrierSpec valuation; "
+            "the dispatcher should route BarrierSpecs to barrier engines only."
+        )
+        spot = float(self._underlying.initial_value)
+        if not _is_triggered(spot, self._spec.barrier, self._spec.direction):
+            return False
+        if self._spec.monitoring is BarrierMonitoring.CONTINUOUS:
+            return True
+        mon_dates = self._barrier_monitoring_dates()
+        assert mon_dates is not None
+        return any(d == self.pricing_date for d in mon_dates)
 
     def _apply_control_variate(self, base_pv: float) -> float:
         """Apply European control-variate adjustment to American base PV.

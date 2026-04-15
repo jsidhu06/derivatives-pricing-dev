@@ -988,19 +988,11 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         present_value().
         """
         if self.spec.action is BarrierAction.OUT:
-            if _is_triggered(
-                float(self.underlying.initial_value),
-                float(self.spec.barrier),
-                self.spec.direction,
-            ):
+            if self.valuation_ctx._barrier_observed_at_inception():
                 return self._resolved_knock_out_lattice()
             return self._solve_knock_out(early_exercise=early_exercise)
 
-        if _is_triggered(
-            float(self.underlying.initial_value),
-            float(self.spec.barrier),
-            self.spec.direction,
-        ):
+        if self.valuation_ctx._barrier_observed_at_inception():
             return self._solve_backward(early_exercise=early_exercise)
 
         _, inactive = self._solve_knock_in(early_exercise=early_exercise)
@@ -1143,11 +1135,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         return active, inactive
 
     def _initial_value_if_triggered(self, *, early_exercise: bool) -> float | None:
-        if not _is_triggered(
-            float(self.underlying.initial_value),
-            float(self.spec.barrier),
-            self.spec.direction,
-        ):
+        if not self.valuation_ctx._barrier_observed_at_inception():
             return None
 
         if self.spec.action is BarrierAction.OUT:

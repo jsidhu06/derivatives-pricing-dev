@@ -25,7 +25,6 @@ from ..exceptions import (
     ValidationError,
 )
 from .params import MonteCarloParams
-from .barrier_analytical import _is_triggered
 
 
 if TYPE_CHECKING:
@@ -1382,7 +1381,6 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
         direction = self.spec.direction
         action = self.spec.action
         sigma = float(self.underlying.volatility)
-        spot0 = float(self.underlying.initial_value)
         n_paths = paths.shape[1]
 
         payoff = _vanilla_payoff(self.spec.option_type, K, paths[time_index_end])
@@ -1394,7 +1392,7 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
         )
         discount_factors = self.valuation_ctx.discount_curve.df(t_grid)
 
-        inception_hit = _is_triggered(spot0, H, direction)
+        inception_hit = self.valuation_ctx._barrier_observed_at_inception()
 
         monitoring_idx = self._monitoring_idx(time_grid)
         monitoring_idx = monitoring_idx[monitoring_idx <= time_index_end]
@@ -1763,7 +1761,6 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
         H = float(self.spec.barrier)
         direction = self.spec.direction
         sigma = float(self.underlying.volatility)
-        spot0 = float(self.underlying.initial_value)
 
         is_continuous = self.spec.monitoring is BarrierMonitoring.CONTINUOUS
         time_deltas = self.underlying._time_deltas()
@@ -1779,7 +1776,7 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
         ever_hit = np.zeros((n_times, n_paths), dtype=bool)
         first_hit_step = np.full(n_paths, -1, dtype=int)
 
-        if _is_triggered(spot0, H, direction):
+        if self.valuation_ctx._barrier_observed_at_inception():
             ever_hit[0] = True
             first_hit_step[:] = 0
 
