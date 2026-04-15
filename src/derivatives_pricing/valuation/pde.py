@@ -1399,21 +1399,69 @@ class _FDGridGreeksMixin:
             return short_circuit[1]
         return self._grid_gamma_safe(S, V, j, spot)
 
-    def theta(self) -> float:
-        r"""Grid theta via backward difference between the last two time
-        slices.
+    def _grid_theta_bs_identity(
+        self,
+        S: np.ndarray,
+        V: np.ndarray,
+        j: int,
+        spot: float,
+        last_dtau: float,
+    ) -> float:
+        r"""Return per-calendar-day theta via the Black-Scholes PDE identity.
 
         .. math::
 
-            \Theta \approx \frac{V^{n}(S_0) - V^{n-1}(S_0)}{\Delta t}
+            \Theta = r V - (r - q) S \Delta - \tfrac{1}{2} \sigma^{2} S^{2} \Gamma
 
-        Returned per **calendar day** (divided by 365).
+        ``V`` is interpolated to exact ``spot`` with the same parabolic
+        Lagrange stencil used by :meth:`_grid_delta_at_spot`; ``r`` and
+        ``q`` are the forward rates over the first PDE step (exact for
+        flat curves, first-order local otherwise).  Result is divided by
+        365 to match the calendar-day convention used elsewhere.
         """
-        _, V, V_prev, last_dtau, j, _ = self._grid_greeks_data()
+        # PV at exactly spot (parabolic Lagrange through the delta stencil).
+        x0, x1, x2 = S[j - 1], S[j], S[j + 1]
+        v0, v1, v2 = V[j - 1], V[j], V[j + 1]
+        pv_at_spot = float(
+            v0 * (spot - x1) * (spot - x2) / ((x0 - x1) * (x0 - x2))
+            + v1 * (spot - x0) * (spot - x2) / ((x1 - x0) * (x1 - x2))
+            + v2 * (spot - x0) * (spot - x1) / ((x2 - x0) * (x2 - x1))
+        )
+        delta = self._grid_delta_at_spot(S, V, j, spot)
+        gamma = self._grid_gamma_safe(S, V, j, spot)
+
+        sigma = float(self.underlying.volatility)
+        dt_probe = max(last_dtau, 1.0e-8)
+        r = float(self.valuation_ctx.discount_curve.forward_rate(0.0, dt_probe))
+        q = 0.0
+        if self.underlying.dividend_curve is not None:
+            q = float(self.underlying.dividend_curve.forward_rate(0.0, dt_probe))
+
+        theta_annual = (
+            r * pv_at_spot - (r - q) * spot * delta - 0.5 * sigma * sigma * spot * spot * gamma
+        )
+        return float(theta_annual / 365.0)
+
+    def theta(self) -> float:
+        r"""Grid theta via the Black-Scholes PDE identity.
+
+        Uses :meth:`_grid_theta_bs_identity` so theta attains the same
+        order of accuracy as the grid delta and gamma — notably better
+        near steep spatial gradients such as a barrier, where a
+        first-order backward time-difference amplifies the local error
+        in ``V``.  Returned per **calendar day**.
+
+        Short-circuits to ``0`` when the option is American and the spot
+        node sits in the early-exercise region; the Black-Scholes PDE
+        becomes an inequality there and the identity no longer holds.
+        """
+        S, V, _, last_dtau, j, spot = self._grid_greeks_data()
+        short_circuit = self._intrinsic_short_circuit_greeks(S, V, j)
+        if short_circuit is not None:
+            return 0.0
         if last_dtau <= 0.0:
             return 0.0
-        theta_annual = (V_prev[j] - V[j]) / last_dtau
-        return float(theta_annual / 365.0)
+        return self._grid_theta_bs_identity(S, V, j, spot, last_dtau)
 
 
 class _FDValuationBase(_FDGridGreeksMixin):
@@ -2557,16 +2605,16 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         j = _FDGridGreeksMixin._spot_grid_index(S, spot)
         return _FDGridGreeksMixin._grid_gamma_safe(S, V, j, spot)
 
-    @staticmethod
     def _grid_theta_from_result(
+        self,
         result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
         spot: float,
     ) -> float:
-        _, S, V, V_prev, last_dtau = result
+        _, S, V, _, last_dtau = result
         if last_dtau <= 0.0:
             return 0.0
         j = _FDGridGreeksMixin._spot_grid_index(S, spot)
-        return float((V_prev[j] - V[j]) / last_dtau / 365.0)
+        return self._grid_theta_bs_identity(S, V, j, spot, last_dtau)
 
     def _base_solve_args(self) -> dict:
         """Build keyword arguments shared by both KO and KI solvers."""
