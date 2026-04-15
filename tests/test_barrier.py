@@ -6,6 +6,7 @@ and barrier Greeks across numerical, tree, and grid methods.
 """
 
 import datetime as dt
+import logging
 import warnings
 
 import numpy as np
@@ -44,6 +45,9 @@ from derivatives_pricing.stochastic_processes import (
 from derivatives_pricing.valuation.params import BinomialParams, MonteCarloParams, PDEParams
 
 from helpers import flat_curve, PRICING_DATE, MATURITY, CURRENCY, SPOT, STRIKE, RATE, VOL
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -1128,17 +1132,42 @@ class TestBarrierGreeksAgainstBoyleTianTable6:
     assertions scale by 365 to compare on the same basis.
     """
 
-    _SPOT_CASES = [
-        pytest.param(95.0, 1.1193, -0.0262, -2.6465, id="spot_95_0"),
-        pytest.param(92.0, 1.2133, -0.0370, -1.1226, id="spot_92_0"),
-        pytest.param(91.0, 1.2525, -0.0413, -0.5719, id="spot_91_0"),
-        pytest.param(90.5, 1.2737, -0.0437, -0.2886, id="spot_90_5"),
-        pytest.param(90.4, 1.2781, -0.0441, -0.2313, id="spot_90_4"),
-        pytest.param(90.3, 1.2826, -0.0446, -0.1738, id="spot_90_3"),
-        pytest.param(90.2, 1.2870, -0.0451, -0.1161, id="spot_90_2"),
-    ]
+    # Spot → Boyle-Tian Table 6 starred analytical (delta, gamma, theta)
+    # triple. Theta is the annualized figure from the paper; library theta
+    # is per-day so we scale by 365 at comparison time.
+    _PAPER_GREEKS = {
+        95.0: (1.1192, -0.0262, -2.6468),
+        92.0: (1.2132, -0.0370, -1.1229),
+        91.0: (1.2524, -0.0413, -0.5720),
+        90.5: (1.2736, -0.0437, -0.2886),
+        90.4: (1.2780, -0.0441, -0.2313),
+        90.3: (1.2825, -0.0446, -0.1738),
+        90.2: (1.2869, -0.0451, -0.1161),
+    }
 
+    # Binomial tree greeks are known to degrade very close to the barrier
+    # (Boyle-Lau retopology + discrete-grid noise).  Regression is enforced
+    # at those spots via BSM numerical and PDE grid greeks only.
     _BINOMIAL_SKIP_SPOTS = {90.5, 90.4, 90.3, 90.2}
+
+    # Per-engine tolerances for each greek.
+    _TOLS = {
+        "delta": {
+            PricingMethod.BSM: dict(rtol=1.0e-2, atol=1.0e-2),
+            PricingMethod.BINOMIAL: dict(rtol=1.0e-2, atol=1.0e-2),
+            PricingMethod.PDE_FD: dict(rtol=1.0e-2, atol=1.0e-2),
+        },
+        "gamma": {
+            PricingMethod.BSM: dict(rtol=1.5e-2, atol=5.0e-4),
+            PricingMethod.BINOMIAL: dict(rtol=1.5e-2, atol=5.0e-4),
+            PricingMethod.PDE_FD: dict(rtol=1.5e-2, atol=5.0e-4),
+        },
+        "theta": {
+            PricingMethod.BSM: dict(rtol=2.0e-2, atol=3.0e-2),
+            PricingMethod.BINOMIAL: dict(rtol=2.0e-2, atol=3.0e-2),
+            PricingMethod.PDE_FD: dict(rtol=2.0e-2, atol=3.0e-2),
+        },
+    }
 
     @staticmethod
     def _paper_market_data() -> MarketData:
@@ -1172,69 +1201,55 @@ class TestBarrierGreeksAgainstBoyleTianTable6:
         )
 
     @classmethod
-    def _paper_valuation(cls, spot: float, method: PricingMethod) -> OptionValuation:
-        underlying = cls._paper_underlying(spot)
-        spec = cls._paper_spec()
-        if method is PricingMethod.BINOMIAL:
-            return OptionValuation(
-                underlying,
-                spec,
-                method,
-            )
-        if method is PricingMethod.PDE_FD:
-            return OptionValuation(
-                underlying,
-                spec,
-                method,
-            )
-        return OptionValuation(underlying, spec, method)
+    def _engine_greek(cls, spot: float, method: PricingMethod, greek: str) -> float:
+        """Return a single greek (delta/gamma/theta) from the given engine.
 
-    @classmethod
-    def _paper_greeks(
-        cls,
-        spot: float,
-        method: PricingMethod,
-    ) -> tuple[float, float, float]:
-        valuation = cls._paper_valuation(spot, method)
-        delta = valuation.delta()
-        gamma = valuation.gamma()
-        theta = valuation.theta()
-        return float(delta), float(gamma), float(theta) * 365.0
+        Theta is annualized (×365) to match the paper's reporting basis.
+        """
+        valuation = OptionValuation(cls._paper_underlying(spot), cls._paper_spec(), method)
+        value = float(getattr(valuation, greek)())
+        if greek == "theta":
+            value *= 365.0
+        return value
 
     @pytest.mark.parametrize(
-        "method",
-        [PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD],
-        ids=["bsm_numerical", "binomial_tree", "pde_grid"],
+        "spot",
+        list(_PAPER_GREEKS.keys()),
+        ids=[f"spot_{s:.1f}".replace(".", "_") for s in _PAPER_GREEKS],
     )
-    @pytest.mark.parametrize("spot,exp_delta,exp_gamma,exp_theta", _SPOT_CASES)
-    def test_down_and_out_call_greeks_match_paper(
-        self,
-        method: PricingMethod,
-        spot: float,
-        exp_delta: float,
-        exp_gamma: float,
-        exp_theta: float,
-    ):
-        if method is PricingMethod.BINOMIAL and spot in self._BINOMIAL_SKIP_SPOTS:
-            pytest.skip(
-                "Binomial tree Greeks are known to degrade very close to the barrier; "
-                "Table 6 regression is enforced there via BSM numerical and PDE grid greeks."
+    @pytest.mark.parametrize("greek", ["delta", "gamma", "theta"])
+    def test_down_and_out_call_greek_matches_paper(self, spot: float, greek: str):
+        """One (spot, greek) → log all three engines, assert each separately."""
+        paper_value = self._PAPER_GREEKS[spot][["delta", "gamma", "theta"].index(greek)]
+
+        engine_values: dict[PricingMethod, float | None] = {}
+        for method in (PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            if method is PricingMethod.BINOMIAL and spot in self._BINOMIAL_SKIP_SPOTS:
+                engine_values[method] = None
+                continue
+            engine_values[method] = self._engine_greek(spot, method, greek)
+
+        def _fmt(v: float | None) -> str:
+            return f"{v:.6f}" if v is not None else "skipped"
+
+        logger.info(
+            "BT98 Table6 DOC spot=%.2f %s | paper=%.6f dp_bsm=%s dp_bn=%s dp_fd=%s",
+            spot,
+            greek,
+            paper_value,
+            _fmt(engine_values[PricingMethod.BSM]),
+            _fmt(engine_values[PricingMethod.BINOMIAL]),
+            _fmt(engine_values[PricingMethod.PDE_FD]),
+        )
+
+        tol = self._TOLS[greek]
+        for method, value in engine_values.items():
+            if value is None:
+                continue
+            assert np.isclose(value, paper_value, **tol[method]), (
+                f"{greek} mismatch for {method.name} at spot={spot}: "
+                f"got {value:.6f}, expected {paper_value:.6f}"
             )
-
-        delta, gamma, theta = self._paper_greeks(spot, method)
-
-        assert np.isclose(delta, exp_delta, rtol=1.0e-2, atol=1.0e-2), (
-            f"delta mismatch for {method.name} at spot={spot}: "
-            f"got {delta:.6f}, expected {exp_delta:.6f}"
-        )
-        assert np.isclose(gamma, exp_gamma, rtol=1.5e-2, atol=5.0e-4), (
-            f"gamma mismatch for {method.name} at spot={spot}: "
-            f"got {gamma:.6f}, expected {exp_gamma:.6f}"
-        )
-        assert np.isclose(theta, exp_theta, rtol=2.0e-2, atol=3.0e-2), (
-            f"theta mismatch for {method.name} at spot={spot}: "
-            f"got {theta:.6f}, expected {exp_theta:.6f}"
-        )
 
 
 # ===========================================================================
