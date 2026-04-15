@@ -2,7 +2,7 @@
 
 Covers: BarrierSpec validation, in/out parity, analytical pricing,
 initial-state handling, rebate pricing, discrete monitoring (BG correction),
-and Greeks (NUMERICAL only).
+and barrier Greeks across numerical, tree, and grid methods.
 """
 
 import datetime as dt
@@ -15,6 +15,7 @@ from derivatives_pricing.enums import (
     BarrierAction,
     BarrierDirection,
     BarrierMonitoring,
+    DayCountConvention,
     ExerciseType,
     GreekCalculationMethod,
     OptionType,
@@ -889,7 +890,182 @@ class TestBarrierDiscreteMonitoring:
 
 
 # ===========================================================================
-# Greeks (NUMERICAL only)
+# Barrier present value against Boyle-Tian closed forms
+# ===========================================================================
+
+
+class TestBarrierPresentValueAgainstBoyleTianTable3:
+    """Compare single-barrier PVs against Table 3 of Boyle-Tian (1998).
+
+    Scenarios are taken from Table 3 of:
+
+    Phelim P. Boyle & Yisong (Sam) Tian (1998) An explicit finite difference
+    approach to the pricing of barrier options, Applied Mathematical Finance,
+    5:1, 17-43, DOI: 10.1080/135048698334718.
+
+    The paper's published table contains two errata relevant to these tests:
+    - Table 3 uses volatility 25% (not 20%).
+    - In Case IV, the second maturity is 0.5 months (not 1 month).
+
+    We compare the library engines against the paper's closed-form column only.
+    The double knock-out case is intentionally omitted.
+    """
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @staticmethod
+    def _paper_maturity(months: float) -> dt.datetime:
+        return PRICING_DATE + dt.timedelta(days=365 * months / 12)
+
+    @classmethod
+    def _paper_underlying(cls) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=100.0,
+            volatility=0.25,
+            market_data=cls._paper_market_data(),
+            dividend_curve=DiscountCurve.flat(0.0, 2.0),
+        )
+
+    @classmethod
+    def _paper_valuation(cls, spec: BarrierSpec, method: PricingMethod) -> OptionValuation:
+        underlying = cls._paper_underlying()
+        if method is PricingMethod.BINOMIAL:
+            return OptionValuation(
+                underlying,
+                spec,
+                method,
+            )
+        if method is PricingMethod.PDE_FD:
+            return OptionValuation(
+                underlying,
+                spec,
+                method,
+            )
+        return OptionValuation(underlying, spec, method)
+
+    _PV_CASES = [
+        pytest.param(
+            _barrier_spec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=95.0,
+                maturity=_paper_maturity(1.0),
+                barrier=97.5,
+                direction=BarrierDirection.DOWN,
+                action=BarrierAction.OUT,
+                monitoring=BarrierMonitoring.CONTINUOUS,
+            ),
+            3.6061,
+            id="table3_case_ii_1_month",
+        ),
+        pytest.param(
+            _barrier_spec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=95.0,
+                maturity=_paper_maturity(0.5),
+                barrier=97.5,
+                direction=BarrierDirection.DOWN,
+                action=BarrierAction.OUT,
+                monitoring=BarrierMonitoring.CONTINUOUS,
+            ),
+            3.7287,
+            id="table3_case_ii_0_5_month",
+        ),
+        pytest.param(
+            _barrier_spec(
+                option_type=OptionType.PUT,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=110.0,
+                maturity=_paper_maturity(1.0),
+                barrier=105.0,
+                direction=BarrierDirection.UP,
+                action=BarrierAction.OUT,
+                monitoring=BarrierMonitoring.CONTINUOUS,
+            ),
+            6.7530,
+            id="table3_case_iii_1_month",
+        ),
+        pytest.param(
+            _barrier_spec(
+                option_type=OptionType.PUT,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=110.0,
+                maturity=_paper_maturity(0.5),
+                barrier=105.0,
+                direction=BarrierDirection.UP,
+                action=BarrierAction.OUT,
+                monitoring=BarrierMonitoring.CONTINUOUS,
+            ),
+            7.8392,
+            id="table3_case_iii_0_5_month",
+        ),
+        pytest.param(
+            _barrier_spec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=100.0,
+                maturity=_paper_maturity(6.0),
+                barrier=90.0,
+                direction=BarrierDirection.DOWN,
+                action=BarrierAction.OUT,
+                monitoring=BarrierMonitoring.CONTINUOUS,
+                rebate=1.0,
+                rebate_timing=RebateTiming.AT_HIT,
+            ),
+            8.8485,
+            id="table3_case_iv_6_months_rebate",
+        ),
+        pytest.param(
+            _barrier_spec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=100.0,
+                maturity=_paper_maturity(0.5),
+                barrier=90.0,
+                direction=BarrierDirection.DOWN,
+                action=BarrierAction.OUT,
+                monitoring=BarrierMonitoring.CONTINUOUS,
+                rebate=1.0,
+                rebate_timing=RebateTiming.AT_HIT,
+            ),
+            2.2806,
+            id="table3_case_iv_0_5_month_rebate",
+        ),
+    ]
+
+    @pytest.mark.parametrize(
+        "method,rtol,atol",
+        [
+            pytest.param(PricingMethod.BSM, 1.0e-4, 7.5e-4, id="bsm"),
+            pytest.param(PricingMethod.BINOMIAL, 5.0e-4, 2.0e-3, id="binomial"),
+            pytest.param(PricingMethod.PDE_FD, 2.0e-4, 1.0e-3, id="pde_fd"),
+        ],
+    )
+    @pytest.mark.parametrize("spec,expected_pv", _PV_CASES)
+    def test_single_barrier_present_value_matches_paper_closed_form(
+        self,
+        method: PricingMethod,
+        rtol: float,
+        atol: float,
+        spec: BarrierSpec,
+        expected_pv: float,
+    ):
+        pv = self._paper_valuation(spec, method).present_value()
+        assert np.isclose(pv, expected_pv, rtol=rtol, atol=atol), (
+            f"PV mismatch for {method.name} on {spec}: got {pv:.6f}, expected {expected_pv:.6f}"
+        )
+
+
+# ===========================================================================
+# Barrier Greeks
 # ===========================================================================
 
 
@@ -936,6 +1112,129 @@ class TestBarrierGreeks:
         # This should not raise
         delta = self.val.delta()
         assert np.isfinite(delta)
+
+
+@pytest.mark.slow
+class TestBarrierGreeksAgainstBoyleTianTable6:
+    """Compare down-and-out call Greeks against Table 6 of Boyle-Tian (1998).
+
+    Scenarios are taken from Table 6 of:
+
+    Phelim P. Boyle & Yisong (Sam) Tian (1998) An explicit finite difference
+    approach to the pricing of barrier options, Applied Mathematical Finance,
+    5:1, 17-43, DOI: 10.1080/135048698334718.
+
+    The paper reports annualized theta. The library theta is per-day, so these
+    assertions scale by 365 to compare on the same basis.
+    """
+
+    _SPOT_CASES = [
+        pytest.param(95.0, 1.1193, -0.0262, -2.6465, id="spot_95_0"),
+        pytest.param(92.0, 1.2133, -0.0370, -1.1226, id="spot_92_0"),
+        pytest.param(91.0, 1.2525, -0.0413, -0.5719, id="spot_91_0"),
+        pytest.param(90.5, 1.2737, -0.0437, -0.2886, id="spot_90_5"),
+        pytest.param(90.4, 1.2781, -0.0441, -0.2313, id="spot_90_4"),
+        pytest.param(90.3, 1.2826, -0.0446, -0.1738, id="spot_90_3"),
+        pytest.param(90.2, 1.2870, -0.0451, -0.1161, id="spot_90_2"),
+    ]
+
+    _BINOMIAL_SKIP_SPOTS = {90.5, 90.4, 90.3, 90.2}
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _paper_underlying(cls, spot: float) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=spot,
+            volatility=0.25,
+            market_data=cls._paper_market_data(),
+            dividend_curve=DiscountCurve.flat(0.0, 2.0),
+        )
+
+    @staticmethod
+    def _paper_spec() -> BarrierSpec:
+        return BarrierSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=100.0,
+            maturity=PRICING_DATE + dt.timedelta(days=365),
+            barrier=90.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+
+    @classmethod
+    def _paper_valuation(cls, spot: float, method: PricingMethod) -> OptionValuation:
+        underlying = cls._paper_underlying(spot)
+        spec = cls._paper_spec()
+        if method is PricingMethod.BINOMIAL:
+            return OptionValuation(
+                underlying,
+                spec,
+                method,
+            )
+        if method is PricingMethod.PDE_FD:
+            return OptionValuation(
+                underlying,
+                spec,
+                method,
+            )
+        return OptionValuation(underlying, spec, method)
+
+    @classmethod
+    def _paper_greeks(
+        cls,
+        spot: float,
+        method: PricingMethod,
+    ) -> tuple[float, float, float]:
+        valuation = cls._paper_valuation(spot, method)
+        delta = valuation.delta()
+        gamma = valuation.gamma()
+        theta = valuation.theta()
+        return float(delta), float(gamma), float(theta) * 365.0
+
+    @pytest.mark.parametrize(
+        "method",
+        [PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD],
+        ids=["bsm_numerical", "binomial_tree", "pde_grid"],
+    )
+    @pytest.mark.parametrize("spot,exp_delta,exp_gamma,exp_theta", _SPOT_CASES)
+    def test_down_and_out_call_greeks_match_paper(
+        self,
+        method: PricingMethod,
+        spot: float,
+        exp_delta: float,
+        exp_gamma: float,
+        exp_theta: float,
+    ):
+        if method is PricingMethod.BINOMIAL and spot in self._BINOMIAL_SKIP_SPOTS:
+            pytest.skip(
+                "Binomial tree Greeks are known to degrade very close to the barrier; "
+                "Table 6 regression is enforced there via BSM numerical and PDE grid greeks."
+            )
+
+        delta, gamma, theta = self._paper_greeks(spot, method)
+
+        assert np.isclose(delta, exp_delta, rtol=1.0e-2, atol=1.0e-2), (
+            f"delta mismatch for {method.name} at spot={spot}: "
+            f"got {delta:.6f}, expected {exp_delta:.6f}"
+        )
+        assert np.isclose(gamma, exp_gamma, rtol=1.5e-2, atol=5.0e-4), (
+            f"gamma mismatch for {method.name} at spot={spot}: "
+            f"got {gamma:.6f}, expected {exp_gamma:.6f}"
+        )
+        assert np.isclose(theta, exp_theta, rtol=2.0e-2, atol=3.0e-2), (
+            f"theta mismatch for {method.name} at spot={spot}: "
+            f"got {theta:.6f}, expected {exp_theta:.6f}"
+        )
 
 
 # ===========================================================================
