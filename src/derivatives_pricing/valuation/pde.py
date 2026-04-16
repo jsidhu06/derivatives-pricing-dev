@@ -130,8 +130,14 @@ def _build_tau_grid(
     base = np.linspace(0.0, time_to_maturity, time_steps + 1)
     if not extra_taus:
         return base
-    grid = np.unique(np.concatenate([base, np.array(extra_taus, dtype=float)]))
-    grid.sort()
+    # Round to 12dp on both inputs so np.unique can collapse near-duplicates.
+    # Extras already arrive at 12dp from the upstream tau converters
+    # (_barrier_monitoring_taus, _dividend_tau_schedule); the linspace base
+    # is bit-fresh.  Without the round, an extra that lands on the same
+    # physical time as a base point survives as a sub-1e-12 neighbour, then
+    # `T - tau` collapses both to the same float and downstream forward-rate
+    # calls raise on dt == 0.
+    grid = np.unique(np.round(np.concatenate([base, np.array(extra_taus, dtype=float)]), 12))
     return grid
 
 

@@ -822,7 +822,17 @@ class OptionValuation:
             if pricing_method is PricingMethod.MONTE_CARLO:
                 return MonteCarloParams()
             if pricing_method is PricingMethod.BINOMIAL:
-                return BinomialParams.for_barriers() if is_barrier else BinomialParams()
+                if not is_barrier:
+                    return BinomialParams()
+                # Continuous barriers get Boyle-Lau step inflation automatically,
+                # so 1000 base steps typically suffice.  Discrete barriers have
+                # no equivalent auto-adjustment (the tree is built exactly at
+                # the user-specified num_steps), so we default higher to
+                # accommodate the harder tree/monitoring-date alignment.
+                assert isinstance(spec, BarrierSpec)
+                if spec.monitoring is BarrierMonitoring.CONTINUOUS:
+                    return BinomialParams.for_barriers()
+                return BinomialParams.for_barriers(num_steps=5000)
             if pricing_method is PricingMethod.PDE_FD:
                 return PDEParams.for_barriers() if is_barrier else PDEParams()
             return None
