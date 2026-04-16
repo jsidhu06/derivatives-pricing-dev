@@ -893,12 +893,15 @@ class OptionValuation:
         if spec.monitoring_dates is not None:
             return tuple(spec.monitoring_dates)
 
+        # N+1 dates from pricing_date to maturity; drop t=0 to leave N dates
+        # at T/N, 2T/N, ..., T.  Matches the standard academic convention for
+        # discretely-monitored barriers.
         return tuple(
             pd.date_range(
                 start=self.pricing_date,
                 end=self.maturity,
-                periods=spec.num_observations,
-            ).to_pydatetime()
+                periods=spec.num_observations + 1,
+            )[1:].to_pydatetime()
         )
 
     def _barrier_observed_at_inception(self) -> bool:

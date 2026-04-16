@@ -891,8 +891,11 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
                 mapped.append(idx)
             observation_indices = np.unique(np.array(mapped, dtype=int))
         elif self.spec.num_observations is not None:
+            # Match OptionValuation._barrier_monitoring_dates: N tree indices
+            # at num_steps/N, 2*num_steps/N, ..., num_steps — index 0 (the
+            # pricing date) excluded per BGK / Boyle-Tian convention.
             observation_indices = np.unique(
-                np.round(np.linspace(0, num_steps, self.spec.num_observations)).astype(int)
+                np.round(np.linspace(0, num_steps, self.spec.num_observations + 1)[1:]).astype(int)
             )
         else:
             raise ValidationError(

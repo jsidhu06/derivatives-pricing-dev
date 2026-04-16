@@ -10,6 +10,7 @@ import logging
 import warnings
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from derivatives_pricing.enums import (
@@ -259,8 +260,16 @@ class TestBarrierSpecValidation:
         with pytest.raises(ValidationError, match="num_observations"):
             _barrier_spec(
                 monitoring=BarrierMonitoring.DISCRETE,
-                num_observations=1,
+                num_observations=0,
             )
+
+    def test_discrete_num_observations_one_allowed(self):
+        """N=1 is valid: a single barrier observation at maturity."""
+        spec = _barrier_spec(
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=1,
+        )
+        assert spec.num_observations == 1
 
     def test_discrete_monitoring_dates_valid(self):
         dates = [PRICING_DATE + dt.timedelta(days=i * 30) for i in range(1, 10)]
@@ -1615,7 +1624,14 @@ class TestBarrierMCInceptionHit:
     # -- Discrete monitoring --
 
     def test_discrete_ko_inception_pv_zero(self, exercise_type):
-        """Discrete DOP with S <= H → MC weight = 0 → PV = 0."""
+        """Discrete DOP with S <= H and pricing date in the schedule → PV = 0.
+
+        The library's default ``num_observations`` schedule excludes the
+        pricing date (BGK convention), so the inception-hit code path only
+        fires when ``monitoring_dates`` explicitly includes it.  Here we
+        pass a schedule anchored at the pricing date.
+        """
+        dates = pd.date_range(PRICING_DATE, MATURITY, periods=12).to_pydatetime().tolist()
         pv = _mc_price(
             _mc_gbm(spot=80.0),
             option_type=OptionType.PUT,
@@ -1624,18 +1640,25 @@ class TestBarrierMCInceptionHit:
             action=BarrierAction.OUT,
             barrier=80.0,
             monitoring=BarrierMonitoring.DISCRETE,
-            num_observations=12,
+            monitoring_dates=dates,
         )
         assert np.isclose(pv, 0.0, atol=1e-10)
 
     def test_discrete_ki_inception_equals_vanilla_aligned(self, exercise_type):
-        """Discrete DIC at inception with grid-aligned observations → exact match.
+        """Discrete DIC at inception with grid-aligned pricing-date observation.
 
-        Setting num_observations = num_steps + 1 ensures monitoring dates
-        land exactly on the simulation grid, so no extra dates are injected
-        and the random draws are identical to vanilla.
+        Passing ``monitoring_dates`` that include the pricing date AND land
+        exactly on the simulation grid ensures both that the inception-hit
+        code path fires and that no extra dates are injected into the
+        simulation grid — so the random draws are identical to vanilla.
         """
         gbm = _mc_gbm(spot=80.0)
+        # Build monitoring dates directly from the simulation grid so they
+        # align exactly; take N+1 points starting at pricing_date.
+        gbm.simulate(random_seed=42)  # force time_grid to materialize
+        dates = (
+            pd.date_range(PRICING_DATE, MATURITY, periods=_MC_STEPS + 1).to_pydatetime().tolist()
+        )
         pv_ki = _mc_price(
             gbm,
             exercise_type=exercise_type,
@@ -1643,7 +1666,7 @@ class TestBarrierMCInceptionHit:
             action=BarrierAction.IN,
             barrier=80.0,
             monitoring=BarrierMonitoring.DISCRETE,
-            num_observations=_MC_STEPS + 1,
+            monitoring_dates=dates,
         )
         vanilla_spec = VanillaSpec(
             option_type=OptionType.CALL,
@@ -1657,12 +1680,14 @@ class TestBarrierMCInceptionHit:
         assert np.isclose(pv_ki, pv_vanilla, rtol=1e-10)
 
     def test_discrete_ki_inception_equals_vanilla_unaligned(self, exercise_type):
-        """Discrete DIC at inception with non-aligned observations → MC noise.
+        """Discrete DIC at inception with non-aligned pricing-date observation.
 
-        With num_observations=12, monitoring dates are injected into the
-        grid, changing its size and thus the random draws. Both prices
-        converge to the same expectation; we compare within MC noise.
+        Monitoring dates include pricing_date but don't align with the
+        simulation grid, so extra dates get injected — random draws differ
+        from vanilla.  Both prices converge to the same expectation; we
+        compare within MC noise.
         """
+        dates = pd.date_range(PRICING_DATE, MATURITY, periods=12).to_pydatetime().tolist()
         gbm = _mc_gbm(spot=80.0)
         pv_ki = _mc_price(
             gbm,
@@ -1671,7 +1696,7 @@ class TestBarrierMCInceptionHit:
             action=BarrierAction.IN,
             barrier=80.0,
             monitoring=BarrierMonitoring.DISCRETE,
-            num_observations=12,
+            monitoring_dates=dates,
         )
         vanilla_spec = VanillaSpec(
             option_type=OptionType.CALL,

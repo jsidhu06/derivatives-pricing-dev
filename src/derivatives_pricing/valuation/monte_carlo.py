@@ -1184,11 +1184,14 @@ def _resolve_monitoring_indices(
             for d in spec.monitoring_dates
         ]
     elif spec.num_observations is not None:
+        # Match OptionValuation._barrier_monitoring_dates: N dates at
+        # T/N, 2T/N, ..., T — pricing date excluded (BGK / Boyle-Tian
+        # convention).  Build N+1 evenly-spaced dates and drop the first.
         dates = pd.date_range(
             start=pricing_date,
             end=spec.maturity,
-            periods=spec.num_observations,
-        )
+            periods=spec.num_observations + 1,
+        )[1:]
         indices = [
             _resolve_time_index(
                 time_grid,
