@@ -44,7 +44,7 @@ from derivatives_pricing.stochastic_processes import (
     SimulationConfig,
 )
 from derivatives_pricing.valuation.params import BinomialParams, MonteCarloParams, PDEParams
-
+from derivatives_pricing.utils import calculate_year_fraction
 from helpers import flat_curve, PRICING_DATE, MATURITY, CURRENCY, SPOT, STRIKE, RATE, VOL
 
 
@@ -1077,6 +1077,127 @@ class TestBarrierPresentValueAgainstBoyleTianTable3:
         )
 
 
+@pytest.mark.slow
+class TestBarrierPresentValueAgainstBoyleTianTable8:
+    """Compare discretely-monitored DOC PVs against Table 8 of Boyle-Tian (1998).
+
+    Scenarios are taken from Table 8 of:
+
+    Phelim P. Boyle & Yisong (Sam) Tian (1998) An explicit finite difference
+    approach to the pricing of barrier options, Applied Mathematical Finance,
+    5:1, 17-43, DOI: 10.1080/135048698334718.
+
+    Table 8 sweeps a down-and-out call across six monitoring frequencies
+    (continuous, hourly, daily, weekly, monthly, quarterly) using the
+    Cheuk-Vorst (1994) convention: 1 yr = 4 q = 12 m = 52 w = 250 trading
+    days = 1000 trading hours.  All discrete frequencies are scaled to the
+    half-year maturity used in the paper.
+
+    Setup: S0 = K = 100, sigma = 20%, T = 0.5 yr, r = 10%, q = 0, H = 95.
+    """
+
+    _T_YEARS = 0.5
+    _PAPER_MATURITY = PRICING_DATE + dt.timedelta(days=_T_YEARS * 365)
+
+    assert (
+        calculate_year_fraction(PRICING_DATE, _PAPER_MATURITY, DayCountConvention.ACT_365F) == 0.5
+    ), "Paper maturity should be exactly 0.5 years under ACT/365F"
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _paper_underlying(cls) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=100.0,
+            volatility=0.20,
+            market_data=cls._paper_market_data(),
+        )
+
+    @classmethod
+    def _make_spec(cls, monitoring_kind: str | int) -> BarrierSpec:
+        common = dict(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=100.0,
+            maturity=cls._PAPER_MATURITY,
+            barrier=95.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+        )
+        if monitoring_kind == "continuous":
+            return _barrier_spec(monitoring=BarrierMonitoring.CONTINUOUS, **common)
+        return _barrier_spec(
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=int(monitoring_kind),
+            **common,
+        )
+
+    # (frequency_label, monitoring_kind, paper_pv).
+    # monitoring_kind: "continuous" or N obs scaled by T = 0.5 yr from
+    # Cheuk-Vorst's per-year frequencies.
+    _PAPER_PVS: list[tuple[str, str | int, float]] = [
+        ("continuous", "continuous", 5.7163),
+        ("hourly", 500, 5.8881),  # 1000 / yr
+        ("daily", 125, 6.1669),  # 250  / yr
+        ("weekly", 26, 6.6176),  # 52   / yr
+        ("monthly", 6, 7.3100),  # 12   / yr
+        ("quarterly", 2, 7.9759),  # 4    / yr
+    ]
+
+    # Per-engine tolerances, set by inspection of the actual error rates
+    # against the paper.  BSM (BG continuity correction) degrades worst at
+    # very low N where the asymptotic correction order matters.
+    _TOLS: dict[PricingMethod, dict[str, float]] = {
+        PricingMethod.BSM: dict(rtol=0.022, atol=1.0e-4),
+        PricingMethod.BINOMIAL: dict(rtol=0.013, atol=1.0e-4),
+        PricingMethod.PDE_FD: dict(rtol=0.010, atol=1.0e-4),
+    }
+
+    @pytest.mark.parametrize(
+        "frequency,monitoring_kind,paper_pv",
+        _PAPER_PVS,
+        ids=[lbl for (lbl, _, _) in _PAPER_PVS],
+    )
+    def test_doc_present_value_matches_paper(
+        self,
+        frequency: str,
+        monitoring_kind: str | int,
+        paper_pv: float,
+    ):
+        """Log all three engines side-by-side for one frequency, assert each."""
+        spec = self._make_spec(monitoring_kind)
+        underlying = self._paper_underlying()
+
+        engine_pvs: dict[PricingMethod, float] = {}
+        for method in (PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            engine_pvs[method] = float(OptionValuation(underlying, spec, method).present_value())
+
+        n_obs_str = "—" if monitoring_kind == "continuous" else str(monitoring_kind)
+        logger.info(
+            "BT98 Table8 DOC freq=%s N=%s | paper=%.4f dp_bsm=%.4f dp_bn=%.4f dp_fd=%.4f",
+            frequency,
+            n_obs_str,
+            paper_pv,
+            engine_pvs[PricingMethod.BSM],
+            engine_pvs[PricingMethod.BINOMIAL],
+            engine_pvs[PricingMethod.PDE_FD],
+        )
+
+        for method, pv in engine_pvs.items():
+            tol = self._TOLS[method]
+            assert np.isclose(pv, paper_pv, **tol), (
+                f"{method.name} PV mismatch at frequency={frequency} "
+                f"(N={n_obs_str}): got {pv:.6f}, expected {paper_pv:.6f}"
+            )
+
+
 # ===========================================================================
 # Barrier Greeks
 # ===========================================================================
@@ -1258,6 +1379,150 @@ class TestBarrierGreeksAgainstBoyleTianTable6:
             assert np.isclose(value, paper_value, **tol[method]), (
                 f"{greek} mismatch for {method.name} at spot={spot}: "
                 f"got {value:.6f}, expected {paper_value:.6f}"
+            )
+
+
+@pytest.mark.slow
+class TestBarrierGreeksAgainstBoyleTianTable9:
+    """Compare discretely-monitored DOC Greeks against Table 9 of Boyle-Tian (1998).
+
+    Scenarios are taken from Table 9 of:
+
+    Phelim P. Boyle & Yisong (Sam) Tian (1998) An explicit finite difference
+    approach to the pricing of barrier options, Applied Mathematical Finance,
+    5:1, 17-43, DOI: 10.1080/135048698334718.
+
+    Table 9 sweeps Greeks (delta, gamma, theta) for a down-and-out call
+    across five monitoring frequencies — continuously, daily, weekly,
+    monthly, quarterly — using the Cheuk-Vorst (1994) convention:
+    1 yr = 4 q = 12 m = 52 w = 250 trading days.  All discrete frequencies
+    are scaled to the half-year maturity used in the paper.
+
+    Setup: S0 = K = 100, sigma = 20%, T = 0.5 yr, r = 10%, q = 0, H = 95.
+    The paper reports annualized theta; the library theta is per-day, so
+    the comparison scales by 365.
+    """
+
+    _T_YEARS = 0.5
+    _PAPER_MATURITY = PRICING_DATE + dt.timedelta(days=_T_YEARS * 365)
+
+    # frequency_label → (monitoring_kind, (delta, gamma, theta_annual))
+    # monitoring_kind: "continuous" or N obs scaled by T = 0.5 yr.
+    _PAPER_GREEKS: dict[str, tuple[str | int, tuple[float, float, float]]] = {
+        "continuous": ("continuous", (1.0474, -0.0272, -4.4572)),
+        "daily": (125, (0.9895, -0.0208, -5.1264)),  # 250 / yr
+        "weekly": (26, (0.9312, -0.0134, -5.9688)),  # 52  / yr
+        "monthly": (6, (0.8055, 0.0155, -10.4166)),  # 12  / yr
+        "quarterly": (2, (0.6955, 0.0250, -11.1626)),  # 4   / yr
+    }
+
+    # Per-engine tolerances.  BSM's Broadie-Glasserman-Kou continuity
+    # correction is an asymptotic series in 1/√N; when differentiated into
+    # greeks at small N, errors grow large (even sign flips for gamma at
+    # monthly/quarterly).  BSM is therefore excluded from this test
+    # entirely. The Binomial gamma
+    # tolerance at weekly (N=26) accommodates tree-to-monitoring-date
+    # alignment noise where 5000 default tree steps spread over 26
+    # non-uniform observation dates leaves sub-integer rounding errors
+    # that amplify in the second derivative.
+    _TOLS: dict[str, dict[PricingMethod, dict[str, float]]] = {
+        "delta": {
+            PricingMethod.BINOMIAL: dict(rtol=1.5e-2, atol=1.0e-3),
+            PricingMethod.PDE_FD: dict(rtol=1.5e-2, atol=1.0e-3),
+        },
+        "gamma": {
+            PricingMethod.BINOMIAL: dict(rtol=1.5e-1, atol=2.0e-3),
+            PricingMethod.PDE_FD: dict(rtol=5.0e-2, atol=2.0e-3),
+        },
+        "theta": {
+            PricingMethod.BINOMIAL: dict(rtol=7.0e-2, atol=2.0e-2),
+            PricingMethod.PDE_FD: dict(rtol=3.0e-2, atol=2.0e-2),
+        },
+    }
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _paper_underlying(cls) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=100.0,
+            volatility=0.20,
+            market_data=cls._paper_market_data(),
+        )
+
+    @classmethod
+    def _make_spec(cls, monitoring_kind: str | int) -> BarrierSpec:
+        common = dict(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=100.0,
+            maturity=cls._PAPER_MATURITY,
+            barrier=95.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+        )
+        if monitoring_kind == "continuous":
+            return _barrier_spec(monitoring=BarrierMonitoring.CONTINUOUS, **common)
+        return _barrier_spec(
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=int(monitoring_kind),
+            **common,
+        )
+
+    @classmethod
+    def _engine_greek(
+        cls,
+        monitoring_kind: str | int,
+        method: PricingMethod,
+        greek: str,
+    ) -> float:
+        """Return a single greek from the given engine; theta annualized ×365."""
+        valuation = OptionValuation(
+            cls._paper_underlying(), cls._make_spec(monitoring_kind), method
+        )
+        value = float(getattr(valuation, greek)())
+        if greek == "theta":
+            value *= 365.0
+        return value
+
+    @pytest.mark.parametrize(
+        "frequency",
+        list(_PAPER_GREEKS.keys()),
+        ids=list(_PAPER_GREEKS.keys()),
+    )
+    @pytest.mark.parametrize("greek", ["delta", "gamma", "theta"])
+    def test_doc_greek_matches_paper(self, frequency: str, greek: str):
+        """One (frequency, greek) → log Binomial + PDE_FD, assert each."""
+        monitoring_kind, triple = self._PAPER_GREEKS[frequency]
+        paper_value = triple[["delta", "gamma", "theta"].index(greek)]
+
+        engine_values: dict[PricingMethod, float] = {}
+        for method in (PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            engine_values[method] = self._engine_greek(monitoring_kind, method, greek)
+
+        n_obs_str = "—" if monitoring_kind == "continuous" else str(monitoring_kind)
+        logger.info(
+            "BT98 Table9 DOC freq=%s N=%s %s | paper=%.6f dp_bn=%.6f dp_fd=%.6f",
+            frequency,
+            n_obs_str,
+            greek,
+            paper_value,
+            engine_values[PricingMethod.BINOMIAL],
+            engine_values[PricingMethod.PDE_FD],
+        )
+
+        tol = self._TOLS[greek]
+        for method, value in engine_values.items():
+            assert np.isclose(value, paper_value, **tol[method]), (
+                f"{greek} mismatch for {method.name} at frequency={frequency} "
+                f"(N={n_obs_str}): got {value:.6f}, expected {paper_value:.6f}"
             )
 
 
