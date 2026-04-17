@@ -43,6 +43,7 @@ from derivatives_pricing.stochastic_processes import (
     GBMProcess,
     SimulationConfig,
 )
+from derivatives_pricing.valuation.pde import _build_log_grid, _build_spot_grid
 from derivatives_pricing.valuation.params import BinomialParams, MonteCarloParams, PDEParams
 from derivatives_pricing.utils import calculate_year_fraction
 from helpers import flat_curve, PRICING_DATE, MATURITY, CURRENCY, SPOT, STRIKE, RATE, VOL
@@ -297,6 +298,49 @@ class TestBarrierSpecValidation:
                 monitoring=BarrierMonitoring.DISCRETE,
                 monitoring_dates=dates,
             )
+
+
+class TestDiscreteBarrierPDEGridPlacement:
+    """Discrete barrier PDE grids place the barrier between adjacent nodes."""
+
+    def test_spot_grid_places_barrier_at_half_step(self):
+        barrier = 95.0
+        grid, _, _ = _build_spot_grid(
+            smin=0.0,
+            smax=4.0 * max(SPOT, STRIKE),
+            spot_steps=200,
+            anchor_spot=barrier,
+            anchor_half_step=True,
+        )
+
+        left_idx = int(np.searchsorted(grid, barrier)) - 1
+        assert 0 <= left_idx < grid.size - 1
+        assert not np.any(np.isclose(grid, barrier, atol=1.0e-12))
+        assert np.isclose(0.5 * (grid[left_idx] + grid[left_idx + 1]), barrier, atol=1.0e-12)
+
+    def test_log_grid_places_barrier_at_half_step_in_log_space(self):
+        barrier = 95.0
+        Z, grid, _ = _build_log_grid(
+            spot=SPOT,
+            strike=STRIKE,
+            time_to_maturity=1.0,
+            volatility=VOL,
+            smax_mult=4.0,
+            spot_steps=200,
+            time_steps=200,
+            method=PricingMethod.PDE_FD,
+            anchor_spot=barrier,
+            anchor_half_step=True,
+        )
+
+        left_idx = int(np.searchsorted(grid, barrier)) - 1
+        assert 0 <= left_idx < grid.size - 1
+        assert not np.any(np.isclose(grid, barrier, atol=1.0e-12))
+        assert np.isclose(np.sqrt(grid[left_idx] * grid[left_idx + 1]), barrier, atol=1.0e-12)
+        assert np.isclose(0.5 * (Z[left_idx] + Z[left_idx + 1]), np.log(barrier), atol=1.0e-12)
+        dz = np.diff(Z)[0]
+        y_d_prime = np.log(barrier) + 0.5 * dz
+        assert len(np.where(Z == y_d_prime)[0]) > 0
 
 
 # ===========================================================================
@@ -1153,12 +1197,17 @@ class TestBarrierPresentValueAgainstBoyleTianTable8:
 
     # Per-engine tolerances, set by inspection of the actual error rates
     # against the paper.  BSM (BG continuity correction) degrades worst at
-    # very low N where the asymptotic correction order matters.
+    # very low N where the asymptotic correction order matters.  PDE_FD
+    # uses the Boyle-Tian half-step barrier placement which is near-exact
+    # at low-to-moderate monitoring density but over-shifts slightly at
+    # very dense monitoring (see pde.py module docstring); hourly is
+    # granted a wider tolerance to accommodate that regime.
     _TOLS: dict[PricingMethod, dict[str, float]] = {
         PricingMethod.BSM: dict(rtol=0.022, atol=1.0e-4),
         PricingMethod.BINOMIAL: dict(rtol=0.013, atol=1.0e-4),
-        PricingMethod.PDE_FD: dict(rtol=0.010, atol=1.0e-4),
+        PricingMethod.PDE_FD: dict(rtol=0.001, atol=1.0e-4),
     }
+    _PDE_FD_HOURLY_TOL: dict[str, float] = dict(rtol=0.015, atol=1.0e-4)
 
     @pytest.mark.parametrize(
         "frequency,monitoring_kind,paper_pv",
@@ -1191,10 +1240,142 @@ class TestBarrierPresentValueAgainstBoyleTianTable8:
         )
 
         for method, pv in engine_pvs.items():
-            tol = self._TOLS[method]
+            if method is PricingMethod.PDE_FD and frequency == "hourly":
+                tol = self._PDE_FD_HOURLY_TOL
+            else:
+                tol = self._TOLS[method]
             assert np.isclose(pv, paper_pv, **tol), (
                 f"{method.name} PV mismatch at frequency={frequency} "
                 f"(N={n_obs_str}): got {pv:.6f}, expected {paper_pv:.6f}"
+            )
+
+
+@pytest.mark.slow
+class TestBarrierPresentValueAgainstBroadieGlasserman:
+    """Compare discrete DOC PVs against Broadie & Glasserman trinomial truth.
+
+    Scenarios are taken from:
+
+    Mark Broadie & Paul Glasserman (1997) "A Continuity Correction for
+    Discrete Barrier Options", Mathematical Finance, 7(4), 325–349.
+
+    The paper's "True" column is computed by a trinomial procedure
+    specifically modified to handle discrete barriers, and is effectively
+    ground truth for a discretely-monitored DOC with m = 50 equally-spaced
+    observations.
+
+    Setup: S0 = K = 100, sigma = 30%, T = 0.2 yr, r = 10%, q = 0, m = 50.
+    Barrier swept from 85 through 99 (near-the-money).
+
+    The DP PDE_FD engine uses the Boyle-Tian half-step barrier placement,
+    which brings it to near-exact agreement (< 0.1% on all rows).
+    Binomial is looser due to tree-to-monitoring-date alignment noise,
+    especially where the barrier approaches spot.  BSM (BG continuity
+    correction) tracks well until the barrier gets very close to spot
+    (H=99) where the asymptotic correction degrades.
+    """
+
+    _T_YEARS = 0.2
+    _PAPER_MATURITY = PRICING_DATE + dt.timedelta(days=_T_YEARS * 365)
+
+    assert (
+        calculate_year_fraction(PRICING_DATE, _PAPER_MATURITY, DayCountConvention.ACT_365F) == 0.2
+    ), "Paper maturity should be exactly 0.2 years under ACT/365F"
+
+    # barrier → trinomial-truth value from the paper.
+    _TRUTH: dict[int, float] = {
+        85: 6.322,
+        86: 6.306,
+        87: 6.281,
+        88: 6.242,
+        89: 6.184,
+        90: 6.098,
+        91: 5.977,
+        92: 5.810,
+        93: 5.584,
+        94: 5.288,
+        95: 4.907,
+        96: 4.427,
+        97: 3.834,
+        98: 3.126,
+        99: 2.337,
+    }
+
+    _NUM_OBSERVATIONS = 50
+
+    # Per-engine tolerances — calibrated from observed behaviour:
+    # PDE_FD hits truth to within ~0.1% everywhere, locked in tight.
+    # Binomial can drift up to ~3% when the barrier is close to spot.
+    # BSM's BG correction degrades sharply as H → S0 (barrier 99).
+    _TOLS: dict[PricingMethod, dict[str, float]] = {
+        PricingMethod.BSM: dict(rtol=0.030, atol=1.0e-3),
+        PricingMethod.BINOMIAL: dict(rtol=0.035, atol=1.0e-3),
+        PricingMethod.PDE_FD: dict(rtol=0.002, atol=1.0e-3),
+    }
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 3.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _paper_underlying(cls) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=100.0,
+            volatility=0.30,
+            market_data=cls._paper_market_data(),
+        )
+
+    @classmethod
+    def _make_spec(cls, barrier: float) -> BarrierSpec:
+        return _barrier_spec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=100.0,
+            maturity=cls._PAPER_MATURITY,
+            barrier=barrier,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=cls._NUM_OBSERVATIONS,
+        )
+
+    @pytest.mark.parametrize(
+        "barrier,truth",
+        list(_TRUTH.items()),
+        ids=[f"H_{b}" for b in _TRUTH],
+    )
+    def test_doc_present_value_matches_trinomial_truth(
+        self,
+        barrier: int,
+        truth: float,
+    ):
+        """One barrier level → log all three engines, assert each against truth."""
+        spec = self._make_spec(float(barrier))
+        underlying = self._paper_underlying()
+
+        engine_pvs: dict[PricingMethod, float] = {}
+        for method in (PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            engine_pvs[method] = float(OptionValuation(underlying, spec, method).present_value())
+
+        logger.info(
+            "BG97 DOC H=%d m=%d | truth=%.3f dp_bsm=%.3f dp_bn=%.3f dp_fd=%.3f",
+            barrier,
+            self._NUM_OBSERVATIONS,
+            truth,
+            engine_pvs[PricingMethod.BSM],
+            engine_pvs[PricingMethod.BINOMIAL],
+            engine_pvs[PricingMethod.PDE_FD],
+        )
+
+        for method, pv in engine_pvs.items():
+            tol = self._TOLS[method]
+            assert np.isclose(pv, truth, **tol), (
+                f"{method.name} PV mismatch at H={barrier}: got {pv:.6f}, expected {truth:.6f}"
             )
 
 

@@ -11,6 +11,15 @@ PDE via finite differences for European and American options:
 - optional Rannacher smoothing for Crank–Nicolson
 - spatial grids: spot or log-spot
 - American handling: intrinsic projection or Gauss-Seidel/PSOR
+
+Discrete barriers
+-----------------
+Uses Boyle-Tian-inspired half-step barrier placement for discrete
+monitoring.  This tends to improve accuracy when the monitoring interval
+is not too fine relative to the PDE grid time-step.  If monitoring is
+extremely dense relative to the PDE grid, the correction can over-shift;
+in that regime the contract is close to continuously monitored and
+``BarrierMonitoring.CONTINUOUS`` is usually the better model choice.
 """
 
 from __future__ import annotations
@@ -377,6 +386,7 @@ def _build_log_grid(
     time_steps: int,
     method: PDEMethod,
     anchor_spot: float | None = None,
+    anchor_half_step: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Build log-spot grid.
 
@@ -395,15 +405,16 @@ def _build_log_grid(
     density directly: ``dz = (zmax_target - zmin_target) / spot_steps``.
 
     When ``anchor_spot`` is provided, the grid is sized so that the anchor
-    lies exactly on an interior node *and* the resulting domain is a
-    (possibly slight) superset of ``[zmin_target, zmax_target]``. For
-    CN/IMPLICIT this is achieved by recomputing ``dz`` from the binding
-    half (left or right of the anchor), i.e. the side that requires the
-    larger uniform ``dz`` to keep the anchor on-node while still covering
-    the target domain. The other side can then have up to roughly one cell
-    of slack. For explicit schemes ``dz`` is fixed by Hull's stability
-    heuristic, so the grid is shifted in place while keeping strict cover
-    of the target domain.
+    lies exactly on an interior node by default. If ``anchor_half_step`` is
+    true, the anchor instead lies halfway between two adjacent nodes. In both
+    cases the resulting domain is a (possibly slight) superset of
+    ``[zmin_target, zmax_target]``. For CN/IMPLICIT this is achieved by
+    recomputing ``dz`` from the binding half (left or right of the anchor),
+    i.e. the side that requires the larger uniform ``dz`` to keep the anchor
+    on-node or at a cell midpoint while still covering the target domain. The
+    other side can then have up to roughly one cell of slack. For explicit
+    schemes ``dz`` is fixed by Hull's stability heuristic, so the grid is
+    shifted in place while keeping strict cover of the target domain.
     """
     smax = float(smax_mult * max(spot, strike))
     smin = float(max(max(spot, strike) / smax_mult, 1.0e-8))
@@ -453,16 +464,22 @@ def _build_log_grid(
             # ``[zmin_target, zmax_target]``. If the target span is already
             # capped exactly by ``spot_steps * dz``, exact anchoring is only
             # possible when the anchor happens to lie on that fixed grid.
-            j_min = max(0, int(math.ceil((z_anchor - zmin_target) / dz - 1.0e-12)))
+            anchor_offset = 0.5 if anchor_half_step else 0.0
+            j_min = max(
+                0,
+                int(math.ceil((z_anchor - zmin_target) / dz - anchor_offset - 1.0e-12)),
+            )
             j_max = min(
-                spot_steps,
-                int(math.floor(spot_steps - (zmax_target - z_anchor) / dz + 1.0e-12)),
+                spot_steps - 1 if anchor_half_step else spot_steps,
+                int(
+                    math.floor(spot_steps - (zmax_target - z_anchor) / dz - anchor_offset + 1.0e-12)
+                ),
             )
             if j_min > j_max:
                 raise StabilityError(
                     "Unable to align anchor_spot on the log grid with current setup"
                 )
-            preferred_index = int(round((z_anchor - zmin) / dz))
+            preferred_index = int(round((z_anchor - zmin) / dz - anchor_offset))
             j_anchor = min(max(preferred_index, j_min), j_max)
         else:
             # CN/IMPLICIT: dz is free, so instead of shifting a fixed-dz
@@ -481,16 +498,17 @@ def _build_log_grid(
             #   - costs at most ~1/(spot_steps - 1) extra dz vs the bare-
             #     minimum tile of the target span.
             span = zmax_target - zmin_target
-            j_opt = int(round(spot_steps * (z_anchor - zmin_target) / span))
-            j_anchor = max(1, min(spot_steps - 1, j_opt))
-            left_dz = (z_anchor - zmin_target) / j_anchor
-            right_dz = (zmax_target - z_anchor) / (spot_steps - j_anchor)
+            anchor_offset = 0.5 if anchor_half_step else 0.0
+            j_opt = int(round(spot_steps * (z_anchor - zmin_target) / span - anchor_offset))
+            j_anchor = max(0 if anchor_half_step else 1, min(spot_steps - 1, j_opt))
+            left_dz = (z_anchor - zmin_target) / (j_anchor + anchor_offset)
+            right_dz = (zmax_target - z_anchor) / (spot_steps - j_anchor - anchor_offset)
             dz = max(left_dz, right_dz)
 
-        zmin = z_anchor - j_anchor * dz
+        zmin = z_anchor - (j_anchor + (0.5 if anchor_half_step else 0.0)) * dz
 
     Z = zmin + dz * np.arange(spot_steps + 1, dtype=float)
-    if anchor_spot is not None:
+    if anchor_spot is not None and not anchor_half_step:
         Z[j_anchor] = z_anchor
     S = np.exp(Z)
     return Z, S, dz
@@ -502,8 +520,9 @@ def _build_spot_grid(
     smax: float,
     spot_steps: int,
     anchor_spot: float | None = None,
+    anchor_half_step: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """Build a uniform spot grid, optionally aligning an anchor to a node."""
+    """Build a uniform spot grid, optionally aligning an anchor to a node or midpoint."""
     if anchor_spot is None:
         grid = np.linspace(smin, smax, spot_steps + 1)
         dS = (smax - smin) / spot_steps
@@ -513,6 +532,16 @@ def _build_spot_grid(
         raise ValidationError("anchor_spot must lie strictly inside the spot-grid domain")
 
     ratio = (anchor_spot - smin) / (smax - smin)
+    if anchor_half_step:
+        j_max = min(spot_steps - 1, int(math.floor(spot_steps * ratio - 0.5 + 1.0e-12)))
+        if j_max < 0:
+            raise StabilityError("Unable to align anchor_spot on the spot grid with current setup")
+        preferred_index = int(round(spot_steps * ratio - 0.5))
+        j_anchor = min(max(preferred_index, 0), j_max)
+        dS = (anchor_spot - smin) / (j_anchor + 0.5)
+        grid = smin + dS * np.arange(spot_steps + 1, dtype=float)
+        return grid, grid, dS
+
     j_max = min(spot_steps - 1, int(math.floor(spot_steps * ratio + 1.0e-12)))
     if j_max < 1:
         raise StabilityError("Unable to align anchor_spot on the spot grid with current setup")
@@ -1769,6 +1798,7 @@ def _fd_barrier_ko_core(
                 time_steps=time_steps,
                 method=method,
                 anchor_spot=barrier,
+                anchor_half_step=True,
             )
     else:
         # Spot grid
@@ -1783,6 +1813,7 @@ def _fd_barrier_ko_core(
                 smax=smax,
                 spot_steps=spot_steps,
                 anchor_spot=barrier,
+                anchor_half_step=True,
             )
 
     smin = float(S[0])
@@ -2167,6 +2198,7 @@ def _fd_barrier_ki_core(
             time_steps=time_steps,
             method=method,
             anchor_spot=barrier,
+            anchor_half_step=not continuous,
         )
     else:
         smax = float(smax_mult * ref_price)
@@ -2175,6 +2207,7 @@ def _fd_barrier_ki_core(
             smax=smax,
             spot_steps=spot_steps,
             anchor_spot=barrier,
+            anchor_half_step=not continuous,
         )
 
     smin = float(S[0])
