@@ -987,24 +987,11 @@ class TestBarrierPresentValueAgainstBoyleTianTable3:
             initial_value=100.0,
             volatility=0.25,
             market_data=cls._paper_market_data(),
-            dividend_curve=DiscountCurve.flat(0.0, 2.0),
         )
 
     @classmethod
     def _paper_valuation(cls, spec: BarrierSpec, method: PricingMethod) -> OptionValuation:
         underlying = cls._paper_underlying()
-        if method is PricingMethod.BINOMIAL:
-            return OptionValuation(
-                underlying,
-                spec,
-                method,
-            )
-        if method is PricingMethod.PDE_FD:
-            return OptionValuation(
-                underlying,
-                spec,
-                method,
-            )
         return OptionValuation(underlying, spec, method)
 
     _PV_CASES = [
@@ -1098,27 +1085,40 @@ class TestBarrierPresentValueAgainstBoyleTianTable3:
         ),
     ]
 
-    @pytest.mark.parametrize(
-        "method,rtol,atol",
-        [
-            pytest.param(PricingMethod.BSM, 1.0e-4, 7.5e-4, id="bsm"),
-            pytest.param(PricingMethod.BINOMIAL, 5.0e-4, 2.0e-3, id="binomial"),
-            pytest.param(PricingMethod.PDE_FD, 2.0e-4, 1.0e-3, id="pde_fd"),
-        ],
-    )
-    @pytest.mark.parametrize("spec,expected_pv", _PV_CASES)
+    # Per-engine tolerances — BSM is analytical closed-form (tightest),
+    # BINOMIAL and PDE_FD carry discretization noise.
+    _TOLS: dict[PricingMethod, dict[str, float]] = {
+        PricingMethod.BSM: dict(rtol=1.0e-4, atol=7.5e-4),
+        PricingMethod.BINOMIAL: dict(rtol=5.0e-4, atol=2.0e-3),
+        PricingMethod.PDE_FD: dict(rtol=2.0e-4, atol=1.0e-3),
+    }
+
+    @pytest.mark.parametrize("spec,paper_pv", _PV_CASES)
     def test_single_barrier_present_value_matches_paper_closed_form(
         self,
-        method: PricingMethod,
-        rtol: float,
-        atol: float,
         spec: BarrierSpec,
-        expected_pv: float,
+        paper_pv: float,
+        request: pytest.FixtureRequest,
     ):
-        pv = self._paper_valuation(spec, method).present_value()
-        assert np.isclose(pv, expected_pv, rtol=rtol, atol=atol), (
-            f"PV mismatch for {method.name} on {spec}: got {pv:.6f}, expected {expected_pv:.6f}"
+        """Log all three engines side-by-side for one case, assert each."""
+        engine_pvs: dict[PricingMethod, float] = {}
+        for method in (PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            engine_pvs[method] = float(self._paper_valuation(spec, method).present_value())
+
+        logger.info(
+            "BT98 Table3 %s | paper=%.4f dp_bsm=%.4f dp_bn=%.4f dp_fd=%.4f",
+            request.node.callspec.id,
+            paper_pv,
+            engine_pvs[PricingMethod.BSM],
+            engine_pvs[PricingMethod.BINOMIAL],
+            engine_pvs[PricingMethod.PDE_FD],
         )
+
+        for method, pv in engine_pvs.items():
+            tol = self._TOLS[method]
+            assert np.isclose(pv, paper_pv, **tol), (
+                f"{method.name} PV mismatch on {spec}: got {pv:.6f}, expected {paper_pv:.6f}"
+            )
 
 
 @pytest.mark.slow
