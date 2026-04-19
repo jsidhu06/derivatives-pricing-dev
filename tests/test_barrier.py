@@ -1379,6 +1379,137 @@ class TestBarrierPresentValueAgainstBroadieGlasserman:
             )
 
 
+@pytest.mark.slow
+class TestBarrierAmericanKIAgainstDaiKwok:
+    """Compare American down-and-in call PVs against Dai & Kwok (2004).
+
+    Scenarios are taken from:
+
+    Min Dai & Yue Kuen Kwok (2004) "Knock-in American options",
+    Journal of Futures Markets, 24(2), 179-192,
+    https://doi.org/10.1002/fut.10101
+
+    Setup: K = 100, sigma = 30%, T = 1 yr, r = 10%, q = 9%.
+
+    The paper PVs are obtained by choosing 10,000 time steps in
+    the full binomial scheme.
+
+    The DP PDE_FD engine uses the two-surface coupled solver and matches
+    the paper to ~3dp throughout.  The binomial engine uses Boyle-Lau
+    retopology + the active/inactive recursion and is granted ~1% to
+    accommodate cap-bind effects in the rows where the barrier sits within
+    1 unit of spot.
+    """
+
+    _PAPER_MATURITY = MATURITY  # 1 year under ACT/365F (see helpers)
+
+    assert (
+        calculate_year_fraction(PRICING_DATE, _PAPER_MATURITY, DayCountConvention.ACT_365F) == 1.0
+    ), "Paper maturity should be exactly 1 year under ACT/365F"
+
+    # (barrier, spot, paper_pv) — sweeps the three regimes Dai-Kwok study.
+    _PAPER_PVS: list[tuple[float, float, float]] = [
+        (99.0, 99.5, 10.7432),
+        (99.0, 110.5, 6.8224),
+        (110.0, 110.5, 17.2062),
+        (110.0, 120.5, 12.5409),
+        (110.0, 140.5, 6.3553),
+        (110.0, 160.5, 3.0667),
+        (130.0, 130.5, 32.1285),
+        (130.0, 140.5, 25.6659),
+        (130.0, 150.5, 20.1773),
+        (170.0, 170.5, 69.4759),
+        (170.0, 180.5, 59.3874),
+    ]
+
+    # Per-engine tolerances.  PDE_FD (two-surface coupled solver) hits the
+    # paper to ~3dp uniformly.  Binomial drifts more (Boyle-Lau alignment +
+    # active/inactive recursion noise), so it is granted ~1%.
+    _TOLS: dict[PricingMethod, dict[str, float]] = {
+        PricingMethod.PDE_FD: dict(rtol=1.0e-3, atol=2.0e-3),
+        PricingMethod.BINOMIAL: dict(rtol=1.0e-2, atol=2.0e-3),
+    }
+
+    # (barrier, spot) pairs where the barrier sits within 1 unit of spot —
+    # Boyle-Lau cap-bind warnings fire from the binomial engine here and
+    # are expected at this near-barrier proximity.
+    _BOYLE_LAU_NEAR_BARRIER: set[tuple[float, float]] = {
+        (130.0, 130.5),
+        (170.0, 170.5),
+    }
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _paper_underlying(cls, spot: float) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=spot,
+            volatility=0.30,
+            market_data=cls._paper_market_data(),
+            dividend_curve=DiscountCurve.flat(0.09, 2.0),
+        )
+
+    @classmethod
+    def _make_spec(cls, barrier: float) -> BarrierSpec:
+        return _barrier_spec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.AMERICAN,
+            strike=100.0,
+            maturity=cls._PAPER_MATURITY,
+            barrier=barrier,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+
+    @pytest.mark.parametrize(
+        "barrier,spot,paper_pv",
+        _PAPER_PVS,
+        ids=[f"H{int(h)}_S{s}".replace(".", "_") for h, s, _ in _PAPER_PVS],
+    )
+    def test_american_di_call_present_value_matches_paper(
+        self,
+        barrier: float,
+        spot: float,
+        paper_pv: float,
+    ):
+        """Log both engines side-by-side for one (H, S), assert each against paper."""
+        spec = self._make_spec(barrier)
+        underlying = self._paper_underlying(spot)
+
+        engine_pvs: dict[PricingMethod, float] = {}
+        for method in (PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            with warnings.catch_warnings():
+                if (barrier, spot) in self._BOYLE_LAU_NEAR_BARRIER:
+                    warnings.filterwarnings("ignore", message=".*Boyle-Lau step alignment.*")
+                engine_pvs[method] = float(
+                    OptionValuation(underlying, spec, method).present_value()
+                )
+
+        logger.info(
+            "DK04 AmKI H=%g S=%g | true=%.4f dp_bn=%.4f dp_fd=%.4f",
+            barrier,
+            spot,
+            paper_pv,
+            engine_pvs[PricingMethod.BINOMIAL],
+            engine_pvs[PricingMethod.PDE_FD],
+        )
+
+        for method, pv in engine_pvs.items():
+            tol = self._TOLS[method]
+            assert np.isclose(pv, paper_pv, **tol), (
+                f"{method.name} PV mismatch at H={barrier}, S={spot}: "
+                f"got {pv:.6f}, expected {paper_pv:.6f}"
+            )
+
+
 # ===========================================================================
 # Barrier Greeks
 # ===========================================================================
