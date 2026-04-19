@@ -669,17 +669,17 @@ class _MCAmericanValuation(_MCValuationBase):
     def present_value_pathwise(self) -> np.ndarray:
         """Return discounted present values for each path (LSM output at pricing date)."""
         spot_paths, intrinsic_values, time_index_start, time_index_end = self.solve()
-        time_list = self.underlying.time_grid[time_index_start : time_index_end + 1]
+        times = self.underlying.time_grid[time_index_start : time_index_end + 1]
         t_grid = _year_fractions(
             self.valuation_ctx.pricing_date,
-            time_list,
+            times,
             day_count_convention=self.underlying.day_count_convention,
         )
         discount_factors = self.valuation_ctx.discount_curve.df(t_grid)
         values = np.zeros_like(intrinsic_values)
         values[-1] = intrinsic_values[-1]
 
-        for t in range(len(time_list) - 2, 0, -1):
+        for t in range(len(times) - 2, 0, -1):
             df_step = discount_factors[t + 1] / discount_factors[t]
             itm = intrinsic_values[t] > 0
 
@@ -750,9 +750,9 @@ class _MCAsianBase(_MCValuationBase):
 
         Returns
         -------
-        (averaging_paths, time_list)
+        (averaging_paths, times)
             averaging_paths : (num_fixings, n_paths) spot prices at fixing dates
-            time_list       : (num_fixings,) datetime sub-grid for those dates
+            times           : (num_fixings,) datetime sub-grid for those dates
         """
         fixing_idx = self._fixing_indices(time_grid)
         return paths[fixing_idx], time_grid[fixing_idx]
@@ -977,14 +977,14 @@ class _MCAsianAmericanValuation(_MCAsianBase):
 
         Returns
         -------
-        (averaging_paths, running_avg, intrinsic, time_list)
+        (averaging_paths, running_avg, intrinsic, times)
             averaging_paths : (num_fixings, n_paths) spot prices at fixing dates
             running_avg     : (num_fixings, n_paths) running average at each fixing date
             intrinsic       : (num_fixings, n_paths) intrinsic payoff at each fixing date
-            time_list       : (num_fixings,) datetime time grid for the fixing window
+            times           : (num_fixings,) datetime time grid for the fixing window
         """
         paths = self.underlying.simulate(random_seed=self.mc_params.random_seed)
-        averaging_paths, time_list = self._extract_averaging_paths(paths, self.underlying.time_grid)
+        averaging_paths, times = self._extract_averaging_paths(paths, self.underlying.time_grid)
 
         spec = self.spec
         n1 = spec.observed_count or 0
@@ -997,7 +997,7 @@ class _MCAsianAmericanValuation(_MCAsianBase):
         )
 
         intrinsic = self._asian_payoff(running_avg)
-        return averaging_paths, running_avg, intrinsic, time_list
+        return averaging_paths, running_avg, intrinsic, times
 
     # ------------------------------------------------------------------
     # public interface
@@ -1035,11 +1035,11 @@ class _MCAsianAmericanValuation(_MCAsianBase):
 
     def present_value_pathwise(self) -> np.ndarray:
         """Discounted PV for each path via LSM on (S_t, A_t)."""
-        averaging_paths, running_avg, intrinsic, time_list = self._get_averaging_data()
+        averaging_paths, running_avg, intrinsic, times = self._get_averaging_data()
 
         t_grid = _year_fractions(
             self.valuation_ctx.pricing_date,
-            time_list,
+            times,
             day_count_convention=self.underlying.day_count_convention,
         )
         discount_factors = self.valuation_ctx.discount_curve.df(t_grid)
@@ -1049,7 +1049,7 @@ class _MCAsianAmericanValuation(_MCAsianBase):
         deg = self.mc_params.deg
         first_fixing_is_pricing_date = _is_pricing_time(
             self.valuation_ctx.pricing_date,
-            time_list[0],
+            times[0],
             self.underlying.day_count_convention,
         )
 
@@ -1339,7 +1339,7 @@ class _MCBarrierBase(_MCValuationBase):
                 "Use DISCRETE monitoring for non-GBM processes."
             )
 
-    def _monitoring_idx(self, time_grid: np.ndarray) -> np.ndarray:
+    def _monitoring_indices(self, time_grid: np.ndarray) -> np.ndarray:
         return _resolve_monitoring_indices(
             time_grid,
             self.spec,
@@ -1397,8 +1397,8 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
 
         inception_hit = self.valuation_ctx._barrier_observed_at_inception()
 
-        monitoring_idx = self._monitoring_idx(time_grid)
-        monitoring_idx = monitoring_idx[monitoring_idx <= time_index_end]
+        monitoring_indices = self._monitoring_indices(time_grid)
+        monitoring_indices = monitoring_indices[monitoring_indices <= time_index_end]
 
         is_continuous = self.spec.monitoring is BarrierMonitoring.CONTINUOUS
         time_deltas = self.underlying._time_deltas()
@@ -1420,7 +1420,7 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
         else:
             weight, rebate_pv = self._discrete_weights(
                 paths,
-                monitoring_idx,
+                monitoring_indices,
                 time_index_end,
                 discount_factors,
                 H,
@@ -1435,7 +1435,7 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
     def _discrete_weights(
         self,
         paths: np.ndarray,
-        monitoring_idx: np.ndarray,
+        monitoring_indices: np.ndarray,
         time_index_end: int,
         discount_factors: np.ndarray,
         H: float,
@@ -1455,7 +1455,7 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
             ever_hit[:] = True
             first_hit_step[:] = 0
 
-        for idx in monitoring_idx:
+        for idx in monitoring_indices:
             if idx == 0:
                 continue
             spots = paths[idx]
@@ -1772,8 +1772,8 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
             "time_grid must start at pricing_date; _build_time_grid enforces this"
         )
 
-        monitoring_idx = self._monitoring_idx(time_grid)
-        monitoring_idx = monitoring_idx[monitoring_idx <= time_index_end]
+        monitoring_indices = self._monitoring_indices(time_grid)
+        monitoring_indices = monitoring_indices[monitoring_indices <= time_index_end]
 
         # Build cumulative barrier state
         ever_hit = np.zeros((n_times, n_paths), dtype=bool)
@@ -1793,7 +1793,7 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
         else:
             bridge_rng = None
 
-        monitoring_set = set(monitoring_idx.tolist())
+        monitoring_set = set(monitoring_indices.tolist())
 
         for t in range(1, n_times):
             ever_hit[t] = ever_hit[t - 1]
@@ -1839,10 +1839,10 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
             time_index_end,
         ) = self.solve()
 
-        time_list = self.underlying.time_grid[time_index_start : time_index_end + 1]
+        times = self.underlying.time_grid[time_index_start : time_index_end + 1]
         t_grid = _year_fractions(
             self.valuation_ctx.pricing_date,
-            time_list,
+            times,
             day_count_convention=self.underlying.day_count_convention,
         )
         discount_factors = self.valuation_ctx.discount_curve.df(t_grid)
