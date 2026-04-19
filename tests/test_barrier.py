@@ -1510,6 +1510,231 @@ class TestBarrierAmericanKIAgainstDaiKwok:
             )
 
 
+@pytest.mark.slow
+class TestAmericanBarrierDiscreteDividends:
+    """Cross-engine DP check: American barrier + discrete cash dividends.
+
+    QL's barrier engines cover only half of this combination: the FD
+    engine supports discrete dividends but rejects American exercise, and
+    the binomial CRR engine supports American exercise but not discrete
+    dividends.  DP's binomial barrier engine is also blocked in this
+    regime (see :class:`TestBinomialBarrierDiscreteDividendsGuard` and
+    the guard in ``core.py``) because the escrowed-dividend tree
+    adjustment smooths the ex-date spot jump into continuous drift,
+    which misprices the barrier-hit probability on ex-dividend dates.
+
+    So this test does a two-engine DP consistency check (PDE_FD vs MC)
+    for all four KO/KI × direction combinations, including the
+    two-surface coupled solver's ``Step C`` (dividend jump applied to
+    both active and inactive surfaces, then American constraint
+    re-enforced on the active surface) that underpins American
+    knock-ins with discrete dividends.
+
+    Tolerance notes:
+        - PDE_FD is the reference (no structural approximation — it
+          models the ex-dividend spot jump as a grid shift).
+        - MC matches PDE_FD within ~2.5 % at 100k paths across both
+          KO and KI scenarios; residual noise comes from GBM path
+          variance plus the barrier check at discrete simulation steps.
+    """
+
+    _MAT = MATURITY  # 1 year under ACT/365F
+
+    _R: float = 0.05
+    _VOL: float = 0.20
+    _SPOT: float = 100.0
+    _STRIKE: float = 100.0
+
+    # Two moderate cash dividends inside the life of the option.
+    _DIVS: list[tuple[dt.datetime, float]] = [
+        (PRICING_DATE + dt.timedelta(days=90), 2.0),
+        (PRICING_DATE + dt.timedelta(days=270), 2.0),
+    ]
+
+    _MC_PATHS = 100_000
+    _MC_NUM_STEPS = 200
+    _MC_SEED = 42
+
+    # (id, option_type, direction, action, barrier, rebate_timing)
+    _SCENARIOS = [
+        pytest.param(
+            OptionType.CALL,
+            BarrierDirection.DOWN,
+            BarrierAction.OUT,
+            85.0,
+            RebateTiming.AT_HIT,
+            id="am_down_out_call",
+        ),
+        pytest.param(
+            OptionType.PUT,
+            BarrierDirection.UP,
+            BarrierAction.OUT,
+            120.0,
+            RebateTiming.AT_HIT,
+            id="am_up_out_put",
+        ),
+        pytest.param(
+            OptionType.CALL,
+            BarrierDirection.DOWN,
+            BarrierAction.IN,
+            85.0,
+            RebateTiming.AT_EXPIRY,
+            id="am_down_in_call",
+        ),
+        pytest.param(
+            OptionType.PUT,
+            BarrierDirection.UP,
+            BarrierAction.IN,
+            120.0,
+            RebateTiming.AT_EXPIRY,
+            id="am_up_in_put",
+        ),
+    ]
+
+    _TOL_MC: dict[str, float] = dict(rtol=0.025, atol=1.0e-2)
+
+    @classmethod
+    def _market_data(cls) -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(cls._R, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _underlying(cls) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=cls._SPOT,
+            volatility=cls._VOL,
+            market_data=cls._market_data(),
+            discrete_dividends=cls._DIVS,
+        )
+
+    @classmethod
+    def _gbm(cls) -> GBMProcess:
+        return GBMProcess(
+            cls._market_data(),
+            GBMParams(
+                initial_value=cls._SPOT,
+                volatility=cls._VOL,
+                discrete_dividends=cls._DIVS,
+            ),
+            SimulationConfig(
+                paths=cls._MC_PATHS,
+                num_steps=cls._MC_NUM_STEPS,
+                end_date=cls._MAT,
+            ),
+        )
+
+    @classmethod
+    def _make_spec(
+        cls,
+        option_type: OptionType,
+        direction: BarrierDirection,
+        action: BarrierAction,
+        barrier: float,
+        rebate_timing: RebateTiming,
+    ) -> BarrierSpec:
+        return _barrier_spec(
+            option_type=option_type,
+            exercise_type=ExerciseType.AMERICAN,
+            strike=cls._STRIKE,
+            maturity=cls._MAT,
+            barrier=barrier,
+            direction=direction,
+            action=action,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+            rebate_timing=rebate_timing,
+        )
+
+    @pytest.mark.parametrize(
+        "option_type,direction,action,barrier,rebate_timing",
+        _SCENARIOS,
+    )
+    def test_american_barrier_discrete_divs_pde_vs_mc(
+        self,
+        option_type: OptionType,
+        direction: BarrierDirection,
+        action: BarrierAction,
+        barrier: float,
+        rebate_timing: RebateTiming,
+    ):
+        """Log PDE/MC side-by-side, assert MC against PDE reference."""
+        spec = self._make_spec(option_type, direction, action, barrier, rebate_timing)
+        underlying = self._underlying()
+        gbm = self._gbm()
+
+        pv_pde = float(OptionValuation(underlying, spec, PricingMethod.PDE_FD).present_value())
+        pv_mc = float(
+            OptionValuation(
+                gbm,
+                spec,
+                PricingMethod.MONTE_CARLO,
+                params=MonteCarloParams(random_seed=self._MC_SEED),
+            ).present_value()
+        )
+
+        logger.info(
+            "AmBarrier+DiscDivs %s-%s %s H=%g | dp_fd=%.4f dp_mc=%.4f",
+            direction.value,
+            action.value,
+            option_type.value,
+            barrier,
+            pv_pde,
+            pv_mc,
+        )
+
+        assert np.isclose(pv_mc, pv_pde, **self._TOL_MC), (
+            f"MC vs PDE_FD mismatch for {direction.name}-{action.name} "
+            f"{option_type.name} H={barrier}: mc={pv_mc:.6f} pde={pv_pde:.6f}"
+        )
+
+
+class TestBinomialBarrierDiscreteDividendsGuard:
+    """Binomial + barrier + discrete dividends must raise UnsupportedFeatureError.
+
+    The escrowed-dividend tree adjustment smooths the ex-date spot jump
+    into continuous drift, mispricing the barrier-hit probability on
+    ex-dividend dates.  Explicit node-shift treatment would break tree
+    recombination.  The guard lives in ``OptionValuation.__init__``.
+    """
+
+    def test_binomial_barrier_with_discrete_dividends_rejected(self):
+        divs = [(PRICING_DATE + dt.timedelta(days=180), 2.0)]
+        underlying = UnderlyingData(
+            initial_value=SPOT,
+            volatility=VOL,
+            market_data=_market_data(),
+            discrete_dividends=divs,
+        )
+        spec = _barrier_spec(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=120.0,
+        )
+        with pytest.raises(UnsupportedFeatureError, match="discrete dividends"):
+            OptionValuation(underlying, spec, PricingMethod.BINOMIAL)
+
+    def test_binomial_vanilla_with_discrete_dividends_allowed(self):
+        """Vanilla (non-barrier) binomial + divs remains supported."""
+        divs = [(PRICING_DATE + dt.timedelta(days=180), 2.0)]
+        underlying = UnderlyingData(
+            initial_value=SPOT,
+            volatility=VOL,
+            market_data=_market_data(),
+            discrete_dividends=divs,
+        )
+        vanilla_spec = VanillaSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.AMERICAN,
+            strike=STRIKE,
+            maturity=MATURITY,
+        )
+        pv = OptionValuation(underlying, vanilla_spec, PricingMethod.BINOMIAL).present_value()
+        assert pv > 0
+
+
 # ===========================================================================
 # Barrier Greeks
 # ===========================================================================

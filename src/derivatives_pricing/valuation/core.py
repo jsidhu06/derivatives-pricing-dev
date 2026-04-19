@@ -321,6 +321,19 @@ class OptionValuation:
                 f"got {type(underlying).__name__}."
             )
 
+        if (
+            pricing_method is PricingMethod.BINOMIAL
+            and isinstance(spec, BarrierSpec)
+            and underlying.discrete_dividends
+        ):
+            raise UnsupportedFeatureError(
+                "Binomial pricing of barrier options with discrete dividends is not supported. "
+                "The escrowed-dividend tree adjustment used for vanilla options does not "
+                "preserve the correct barrier-hit dynamics at ex-dividend dates. Accurate "
+                "treatment would require a different tree construction rather than the "
+                "standard recombining CRR barrier tree. Use PDE_FD or MONTE_CARLO instead."
+            )
+
         # Assign early so helper methods (_asian_fixing_dates,
         # _barrier_monitoring_dates) can access self.pricing_date etc.
         # Overwritten below with the defensive copy for PathSimulation.
