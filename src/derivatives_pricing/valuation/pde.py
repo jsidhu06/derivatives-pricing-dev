@@ -2774,21 +2774,28 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         )
         return ko_result, van_result
 
+    def _is_european_ki(self) -> bool:
+        """True iff this spec is a European knock-in — the only case that
+        needs native-surface parity (V_KI = V_vanilla − V_KO + rebate leg)
+        rather than the mixin's direct grid extraction."""
+        spec = self._spec
+        return spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN
+
     def delta(self) -> float:
         spec = self._spec
         if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return 0.0
-            return self._vanilla_equivalent_valuation().delta(greek_calc_method=None)
+            return self._vanilla_equivalent_valuation().delta()
 
-        if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
-            return super().delta()
+        if self._is_european_ki():
+            ko_result, van_result = self._solve_european_ki_components()
+            spot = float(self.underlying.initial_value)
+            return self._grid_delta_from_result(van_result, spot) - self._grid_delta_from_result(
+                ko_result, spot
+            )
 
-        ko_result, van_result = self._solve_european_ki_components()
-        spot = float(self.underlying.initial_value)
-        return self._grid_delta_from_result(van_result, spot) - self._grid_delta_from_result(
-            ko_result, spot
-        )
+        return super().delta()
 
     def gamma(self) -> float:
         """Return grid gamma, using native-surface parity for European KI barriers."""
@@ -2796,33 +2803,33 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return 0.0
-            return self._vanilla_equivalent_valuation().gamma(greek_calc_method=None)
+            return self._vanilla_equivalent_valuation().gamma()
 
-        if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
-            return super().gamma()
+        if self._is_european_ki():
+            ko_result, van_result = self._solve_european_ki_components()
+            spot = float(self.underlying.initial_value)
+            return self._grid_gamma_from_result(van_result, spot) - self._grid_gamma_from_result(
+                ko_result, spot
+            )
 
-        ko_result, van_result = self._solve_european_ki_components()
-        spot = float(self.underlying.initial_value)
-        return self._grid_gamma_from_result(van_result, spot) - self._grid_gamma_from_result(
-            ko_result, spot
-        )
+        return super().gamma()
 
     def theta(self) -> float:
         spec = self._spec
         if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return self._resolved_knock_out_theta()
-            return self._vanilla_equivalent_valuation().theta(greek_calc_method=None)
+            return self._vanilla_equivalent_valuation().theta()
 
-        if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
-            return super().theta()
+        if self._is_european_ki():
+            ko_result, van_result = self._solve_european_ki_components()
+            spot = float(self.underlying.initial_value)
+            ko_theta = self._grid_theta_from_result(ko_result, spot)
+            vanilla_theta = self._grid_theta_from_result(van_result, spot)
+            rebate_theta = self._discounted_rebate_theta(ko_result[-1])
+            return vanilla_theta + rebate_theta - ko_theta
 
-        ko_result, van_result = self._solve_european_ki_components()
-        spot = float(self.underlying.initial_value)
-        ko_theta = self._grid_theta_from_result(ko_result, spot)
-        vanilla_theta = self._grid_theta_from_result(van_result, spot)
-        rebate_theta = self._discounted_rebate_theta(ko_result[-1])
-        return vanilla_theta + rebate_theta - ko_theta
+        return super().theta()
 
     def _solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Memoised PDE solve result.
