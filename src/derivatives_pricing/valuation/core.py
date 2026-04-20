@@ -633,6 +633,20 @@ class OptionValuation:
             Value change per day.
         """
         self._validate_bump(time_bump_days, greek_calc_method, "time_bump_days")
+
+        # BSM analytical barrier theta: use the Black-Scholes PDE identity
+        # (θ = rV − (r−q)Sδ − ½σ²S²γ) via the engine impl rather than a
+        # forward-difference time bump (the former has better accuracy).
+        # Only applies on auto-select; an explicit NUMERICAL request or a user-supplied
+        # ``time_bump_days`` still routes to the original bump path.
+        if (
+            greek_calc_method is None
+            and time_bump_days is None
+            and self._pricing_method is PricingMethod.BSM
+            and isinstance(self._spec, BarrierSpec)
+        ):
+            return float(self._impl.theta())
+
         method = self._resolve_greek_method(
             greek_calc_method,
             tree_capable=True,

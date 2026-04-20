@@ -975,7 +975,9 @@ def _dp_barrier_greeks_from_valuation(
     if "vega" in greeks:
         result["vega"] = ov.vega()
     if "theta" in greeks:
-        result["theta"] = ov.theta(time_bump_days=_BARRIER_NUMERICAL_THETA_DAYS)
+        # No explicit ``time_bump_days`` — auto-select routes AN barrier to
+        # the BSM PDE identity, BN/PDE to their native tree/grid theta.
+        result["theta"] = ov.theta()
     if "rho" in greeks:
         result["rho"] = ov.rho()
     return result
