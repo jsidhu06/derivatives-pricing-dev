@@ -991,11 +991,11 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         present_value().
         """
         if self.spec.action is BarrierAction.OUT:
-            if self.valuation_ctx._barrier_observed_at_inception():
+            if self.valuation_ctx._barrier_triggered_at_inception():
                 return self._resolved_knock_out_lattice()
             return self._solve_knock_out(early_exercise=early_exercise)
 
-        if self.valuation_ctx._barrier_observed_at_inception():
+        if self.valuation_ctx._barrier_triggered_at_inception():
             return self._solve_backward(early_exercise=early_exercise)
 
         _, inactive = self._solve_knock_in(early_exercise=early_exercise)
@@ -1149,7 +1149,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         user with ``log_timings=True`` can distinguish it from a regular
         barrier-aware solve.
         """
-        if not self.valuation_ctx._barrier_observed_at_inception():
+        if not self.valuation_ctx._barrier_triggered_at_inception():
             return None
 
         if self.spec.action is BarrierAction.OUT:

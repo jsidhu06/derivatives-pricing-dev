@@ -1146,7 +1146,7 @@ def _brownian_bridge_hit_prob(
     return np.clip(p, 0.0, 1.0)
 
 
-def _resolve_monitoring_indices(
+def _resolve_barrier_monitoring_indices(
     time_grid: np.ndarray,
     spec: BarrierSpec,
     pricing_date: dt.datetime,
@@ -1340,7 +1340,7 @@ class _MCBarrierBase(_MCValuationBase):
             )
 
     def _monitoring_indices(self, time_grid: np.ndarray) -> np.ndarray:
-        return _resolve_monitoring_indices(
+        return _resolve_barrier_monitoring_indices(
             time_grid,
             self.spec,
             self.valuation_ctx.pricing_date,
@@ -1395,7 +1395,7 @@ class _MCBarrierEuropeanValuation(_MCBarrierBase):
         )
         discount_factors = self.valuation_ctx.discount_curve.df(t_grid)
 
-        inception_hit = self.valuation_ctx._barrier_observed_at_inception()
+        inception_hit = self.valuation_ctx._barrier_triggered_at_inception()
 
         monitoring_indices = self._monitoring_indices(time_grid)
         monitoring_indices = monitoring_indices[monitoring_indices <= time_index_end]
@@ -1595,8 +1595,13 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
 
     def __init__(self, valuation_ctx: OptionValuation) -> None:
         super().__init__(valuation_ctx)
+
         if self.spec.action is not BarrierAction.OUT:
             return
+
+        if self.valuation_ctx._barrier_triggered_at_inception():
+            return
+
         is_down_out_put = (
             self.spec.direction is BarrierDirection.DOWN and self.spec.option_type is OptionType.PUT
         )
@@ -1607,7 +1612,7 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
             warnings.warn(
                 "American barrier Monte Carlo LSM can show significant downward bias "
                 "for down-and-out puts and up-and-out calls. "
-                "Prefer BINOMIAL or PDE_FD for production pricing.",
+                "Prefer PDE_FD for production pricing.",
                 stacklevel=3,
             )
 
@@ -1779,7 +1784,7 @@ class _MCBarrierAmericanValuation(_MCBarrierBase):
         ever_hit = np.zeros((n_times, n_paths), dtype=bool)
         first_hit_step = np.full(n_paths, -1, dtype=int)
 
-        if self.valuation_ctx._barrier_observed_at_inception():
+        if self.valuation_ctx._barrier_triggered_at_inception():
             ever_hit[0] = True
             first_hit_step[:] = 0
 

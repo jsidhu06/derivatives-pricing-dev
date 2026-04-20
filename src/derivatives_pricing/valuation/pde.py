@@ -2552,7 +2552,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
     def _resolved_knock_out_value(self) -> float | None:
         if (
             self._spec.action is not BarrierAction.OUT
-            or not self.valuation_ctx._barrier_observed_at_inception()
+            or not self.valuation_ctx._barrier_triggered_at_inception()
         ):
             return None
 
@@ -2734,7 +2734,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
     def delta(self) -> float:
         spec = self._spec
-        if self.valuation_ctx._barrier_observed_at_inception():
+        if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return 0.0
             return self._vanilla_equivalent_valuation().delta(greek_calc_method=None)
@@ -2751,7 +2751,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
     def gamma(self) -> float:
         """Return grid gamma, using native-surface parity for European KI barriers."""
         spec = self._spec
-        if self.valuation_ctx._barrier_observed_at_inception():
+        if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return 0.0
             return self._vanilla_equivalent_valuation().gamma(greek_calc_method=None)
@@ -2767,7 +2767,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
     def theta(self) -> float:
         spec = self._spec
-        if self.valuation_ctx._barrier_observed_at_inception():
+        if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return self._resolved_knock_out_theta()
             return self._vanilla_equivalent_valuation().theta(greek_calc_method=None)
@@ -2822,7 +2822,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
     def present_value(self) -> float:
         """Return present value from the PDE barrier solve."""
-        if self.valuation_ctx._barrier_observed_at_inception():
+        if self.valuation_ctx._barrier_triggered_at_inception():
             if self._spec.action is BarrierAction.OUT:
                 triggered_value = self._resolved_knock_out_value()
                 if triggered_value is None:

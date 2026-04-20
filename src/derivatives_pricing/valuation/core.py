@@ -917,7 +917,7 @@ class OptionValuation:
             )[1:].to_pydatetime()
         )
 
-    def _barrier_observed_at_inception(self) -> bool:
+    def _barrier_triggered_at_inception(self) -> bool:
         """Return ``True`` only if the barrier has been hit AND that hit is
         observable at the pricing date.
 
@@ -927,7 +927,7 @@ class OptionValuation:
         the pricing date qualifies only if it appears in that schedule.
         """
         assert isinstance(self._spec, BarrierSpec), (
-            "_barrier_observed_at_inception called on non-BarrierSpec valuation; "
+            "_barrier_triggered_at_inception called on non-BarrierSpec valuation; "
             "the dispatcher should route BarrierSpecs to barrier engines only."
         )
         spot = float(self._underlying.initial_value)
