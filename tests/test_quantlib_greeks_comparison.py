@@ -318,7 +318,10 @@ def _ql_american_fd_option(
     return option
 
 
-def _ql_greek(option: "ql_typing.VanillaOption", greek: str) -> float | None:
+def _ql_greek(
+    option: "ql_typing.VanillaOption | ql_typing.BarrierOption",
+    greek: str,
+) -> float | None:
     """Return a QuantLib greek when available, else ``None``."""
     try:
         return float(getattr(option, greek)())
@@ -327,7 +330,7 @@ def _ql_greek(option: "ql_typing.VanillaOption", greek: str) -> float | None:
 
 
 def _ql_scaled_greeks(
-    option: "ql_typing.VanillaOption",
+    option: "ql_typing.VanillaOption | ql_typing.BarrierOption",
     *,
     allow_missing: bool,
 ) -> dict[str, float | None]:
@@ -994,7 +997,6 @@ def _ql_barrier_option(
     spot: float,
     vol: float,
     rebate: float = 0.0,
-    rebate_timing: RebateTiming = RebateTiming.AT_HIT,
     r_curve: DiscountCurve | None = None,
     q_curve: DiscountCurve | None = None,
     grid_points: int = 800,
@@ -1486,7 +1488,6 @@ def test_american_barrier_greeks_vs_quantlib(
             spot=_BARRIER_SPOT,
             vol=_BARRIER_VOL,
             rebate=rebate,
-            rebate_timing=rebate_timing,
             binom_steps=_BARRIER_BINOM_CFG.num_steps,
         ),
         allow_missing=True,
