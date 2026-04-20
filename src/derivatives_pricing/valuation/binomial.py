@@ -891,8 +891,11 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
                 mapped.append(idx)
             observation_indices = np.unique(np.array(mapped, dtype=int))
         elif self.spec.num_observations is not None:
+            # Match OptionValuation._barrier_monitoring_dates: N tree indices
+            # at num_steps/N, 2*num_steps/N, ..., num_steps — index 0 (the
+            # pricing date) excluded per BGK / Boyle-Tian convention.
             observation_indices = np.unique(
-                np.round(np.linspace(0, num_steps, self.spec.num_observations)).astype(int)
+                np.round(np.linspace(0, num_steps, self.spec.num_observations + 1)[1:]).astype(int)
             )
         else:
             raise ValidationError(
@@ -917,7 +920,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
             return base_steps
 
         # If the option is already triggered at inception, `present_value()`
-        # will short-circuit through `_initial_value_if_triggered` without
+        # will short-circuit through `_inception_short_circuit_value` without
         # running the barrier tree. Neither Boyle-Lau inflation nor the
         # cap-bind warning is meaningful in that case:
         #   - KO: the option is dead at t=0 and PV is a closed-form rebate
@@ -933,7 +936,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         divisor = log_distance * log_distance
         # Only bail if log_distance is exactly zero (barrier coincides with
         # spot — a triggered-at-inception case handled upstream by
-        # `_initial_value_if_triggered`). We must NOT use `np.isclose` here
+        # `_inception_short_circuit_value`). We must NOT use `np.isclose` here
         # with its default atol=1e-8 because that would silently disable the
         # Boyle-Lau step adjustment for all near-spot barriers (any barrier
         # closer to spot than ~1e-4 in log-space would fall inside the
@@ -988,19 +991,11 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         present_value().
         """
         if self.spec.action is BarrierAction.OUT:
-            if _is_triggered(
-                float(self.underlying.initial_value),
-                float(self.spec.barrier),
-                self.spec.direction,
-            ):
+            if self.valuation_ctx._barrier_triggered_at_inception():
                 return self._resolved_knock_out_lattice()
             return self._solve_knock_out(early_exercise=early_exercise)
 
-        if _is_triggered(
-            float(self.underlying.initial_value),
-            float(self.spec.barrier),
-            self.spec.direction,
-        ):
+        if self.valuation_ctx._barrier_triggered_at_inception():
             return self._solve_backward(early_exercise=early_exercise)
 
         _, inactive = self._solve_knock_in(early_exercise=early_exercise)
@@ -1142,12 +1137,19 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
 
         return active, inactive
 
-    def _initial_value_if_triggered(self, *, early_exercise: bool) -> float | None:
-        if not _is_triggered(
-            float(self.underlying.initial_value),
-            float(self.spec.barrier),
-            self.spec.direction,
-        ):
+    def _inception_short_circuit_value(self, *, early_exercise: bool) -> float | None:
+        """Return the PV if the barrier is triggered at inception, else None.
+
+        For knock-out options the result is an O(1) closed-form rebate PV
+        (zero without a rebate, the rebate amount for ``AT_HIT``, or its
+        discounted value for ``AT_EXPIRY``).  For knock-in options the
+        result is the vanilla tree solve (O(n²)) since the option becomes
+        an ordinary vanilla the moment the barrier is hit — that path is
+        wrapped in its own ``log_timing`` under a distinct label so a
+        user with ``log_timings=True`` can distinguish it from a regular
+        barrier-aware solve.
+        """
+        if not self.valuation_ctx._barrier_triggered_at_inception():
             return None
 
         if self.spec.action is BarrierAction.OUT:
@@ -1158,7 +1160,12 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
             ttm = self.valuation_ctx._maturity_year_fraction()
             return float(self.spec.rebate) * float(self.valuation_ctx.discount_curve.df(ttm))
 
-        vanilla_lattice = self._solve_backward(early_exercise=early_exercise)
+        label = (
+            f"Binomial vanilla (KI triggered at inception, "
+            f"{'American' if early_exercise else 'European'}) present_value"
+        )
+        with log_timing(logger, label, self.binom_params.log_timings):
+            vanilla_lattice = self._solve_backward(early_exercise=early_exercise)
         return float(vanilla_lattice[0, 0])
 
     def solve(self) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
@@ -1169,7 +1176,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
 
     def present_value(self) -> float:
         early_exercise = self.spec.exercise_type is ExerciseType.AMERICAN
-        triggered_value = self._initial_value_if_triggered(
+        triggered_value = self._inception_short_circuit_value(
             early_exercise=early_exercise,
         )
         if triggered_value is not None:

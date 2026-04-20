@@ -2,19 +2,22 @@
 
 Covers: BarrierSpec validation, in/out parity, analytical pricing,
 initial-state handling, rebate pricing, discrete monitoring (BG correction),
-and Greeks (NUMERICAL only).
+and barrier Greeks across numerical, tree, and grid methods.
 """
 
 import datetime as dt
+import logging
 import warnings
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from derivatives_pricing.enums import (
     BarrierAction,
     BarrierDirection,
     BarrierMonitoring,
+    DayCountConvention,
     ExerciseType,
     GreekCalculationMethod,
     OptionType,
@@ -40,9 +43,13 @@ from derivatives_pricing.stochastic_processes import (
     GBMProcess,
     SimulationConfig,
 )
+from derivatives_pricing.valuation.pde import _build_log_grid, _build_spot_grid
 from derivatives_pricing.valuation.params import BinomialParams, MonteCarloParams, PDEParams
-
+from derivatives_pricing.utils import calculate_year_fraction
 from helpers import flat_curve, PRICING_DATE, MATURITY, CURRENCY, SPOT, STRIKE, RATE, VOL
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +261,16 @@ class TestBarrierSpecValidation:
         with pytest.raises(ValidationError, match="num_observations"):
             _barrier_spec(
                 monitoring=BarrierMonitoring.DISCRETE,
-                num_observations=1,
+                num_observations=0,
             )
+
+    def test_discrete_num_observations_one_allowed(self):
+        """N=1 is valid: a single barrier observation at maturity."""
+        spec = _barrier_spec(
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=1,
+        )
+        assert spec.num_observations == 1
 
     def test_discrete_monitoring_dates_valid(self):
         dates = [PRICING_DATE + dt.timedelta(days=i * 30) for i in range(1, 10)]
@@ -283,6 +298,49 @@ class TestBarrierSpecValidation:
                 monitoring=BarrierMonitoring.DISCRETE,
                 monitoring_dates=dates,
             )
+
+
+class TestDiscreteBarrierPDEGridPlacement:
+    """Discrete barrier PDE grids place the barrier between adjacent nodes."""
+
+    def test_spot_grid_places_barrier_at_half_step(self):
+        barrier = 95.0
+        grid, _, _ = _build_spot_grid(
+            smin=0.0,
+            smax=4.0 * max(SPOT, STRIKE),
+            spot_steps=200,
+            anchor_spot=barrier,
+            anchor_half_step=True,
+        )
+
+        left_idx = int(np.searchsorted(grid, barrier)) - 1
+        assert 0 <= left_idx < grid.size - 1
+        assert not np.any(np.isclose(grid, barrier, atol=1.0e-12))
+        assert np.isclose(0.5 * (grid[left_idx] + grid[left_idx + 1]), barrier, atol=1.0e-12)
+
+    def test_log_grid_places_barrier_at_half_step_in_log_space(self):
+        barrier = 95.0
+        Z, grid, _ = _build_log_grid(
+            spot=SPOT,
+            strike=STRIKE,
+            time_to_maturity=1.0,
+            volatility=VOL,
+            smax_mult=4.0,
+            spot_steps=200,
+            time_steps=200,
+            method=PricingMethod.PDE_FD,
+            anchor_spot=barrier,
+            anchor_half_step=True,
+        )
+
+        left_idx = int(np.searchsorted(grid, barrier)) - 1
+        assert 0 <= left_idx < grid.size - 1
+        assert not np.any(np.isclose(grid, barrier, atol=1.0e-12))
+        assert np.isclose(np.sqrt(grid[left_idx] * grid[left_idx + 1]), barrier, atol=1.0e-12)
+        assert np.isclose(0.5 * (Z[left_idx] + Z[left_idx + 1]), np.log(barrier), atol=1.0e-12)
+        dz = np.diff(Z)[0]
+        y_d_prime = np.log(barrier) + 0.5 * dz
+        assert len(np.where(Z == y_d_prime)[0]) > 0
 
 
 # ===========================================================================
@@ -889,7 +947,796 @@ class TestBarrierDiscreteMonitoring:
 
 
 # ===========================================================================
-# Greeks (NUMERICAL only)
+# Barrier present value against Boyle-Tian closed forms
+# ===========================================================================
+
+
+class TestBarrierPresentValueAgainstBoyleTianTable3:
+    """Compare single-barrier PVs against Table 3 of Boyle-Tian (1998).
+
+    Scenarios are taken from Table 3 of:
+
+    Phelim P. Boyle & Yisong (Sam) Tian (1998) An explicit finite difference
+    approach to the pricing of barrier options, Applied Mathematical Finance,
+    5:1, 17-43, DOI: 10.1080/135048698334718.
+
+    The paper's published table contains two errata relevant to these tests:
+    - Table 3 uses volatility 25% (not 20%).
+    - In Case IV, the second maturity is 0.5 months (not 1 month).
+
+    We compare the library engines against the paper's closed-form column only.
+    The double knock-out case is intentionally omitted.
+    """
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @staticmethod
+    def _paper_maturity(months: float) -> dt.datetime:
+        return PRICING_DATE + dt.timedelta(days=365 * months / 12)
+
+    @classmethod
+    def _paper_underlying(cls) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=100.0,
+            volatility=0.25,
+            market_data=cls._paper_market_data(),
+        )
+
+    @classmethod
+    def _paper_valuation(cls, spec: BarrierSpec, method: PricingMethod) -> OptionValuation:
+        underlying = cls._paper_underlying()
+        return OptionValuation(underlying, spec, method)
+
+    _PV_CASES = [
+        pytest.param(
+            _barrier_spec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=95.0,
+                maturity=_paper_maturity(1.0),
+                barrier=97.5,
+                direction=BarrierDirection.DOWN,
+                action=BarrierAction.OUT,
+                monitoring=BarrierMonitoring.CONTINUOUS,
+            ),
+            3.6061,
+            id="table3_case_ii_1_month",
+        ),
+        pytest.param(
+            _barrier_spec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=95.0,
+                maturity=_paper_maturity(0.5),
+                barrier=97.5,
+                direction=BarrierDirection.DOWN,
+                action=BarrierAction.OUT,
+                monitoring=BarrierMonitoring.CONTINUOUS,
+            ),
+            3.7287,
+            id="table3_case_ii_0_5_month",
+        ),
+        pytest.param(
+            _barrier_spec(
+                option_type=OptionType.PUT,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=110.0,
+                maturity=_paper_maturity(1.0),
+                barrier=105.0,
+                direction=BarrierDirection.UP,
+                action=BarrierAction.OUT,
+                monitoring=BarrierMonitoring.CONTINUOUS,
+            ),
+            6.7530,
+            id="table3_case_iii_1_month",
+        ),
+        pytest.param(
+            _barrier_spec(
+                option_type=OptionType.PUT,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=110.0,
+                maturity=_paper_maturity(0.5),
+                barrier=105.0,
+                direction=BarrierDirection.UP,
+                action=BarrierAction.OUT,
+                monitoring=BarrierMonitoring.CONTINUOUS,
+            ),
+            7.8392,
+            id="table3_case_iii_0_5_month",
+        ),
+        pytest.param(
+            _barrier_spec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=100.0,
+                maturity=_paper_maturity(6.0),
+                barrier=90.0,
+                direction=BarrierDirection.DOWN,
+                action=BarrierAction.OUT,
+                monitoring=BarrierMonitoring.CONTINUOUS,
+                rebate=1.0,
+                rebate_timing=RebateTiming.AT_HIT,
+            ),
+            8.8485,
+            id="table3_case_iv_6_months_rebate",
+        ),
+        pytest.param(
+            _barrier_spec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=100.0,
+                maturity=_paper_maturity(0.5),
+                barrier=90.0,
+                direction=BarrierDirection.DOWN,
+                action=BarrierAction.OUT,
+                monitoring=BarrierMonitoring.CONTINUOUS,
+                rebate=1.0,
+                rebate_timing=RebateTiming.AT_HIT,
+            ),
+            2.2806,
+            id="table3_case_iv_0_5_month_rebate",
+        ),
+    ]
+
+    # Per-engine tolerances — BSM is analytical closed-form (tightest),
+    # BINOMIAL and PDE_FD carry discretization noise.
+    _TOLS: dict[PricingMethod, dict[str, float]] = {
+        PricingMethod.BSM: dict(rtol=1.0e-4, atol=7.5e-4),
+        PricingMethod.BINOMIAL: dict(rtol=5.0e-4, atol=2.0e-3),
+        PricingMethod.PDE_FD: dict(rtol=2.0e-4, atol=1.0e-3),
+    }
+
+    @pytest.mark.parametrize("spec,paper_pv", _PV_CASES)
+    def test_single_barrier_present_value_matches_paper_closed_form(
+        self,
+        spec: BarrierSpec,
+        paper_pv: float,
+        request: pytest.FixtureRequest,
+    ):
+        """Log all three engines side-by-side for one case, assert each."""
+        engine_pvs: dict[PricingMethod, float] = {}
+        for method in (PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            engine_pvs[method] = float(self._paper_valuation(spec, method).present_value())
+
+        logger.info(
+            "BT98 Table3 %s | paper=%.4f dp_bsm=%.4f dp_bn=%.4f dp_fd=%.4f",
+            request.node.callspec.id,
+            paper_pv,
+            engine_pvs[PricingMethod.BSM],
+            engine_pvs[PricingMethod.BINOMIAL],
+            engine_pvs[PricingMethod.PDE_FD],
+        )
+
+        for method, pv in engine_pvs.items():
+            tol = self._TOLS[method]
+            assert np.isclose(pv, paper_pv, **tol), (
+                f"{method.name} PV mismatch on {spec}: got {pv:.6f}, expected {paper_pv:.6f}"
+            )
+
+
+@pytest.mark.slow
+class TestBarrierPresentValueAgainstBoyleTianTable8:
+    """Compare discretely-monitored DOC PVs against Table 8 of Boyle-Tian (1998).
+
+    Scenarios are taken from Table 8 of:
+
+    Phelim P. Boyle & Yisong (Sam) Tian (1998) An explicit finite difference
+    approach to the pricing of barrier options, Applied Mathematical Finance,
+    5:1, 17-43, DOI: 10.1080/135048698334718.
+
+    Table 8 sweeps a down-and-out call across six monitoring frequencies
+    (continuous, hourly, daily, weekly, monthly, quarterly) using the
+    Cheuk-Vorst (1994) convention: 1 yr = 4 q = 12 m = 52 w = 250 trading
+    days = 1000 trading hours.  All discrete frequencies are scaled to the
+    half-year maturity used in the paper.
+
+    Setup: S0 = K = 100, sigma = 20%, T = 0.5 yr, r = 10%, q = 0, H = 95.
+    """
+
+    _T_YEARS = 0.5
+    _PAPER_MATURITY = PRICING_DATE + dt.timedelta(days=_T_YEARS * 365)
+
+    assert (
+        calculate_year_fraction(PRICING_DATE, _PAPER_MATURITY, DayCountConvention.ACT_365F) == 0.5
+    ), "Paper maturity should be exactly 0.5 years under ACT/365F"
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _paper_underlying(cls) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=100.0,
+            volatility=0.20,
+            market_data=cls._paper_market_data(),
+        )
+
+    @classmethod
+    def _make_spec(cls, monitoring_kind: str | int) -> BarrierSpec:
+        common = dict(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=100.0,
+            maturity=cls._PAPER_MATURITY,
+            barrier=95.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+        )
+        if monitoring_kind == "continuous":
+            return _barrier_spec(monitoring=BarrierMonitoring.CONTINUOUS, **common)
+        return _barrier_spec(
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=int(monitoring_kind),
+            **common,
+        )
+
+    # (frequency_label, monitoring_kind, paper_pv).
+    # monitoring_kind: "continuous" or N obs scaled by T = 0.5 yr from
+    # Cheuk-Vorst's per-year frequencies.
+    _PAPER_PVS: list[tuple[str, str | int, float]] = [
+        ("continuous", "continuous", 5.7163),
+        ("hourly", 500, 5.8881),  # 1000 / yr
+        ("daily", 125, 6.1669),  # 250  / yr
+        ("weekly", 26, 6.6176),  # 52   / yr
+        ("monthly", 6, 7.3100),  # 12   / yr
+        ("quarterly", 2, 7.9759),  # 4    / yr
+    ]
+
+    # Per-engine tolerances, set by inspection of the actual error rates
+    # against the paper.  BSM (BG continuity correction) degrades worst at
+    # very low N where the asymptotic correction order matters.  PDE_FD
+    # uses the Boyle-Tian half-step barrier placement which is near-exact
+    # at low-to-moderate monitoring density but over-shifts slightly at
+    # very dense monitoring (see pde.py module docstring); hourly is
+    # granted a wider tolerance to accommodate that regime.
+    _TOLS: dict[PricingMethod, dict[str, float]] = {
+        PricingMethod.BSM: dict(rtol=0.022, atol=1.0e-4),
+        PricingMethod.BINOMIAL: dict(rtol=0.013, atol=1.0e-4),
+        PricingMethod.PDE_FD: dict(rtol=0.001, atol=1.0e-4),
+    }
+    _PDE_FD_HOURLY_TOL: dict[str, float] = dict(rtol=0.015, atol=1.0e-4)
+
+    @pytest.mark.parametrize(
+        "frequency,monitoring_kind,paper_pv",
+        _PAPER_PVS,
+        ids=[lbl for (lbl, _, _) in _PAPER_PVS],
+    )
+    def test_doc_present_value_matches_paper(
+        self,
+        frequency: str,
+        monitoring_kind: str | int,
+        paper_pv: float,
+    ):
+        """Log all three engines side-by-side for one frequency, assert each."""
+        spec = self._make_spec(monitoring_kind)
+        underlying = self._paper_underlying()
+
+        engine_pvs: dict[PricingMethod, float] = {}
+        for method in (PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            engine_pvs[method] = float(OptionValuation(underlying, spec, method).present_value())
+
+        n_obs_str = "—" if monitoring_kind == "continuous" else str(monitoring_kind)
+        logger.info(
+            "BT98 Table8 DOC freq=%s N=%s | paper=%.4f dp_bsm=%.4f dp_bn=%.4f dp_fd=%.4f",
+            frequency,
+            n_obs_str,
+            paper_pv,
+            engine_pvs[PricingMethod.BSM],
+            engine_pvs[PricingMethod.BINOMIAL],
+            engine_pvs[PricingMethod.PDE_FD],
+        )
+
+        for method, pv in engine_pvs.items():
+            if method is PricingMethod.PDE_FD and frequency == "hourly":
+                tol = self._PDE_FD_HOURLY_TOL
+            else:
+                tol = self._TOLS[method]
+            assert np.isclose(pv, paper_pv, **tol), (
+                f"{method.name} PV mismatch at frequency={frequency} "
+                f"(N={n_obs_str}): got {pv:.6f}, expected {paper_pv:.6f}"
+            )
+
+
+@pytest.mark.slow
+class TestBarrierPresentValueAgainstBroadieGlasserman:
+    """Compare discrete DOC PVs against Broadie & Glasserman trinomial truth.
+
+    Scenarios are taken from:
+
+    Mark Broadie & Paul Glasserman (1997) "A Continuity Correction for
+    Discrete Barrier Options", Mathematical Finance, 7(4), 325–349.
+
+    The paper's "True" column is computed by a trinomial procedure
+    specifically modified to handle discrete barriers, and is effectively
+    ground truth for a discretely-monitored DOC with m = 50 equally-spaced
+    observations.
+
+    Setup: S0 = K = 100, sigma = 30%, T = 0.2 yr, r = 10%, q = 0, m = 50.
+    Barrier swept from 85 through 99 (near-the-money).
+
+    The DP PDE_FD engine uses the Boyle-Tian half-step barrier placement,
+    which brings it to near-exact agreement (< 0.1% on all rows).
+    Binomial is looser due to tree-to-monitoring-date alignment noise,
+    especially where the barrier approaches spot.  BSM (BG continuity
+    correction) tracks well until the barrier gets very close to spot
+    (H=99) where the asymptotic correction degrades.
+    """
+
+    _T_YEARS = 0.2
+    _PAPER_MATURITY = PRICING_DATE + dt.timedelta(days=_T_YEARS * 365)
+
+    assert (
+        calculate_year_fraction(PRICING_DATE, _PAPER_MATURITY, DayCountConvention.ACT_365F) == 0.2
+    ), "Paper maturity should be exactly 0.2 years under ACT/365F"
+
+    # barrier → trinomial-truth value from the paper.
+    _TRUTH: dict[int, float] = {
+        85: 6.322,
+        86: 6.306,
+        87: 6.281,
+        88: 6.242,
+        89: 6.184,
+        90: 6.098,
+        91: 5.977,
+        92: 5.810,
+        93: 5.584,
+        94: 5.288,
+        95: 4.907,
+        96: 4.427,
+        97: 3.834,
+        98: 3.126,
+        99: 2.337,
+    }
+
+    _NUM_OBSERVATIONS = 50
+
+    # Per-engine tolerances — calibrated from observed behaviour:
+    # PDE_FD hits truth to within ~0.1% everywhere, locked in tight.
+    # Binomial can drift up to ~3% when the barrier is close to spot.
+    # BSM's BG correction degrades sharply as H → S0 (barrier 99).
+    _TOLS: dict[PricingMethod, dict[str, float]] = {
+        PricingMethod.BSM: dict(rtol=0.030, atol=1.0e-3),
+        PricingMethod.BINOMIAL: dict(rtol=0.035, atol=1.0e-3),
+        PricingMethod.PDE_FD: dict(rtol=0.002, atol=1.0e-3),
+    }
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 3.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _paper_underlying(cls) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=100.0,
+            volatility=0.30,
+            market_data=cls._paper_market_data(),
+        )
+
+    @classmethod
+    def _make_spec(cls, barrier: float) -> BarrierSpec:
+        return _barrier_spec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=100.0,
+            maturity=cls._PAPER_MATURITY,
+            barrier=barrier,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=cls._NUM_OBSERVATIONS,
+        )
+
+    @pytest.mark.parametrize(
+        "barrier,truth",
+        list(_TRUTH.items()),
+        ids=[f"H_{b}" for b in _TRUTH],
+    )
+    def test_doc_present_value_matches_trinomial_truth(
+        self,
+        barrier: int,
+        truth: float,
+    ):
+        """One barrier level → log all three engines, assert each against truth."""
+        spec = self._make_spec(float(barrier))
+        underlying = self._paper_underlying()
+
+        engine_pvs: dict[PricingMethod, float] = {}
+        for method in (PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            engine_pvs[method] = float(OptionValuation(underlying, spec, method).present_value())
+
+        logger.info(
+            "BG97 DOC H=%d m=%d | truth=%.3f dp_bsm=%.3f dp_bn=%.3f dp_fd=%.3f",
+            barrier,
+            self._NUM_OBSERVATIONS,
+            truth,
+            engine_pvs[PricingMethod.BSM],
+            engine_pvs[PricingMethod.BINOMIAL],
+            engine_pvs[PricingMethod.PDE_FD],
+        )
+
+        for method, pv in engine_pvs.items():
+            tol = self._TOLS[method]
+            assert np.isclose(pv, truth, **tol), (
+                f"{method.name} PV mismatch at H={barrier}: got {pv:.6f}, expected {truth:.6f}"
+            )
+
+
+@pytest.mark.slow
+class TestBarrierAmericanKIAgainstDaiKwok:
+    """Compare American down-and-in call PVs against Dai & Kwok (2004).
+
+    Scenarios are taken from:
+
+    Min Dai & Yue Kuen Kwok (2004) "Knock-in American options",
+    Journal of Futures Markets, 24(2), 179-192,
+    https://doi.org/10.1002/fut.10101
+
+    Setup: K = 100, sigma = 30%, T = 1 yr, r = 10%, q = 9%.
+
+    The paper PVs are obtained by choosing 10,000 time steps in
+    the full binomial scheme.
+
+    The DP PDE_FD engine uses the two-surface coupled solver and matches
+    the paper to ~3dp throughout.  The binomial engine uses Boyle-Lau
+    retopology + the active/inactive recursion and is granted ~1% to
+    accommodate cap-bind effects in the rows where the barrier sits within
+    1 unit of spot.
+    """
+
+    _PAPER_MATURITY = MATURITY  # 1 year under ACT/365F (see helpers)
+
+    assert (
+        calculate_year_fraction(PRICING_DATE, _PAPER_MATURITY, DayCountConvention.ACT_365F) == 1.0
+    ), "Paper maturity should be exactly 1 year under ACT/365F"
+
+    # (barrier, spot, paper_pv) — sweeps the three regimes Dai-Kwok study.
+    _PAPER_PVS: list[tuple[float, float, float]] = [
+        (99.0, 99.5, 10.7432),
+        (99.0, 110.5, 6.8224),
+        (110.0, 110.5, 17.2062),
+        (110.0, 120.5, 12.5409),
+        (110.0, 140.5, 6.3553),
+        (110.0, 160.5, 3.0667),
+        (130.0, 130.5, 32.1285),
+        (130.0, 140.5, 25.6659),
+        (130.0, 150.5, 20.1773),
+        (170.0, 170.5, 69.4759),
+        (170.0, 180.5, 59.3874),
+    ]
+
+    # Per-engine tolerances.  PDE_FD (two-surface coupled solver) hits the
+    # paper to ~3dp uniformly.  Binomial drifts more (Boyle-Lau alignment +
+    # active/inactive recursion noise), so it is granted ~1%.
+    _TOLS: dict[PricingMethod, dict[str, float]] = {
+        PricingMethod.PDE_FD: dict(rtol=1.0e-3, atol=2.0e-3),
+        PricingMethod.BINOMIAL: dict(rtol=1.0e-2, atol=2.0e-3),
+    }
+
+    # (barrier, spot) pairs where the barrier sits within 1 unit of spot —
+    # Boyle-Lau cap-bind warnings fire from the binomial engine here and
+    # are expected at this near-barrier proximity.
+    _BOYLE_LAU_NEAR_BARRIER: set[tuple[float, float]] = {
+        (130.0, 130.5),
+        (170.0, 170.5),
+    }
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _paper_underlying(cls, spot: float) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=spot,
+            volatility=0.30,
+            market_data=cls._paper_market_data(),
+            dividend_curve=DiscountCurve.flat(0.09, 2.0),
+        )
+
+    @classmethod
+    def _make_spec(cls, barrier: float) -> BarrierSpec:
+        return _barrier_spec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.AMERICAN,
+            strike=100.0,
+            maturity=cls._PAPER_MATURITY,
+            barrier=barrier,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+
+    @pytest.mark.parametrize(
+        "barrier,spot,paper_pv",
+        _PAPER_PVS,
+        ids=[f"H{int(h)}_S{s}".replace(".", "_") for h, s, _ in _PAPER_PVS],
+    )
+    def test_american_di_call_present_value_matches_paper(
+        self,
+        barrier: float,
+        spot: float,
+        paper_pv: float,
+    ):
+        """Log both engines side-by-side for one (H, S), assert each against paper."""
+        spec = self._make_spec(barrier)
+        underlying = self._paper_underlying(spot)
+
+        engine_pvs: dict[PricingMethod, float] = {}
+        for method in (PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            with warnings.catch_warnings():
+                if (barrier, spot) in self._BOYLE_LAU_NEAR_BARRIER:
+                    warnings.filterwarnings("ignore", message=".*Boyle-Lau step alignment.*")
+                engine_pvs[method] = float(
+                    OptionValuation(underlying, spec, method).present_value()
+                )
+
+        logger.info(
+            "DK04 AmKI H=%g S=%g | true=%.4f dp_bn=%.4f dp_fd=%.4f",
+            barrier,
+            spot,
+            paper_pv,
+            engine_pvs[PricingMethod.BINOMIAL],
+            engine_pvs[PricingMethod.PDE_FD],
+        )
+
+        for method, pv in engine_pvs.items():
+            tol = self._TOLS[method]
+            assert np.isclose(pv, paper_pv, **tol), (
+                f"{method.name} PV mismatch at H={barrier}, S={spot}: "
+                f"got {pv:.6f}, expected {paper_pv:.6f}"
+            )
+
+
+@pytest.mark.slow
+class TestAmericanBarrierDiscreteDividends:
+    """Cross-engine DP check: American barrier + discrete cash dividends.
+
+    QL's barrier engines cover only half of this combination: the FD
+    engine supports discrete dividends but rejects American exercise, and
+    the binomial CRR engine supports American exercise but not discrete
+    dividends.  DP's binomial barrier engine is also blocked in this
+    regime (see :class:`TestBinomialBarrierDiscreteDividendsGuard` and
+    the guard in ``core.py``) because the escrowed-dividend tree
+    adjustment smooths the ex-date spot jump into continuous drift,
+    which misprices the barrier-hit probability on ex-dividend dates.
+
+    So this test does a two-engine DP consistency check (PDE_FD vs MC)
+    for all four KO/KI × direction combinations, including the
+    two-surface coupled solver's ``Step C`` (dividend jump applied to
+    both active and inactive surfaces, then American constraint
+    re-enforced on the active surface) that underpins American
+    knock-ins with discrete dividends.
+
+    Tolerance notes:
+        - PDE_FD is the reference (no structural approximation — it
+          models the ex-dividend spot jump as a grid shift).
+        - MC matches PDE_FD within ~2.5 % at 100k paths across both
+          KO and KI scenarios; residual noise comes from GBM path
+          variance plus the barrier check at discrete simulation steps.
+    """
+
+    _MAT = MATURITY  # 1 year under ACT/365F
+
+    _R: float = 0.05
+    _VOL: float = 0.20
+    _SPOT: float = 100.0
+    _STRIKE: float = 100.0
+
+    # Two moderate cash dividends inside the life of the option.
+    _DIVS: list[tuple[dt.datetime, float]] = [
+        (PRICING_DATE + dt.timedelta(days=90), 2.0),
+        (PRICING_DATE + dt.timedelta(days=270), 2.0),
+    ]
+
+    _MC_PATHS = 100_000
+    _MC_NUM_STEPS = 200
+    _MC_SEED = 42
+
+    # (id, option_type, direction, action, barrier, rebate_timing)
+    _SCENARIOS = [
+        pytest.param(
+            OptionType.CALL,
+            BarrierDirection.DOWN,
+            BarrierAction.OUT,
+            85.0,
+            RebateTiming.AT_HIT,
+            id="am_down_out_call",
+        ),
+        pytest.param(
+            OptionType.PUT,
+            BarrierDirection.UP,
+            BarrierAction.OUT,
+            120.0,
+            RebateTiming.AT_HIT,
+            id="am_up_out_put",
+        ),
+        pytest.param(
+            OptionType.CALL,
+            BarrierDirection.DOWN,
+            BarrierAction.IN,
+            85.0,
+            RebateTiming.AT_EXPIRY,
+            id="am_down_in_call",
+        ),
+        pytest.param(
+            OptionType.PUT,
+            BarrierDirection.UP,
+            BarrierAction.IN,
+            120.0,
+            RebateTiming.AT_EXPIRY,
+            id="am_up_in_put",
+        ),
+    ]
+
+    _TOL_MC: dict[str, float] = dict(rtol=0.025, atol=1.0e-2)
+
+    @classmethod
+    def _market_data(cls) -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(cls._R, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _underlying(cls) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=cls._SPOT,
+            volatility=cls._VOL,
+            market_data=cls._market_data(),
+            discrete_dividends=cls._DIVS,
+        )
+
+    @classmethod
+    def _gbm(cls) -> GBMProcess:
+        return GBMProcess(
+            cls._market_data(),
+            GBMParams(
+                initial_value=cls._SPOT,
+                volatility=cls._VOL,
+                discrete_dividends=cls._DIVS,
+            ),
+            SimulationConfig(
+                paths=cls._MC_PATHS,
+                num_steps=cls._MC_NUM_STEPS,
+                end_date=cls._MAT,
+            ),
+        )
+
+    @classmethod
+    def _make_spec(
+        cls,
+        option_type: OptionType,
+        direction: BarrierDirection,
+        action: BarrierAction,
+        barrier: float,
+        rebate_timing: RebateTiming,
+    ) -> BarrierSpec:
+        return _barrier_spec(
+            option_type=option_type,
+            exercise_type=ExerciseType.AMERICAN,
+            strike=cls._STRIKE,
+            maturity=cls._MAT,
+            barrier=barrier,
+            direction=direction,
+            action=action,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+            rebate_timing=rebate_timing,
+        )
+
+    @pytest.mark.parametrize(
+        "option_type,direction,action,barrier,rebate_timing",
+        _SCENARIOS,
+    )
+    def test_american_barrier_discrete_divs_pde_vs_mc(
+        self,
+        option_type: OptionType,
+        direction: BarrierDirection,
+        action: BarrierAction,
+        barrier: float,
+        rebate_timing: RebateTiming,
+    ):
+        """Log PDE/MC side-by-side, assert MC against PDE reference."""
+        spec = self._make_spec(option_type, direction, action, barrier, rebate_timing)
+        underlying = self._underlying()
+        gbm = self._gbm()
+
+        pv_pde = float(OptionValuation(underlying, spec, PricingMethod.PDE_FD).present_value())
+        pv_mc = float(
+            OptionValuation(
+                gbm,
+                spec,
+                PricingMethod.MONTE_CARLO,
+                params=MonteCarloParams(random_seed=self._MC_SEED),
+            ).present_value()
+        )
+
+        logger.info(
+            "AmBarrier+DiscDivs %s-%s %s H=%g | dp_fd=%.4f dp_mc=%.4f",
+            direction.value,
+            action.value,
+            option_type.value,
+            barrier,
+            pv_pde,
+            pv_mc,
+        )
+
+        assert np.isclose(pv_mc, pv_pde, **self._TOL_MC), (
+            f"MC vs PDE_FD mismatch for {direction.name}-{action.name} "
+            f"{option_type.name} H={barrier}: mc={pv_mc:.6f} pde={pv_pde:.6f}"
+        )
+
+
+class TestBinomialBarrierDiscreteDividendsGuard:
+    """Binomial + barrier + discrete dividends must raise UnsupportedFeatureError.
+
+    The escrowed-dividend tree adjustment smooths the ex-date spot jump
+    into continuous drift, mispricing the barrier-hit probability on
+    ex-dividend dates.  Explicit node-shift treatment would break tree
+    recombination.  The guard lives in ``OptionValuation.__init__``.
+    """
+
+    def test_binomial_barrier_with_discrete_dividends_rejected(self):
+        divs = [(PRICING_DATE + dt.timedelta(days=180), 2.0)]
+        underlying = UnderlyingData(
+            initial_value=SPOT,
+            volatility=VOL,
+            market_data=_market_data(),
+            discrete_dividends=divs,
+        )
+        spec = _barrier_spec(
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            barrier=120.0,
+        )
+        with pytest.raises(UnsupportedFeatureError, match="discrete dividends"):
+            OptionValuation(underlying, spec, PricingMethod.BINOMIAL)
+
+    def test_binomial_vanilla_with_discrete_dividends_allowed(self):
+        """Vanilla (non-barrier) binomial + divs remains supported."""
+        divs = [(PRICING_DATE + dt.timedelta(days=180), 2.0)]
+        underlying = UnderlyingData(
+            initial_value=SPOT,
+            volatility=VOL,
+            market_data=_market_data(),
+            discrete_dividends=divs,
+        )
+        vanilla_spec = VanillaSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.AMERICAN,
+            strike=STRIKE,
+            maturity=MATURITY,
+        )
+        pv = OptionValuation(underlying, vanilla_spec, PricingMethod.BINOMIAL).present_value()
+        assert pv > 0
+
+
+# ===========================================================================
+# Barrier Greeks
 # ===========================================================================
 
 
@@ -936,6 +1783,284 @@ class TestBarrierGreeks:
         # This should not raise
         delta = self.val.delta()
         assert np.isfinite(delta)
+
+
+@pytest.mark.slow
+class TestBarrierGreeksAgainstBoyleTianTable6:
+    """Compare down-and-out call Greeks against Table 6 of Boyle-Tian (1998).
+
+    Scenarios are taken from Table 6 of:
+
+    Phelim P. Boyle & Yisong (Sam) Tian (1998) An explicit finite difference
+    approach to the pricing of barrier options, Applied Mathematical Finance,
+    5:1, 17-43, DOI: 10.1080/135048698334718.
+
+    The paper reports annualized theta. The library theta is per-day, so these
+    assertions scale by 365 to compare on the same basis.
+    """
+
+    # Spot → Boyle-Tian Table 6 starred analytical (delta, gamma, theta)
+    # triple. Theta is the annualized figure from the paper; library theta
+    # is per-day so we scale by 365 at comparison time.
+    _PAPER_GREEKS = {
+        95.0: (1.1192, -0.0262, -2.6468),
+        92.0: (1.2132, -0.0370, -1.1229),
+        91.0: (1.2524, -0.0413, -0.5720),
+        90.5: (1.2736, -0.0437, -0.2886),
+        90.4: (1.2780, -0.0441, -0.2313),
+        90.3: (1.2825, -0.0446, -0.1738),
+        90.2: (1.2869, -0.0451, -0.1161),
+    }
+
+    # Binomial tree greeks are known to degrade very close to the barrier
+    # (Boyle-Lau retopology + discrete-grid noise).  Regression is enforced
+    # at those spots via BSM numerical and PDE grid greeks only.
+    _BINOMIAL_SKIP_SPOTS = {90.5, 90.4, 90.3, 90.2}
+
+    # Per-engine tolerances for each greek.
+    _TOLS = {
+        "delta": {
+            PricingMethod.BSM: dict(rtol=1.0e-2, atol=1.0e-2),
+            PricingMethod.BINOMIAL: dict(rtol=1.0e-2, atol=1.0e-2),
+            PricingMethod.PDE_FD: dict(rtol=1.0e-2, atol=1.0e-2),
+        },
+        "gamma": {
+            PricingMethod.BSM: dict(rtol=1.5e-2, atol=5.0e-4),
+            PricingMethod.BINOMIAL: dict(rtol=1.5e-2, atol=5.0e-4),
+            PricingMethod.PDE_FD: dict(rtol=1.5e-2, atol=5.0e-4),
+        },
+        "theta": {
+            PricingMethod.BSM: dict(rtol=2.0e-2, atol=3.0e-2),
+            PricingMethod.BINOMIAL: dict(rtol=2.0e-2, atol=3.0e-2),
+            PricingMethod.PDE_FD: dict(rtol=2.0e-2, atol=3.0e-2),
+        },
+    }
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _paper_underlying(cls, spot: float) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=spot,
+            volatility=0.25,
+            market_data=cls._paper_market_data(),
+            dividend_curve=DiscountCurve.flat(0.0, 2.0),
+        )
+
+    @staticmethod
+    def _paper_spec() -> BarrierSpec:
+        return BarrierSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=100.0,
+            maturity=PRICING_DATE + dt.timedelta(days=365),
+            barrier=90.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+
+    @classmethod
+    def _engine_greek(cls, spot: float, method: PricingMethod, greek: str) -> float:
+        """Return a single greek (delta/gamma/theta) from the given engine.
+
+        Theta is annualized (×365) to match the paper's reporting basis.
+        """
+        valuation = OptionValuation(cls._paper_underlying(spot), cls._paper_spec(), method)
+        value = float(getattr(valuation, greek)())
+        if greek == "theta":
+            value *= 365.0
+        return value
+
+    @pytest.mark.parametrize(
+        "spot",
+        list(_PAPER_GREEKS.keys()),
+        ids=[f"spot_{s:.1f}".replace(".", "_") for s in _PAPER_GREEKS],
+    )
+    @pytest.mark.parametrize("greek", ["delta", "gamma", "theta"])
+    def test_down_and_out_call_greek_matches_paper(self, spot: float, greek: str):
+        """One (spot, greek) → log all three engines, assert each separately."""
+        paper_value = self._PAPER_GREEKS[spot][["delta", "gamma", "theta"].index(greek)]
+
+        engine_values: dict[PricingMethod, float | None] = {}
+        for method in (PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            if method is PricingMethod.BINOMIAL and spot in self._BINOMIAL_SKIP_SPOTS:
+                engine_values[method] = None
+                continue
+            engine_values[method] = self._engine_greek(spot, method, greek)
+
+        def _fmt(v: float | None) -> str:
+            return f"{v:.6f}" if v is not None else "skipped"
+
+        logger.info(
+            "BT98 Table6 DOC spot=%.2f %s | paper=%.6f dp_bsm=%s dp_bn=%s dp_fd=%s",
+            spot,
+            greek,
+            paper_value,
+            _fmt(engine_values[PricingMethod.BSM]),
+            _fmt(engine_values[PricingMethod.BINOMIAL]),
+            _fmt(engine_values[PricingMethod.PDE_FD]),
+        )
+
+        tol = self._TOLS[greek]
+        for method, value in engine_values.items():
+            if value is None:
+                continue
+            assert np.isclose(value, paper_value, **tol[method]), (
+                f"{greek} mismatch for {method.name} at spot={spot}: "
+                f"got {value:.6f}, expected {paper_value:.6f}"
+            )
+
+
+@pytest.mark.slow
+class TestBarrierGreeksAgainstBoyleTianTable9:
+    """Compare discretely-monitored DOC Greeks against Table 9 of Boyle-Tian (1998).
+
+    Scenarios are taken from Table 9 of:
+
+    Phelim P. Boyle & Yisong (Sam) Tian (1998) An explicit finite difference
+    approach to the pricing of barrier options, Applied Mathematical Finance,
+    5:1, 17-43, DOI: 10.1080/135048698334718.
+
+    Table 9 sweeps Greeks (delta, gamma, theta) for a down-and-out call
+    across five monitoring frequencies — continuously, daily, weekly,
+    monthly, quarterly — using the Cheuk-Vorst (1994) convention:
+    1 yr = 4 q = 12 m = 52 w = 250 trading days.  All discrete frequencies
+    are scaled to the half-year maturity used in the paper.
+
+    Setup: S0 = K = 100, sigma = 20%, T = 0.5 yr, r = 10%, q = 0, H = 95.
+    The paper reports annualized theta; the library theta is per-day, so
+    the comparison scales by 365.
+    """
+
+    _T_YEARS = 0.5
+    _PAPER_MATURITY = PRICING_DATE + dt.timedelta(days=_T_YEARS * 365)
+
+    # frequency_label → (monitoring_kind, (delta, gamma, theta_annual))
+    # monitoring_kind: "continuous" or N obs scaled by T = 0.5 yr.
+    _PAPER_GREEKS: dict[str, tuple[str | int, tuple[float, float, float]]] = {
+        "continuous": ("continuous", (1.0474, -0.0272, -4.4572)),
+        "daily": (125, (0.9895, -0.0208, -5.1264)),  # 250 / yr
+        "weekly": (26, (0.9312, -0.0134, -5.9688)),  # 52  / yr
+        "monthly": (6, (0.8055, 0.0155, -10.4166)),  # 12  / yr
+        "quarterly": (2, (0.6955, 0.0250, -11.1626)),  # 4   / yr
+    }
+
+    # Per-engine tolerances.  BSM's Broadie-Glasserman-Kou continuity
+    # correction is an asymptotic series in 1/√N; when differentiated into
+    # greeks at small N, errors grow large (even sign flips for gamma at
+    # monthly/quarterly).  BSM is therefore excluded from this test
+    # entirely. The Binomial gamma
+    # tolerance at weekly (N=26) accommodates tree-to-monitoring-date
+    # alignment noise where 5000 default tree steps spread over 26
+    # non-uniform observation dates leaves sub-integer rounding errors
+    # that amplify in the second derivative.
+    _TOLS: dict[str, dict[PricingMethod, dict[str, float]]] = {
+        "delta": {
+            PricingMethod.BINOMIAL: dict(rtol=1.5e-2, atol=1.0e-3),
+            PricingMethod.PDE_FD: dict(rtol=1.5e-2, atol=1.0e-3),
+        },
+        "gamma": {
+            PricingMethod.BINOMIAL: dict(rtol=1.5e-1, atol=2.0e-3),
+            PricingMethod.PDE_FD: dict(rtol=5.0e-2, atol=2.0e-3),
+        },
+        "theta": {
+            PricingMethod.BINOMIAL: dict(rtol=7.0e-2, atol=2.0e-2),
+            PricingMethod.PDE_FD: dict(rtol=3.0e-2, atol=2.0e-2),
+        },
+    }
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _paper_underlying(cls) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=100.0,
+            volatility=0.20,
+            market_data=cls._paper_market_data(),
+        )
+
+    @classmethod
+    def _make_spec(cls, monitoring_kind: str | int) -> BarrierSpec:
+        common = dict(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=100.0,
+            maturity=cls._PAPER_MATURITY,
+            barrier=95.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+        )
+        if monitoring_kind == "continuous":
+            return _barrier_spec(monitoring=BarrierMonitoring.CONTINUOUS, **common)
+        return _barrier_spec(
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=int(monitoring_kind),
+            **common,
+        )
+
+    @classmethod
+    def _engine_greek(
+        cls,
+        monitoring_kind: str | int,
+        method: PricingMethod,
+        greek: str,
+    ) -> float:
+        """Return a single greek from the given engine; theta annualized ×365."""
+        valuation = OptionValuation(
+            cls._paper_underlying(), cls._make_spec(monitoring_kind), method
+        )
+        value = float(getattr(valuation, greek)())
+        if greek == "theta":
+            value *= 365.0
+        return value
+
+    @pytest.mark.parametrize(
+        "frequency",
+        list(_PAPER_GREEKS.keys()),
+        ids=list(_PAPER_GREEKS.keys()),
+    )
+    @pytest.mark.parametrize("greek", ["delta", "gamma", "theta"])
+    def test_doc_greek_matches_paper(self, frequency: str, greek: str):
+        """One (frequency, greek) → log Binomial + PDE_FD, assert each."""
+        monitoring_kind, triple = self._PAPER_GREEKS[frequency]
+        paper_value = triple[["delta", "gamma", "theta"].index(greek)]
+
+        engine_values: dict[PricingMethod, float] = {}
+        for method in (PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            engine_values[method] = self._engine_greek(monitoring_kind, method, greek)
+
+        n_obs_str = "—" if monitoring_kind == "continuous" else str(monitoring_kind)
+        logger.info(
+            "BT98 Table9 DOC freq=%s N=%s %s | paper=%.6f dp_bn=%.6f dp_fd=%.6f",
+            frequency,
+            n_obs_str,
+            greek,
+            paper_value,
+            engine_values[PricingMethod.BINOMIAL],
+            engine_values[PricingMethod.PDE_FD],
+        )
+
+        tol = self._TOLS[greek]
+        for method, value in engine_values.items():
+            assert np.isclose(value, paper_value, **tol[method]), (
+                f"{greek} mismatch for {method.name} at frequency={frequency} "
+                f"(N={n_obs_str}): got {value:.6f}, expected {paper_value:.6f}"
+            )
 
 
 # ===========================================================================
@@ -1221,25 +2346,36 @@ class TestBarrierDiscreteBGvsMC:
         )
 
 
+_EXERCISE_TYPES = [ExerciseType.EUROPEAN, ExerciseType.AMERICAN]
+
+
+@pytest.mark.parametrize("exercise_type", _EXERCISE_TYPES)
 class TestBarrierMCInceptionHit:
-    """MC paths where the barrier is already triggered at time zero."""
+    """MC paths where the barrier is already triggered at time zero.
+
+    Inception-hit semantics are identical for European and American exercise
+    (option is dead/active at t=0; no exercise decisions yet matter), so each
+    test is parametrized over both exercise types.
+    """
 
     # -- Continuous monitoring --
 
-    def test_continuous_ko_inception_pv_zero(self):
+    def test_continuous_ko_inception_pv_zero(self, exercise_type):
         """Continuous UOC with S >= H → MC weight = 0 → PV = 0."""
         pv = _mc_price(
             _mc_gbm(spot=120.0),
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=120.0,
         )
         assert np.isclose(pv, 0.0, atol=1e-10)
 
-    def test_continuous_ko_inception_rebate_at_hit(self):
+    def test_continuous_ko_inception_rebate_at_hit(self, exercise_type):
         """Continuous UOC at inception with AT_HIT rebate → PV = rebate."""
         pv = _mc_price(
             _mc_gbm(spot=120.0),
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=120.0,
@@ -1248,7 +2384,7 @@ class TestBarrierMCInceptionHit:
         )
         assert np.isclose(pv, 5.0, atol=1e-10)
 
-    def test_continuous_ko_inception_rebate_at_expiry(self):
+    def test_continuous_ko_inception_rebate_at_expiry(self, exercise_type):
         """Continuous UOC at inception with AT_EXPIRY rebate → PV = rebate * df."""
         from derivatives_pricing.utils import calculate_year_fraction
 
@@ -1257,6 +2393,7 @@ class TestBarrierMCInceptionHit:
 
         pv = _mc_price(
             _mc_gbm(spot=120.0),
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=120.0,
@@ -1265,18 +2402,19 @@ class TestBarrierMCInceptionHit:
         )
         assert np.isclose(pv, 5.0 * df, rtol=1e-6)
 
-    def test_continuous_ki_inception_equals_vanilla(self):
+    def test_continuous_ki_inception_equals_vanilla(self, exercise_type):
         """Continuous UIC with S >= H → knocked in at inception → vanilla."""
         gbm = _mc_gbm(spot=120.0)
         pv_ki = _mc_price(
             gbm,
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.IN,
             barrier=120.0,
         )
         vanilla_spec = VanillaSpec(
             option_type=OptionType.CALL,
-            exercise_type=ExerciseType.EUROPEAN,
+            exercise_type=exercise_type,
             strike=STRIKE,
             maturity=MATURITY,
         )
@@ -1287,38 +2425,54 @@ class TestBarrierMCInceptionHit:
 
     # -- Discrete monitoring --
 
-    def test_discrete_ko_inception_pv_zero(self):
-        """Discrete DOP with S <= H → MC weight = 0 → PV = 0."""
+    def test_discrete_ko_inception_pv_zero(self, exercise_type):
+        """Discrete DOP with S <= H and pricing date in the schedule → PV = 0.
+
+        The library's default ``num_observations`` schedule excludes the
+        pricing date (BGK convention), so the inception-hit code path only
+        fires when ``monitoring_dates`` explicitly includes it.  Here we
+        pass a schedule anchored at the pricing date.
+        """
+        dates = pd.date_range(PRICING_DATE, MATURITY, periods=12).to_pydatetime().tolist()
         pv = _mc_price(
             _mc_gbm(spot=80.0),
             option_type=OptionType.PUT,
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.OUT,
             barrier=80.0,
             monitoring=BarrierMonitoring.DISCRETE,
-            num_observations=12,
+            monitoring_dates=dates,
         )
         assert np.isclose(pv, 0.0, atol=1e-10)
 
-    def test_discrete_ki_inception_equals_vanilla_aligned(self):
-        """Discrete DIC at inception with grid-aligned observations → exact match.
+    def test_discrete_ki_inception_equals_vanilla_aligned(self, exercise_type):
+        """Discrete DIC at inception with grid-aligned pricing-date observation.
 
-        Setting num_observations = num_steps + 1 ensures monitoring dates
-        land exactly on the simulation grid, so no extra dates are injected
-        and the random draws are identical to vanilla.
+        Passing ``monitoring_dates`` that include the pricing date AND land
+        exactly on the simulation grid ensures both that the inception-hit
+        code path fires and that no extra dates are injected into the
+        simulation grid — so the random draws are identical to vanilla.
         """
         gbm = _mc_gbm(spot=80.0)
+        # Build monitoring dates directly from the simulation grid so they
+        # align exactly; take N+1 points starting at pricing_date.
+        gbm.simulate(random_seed=42)  # force time_grid to materialize
+        dates = (
+            pd.date_range(PRICING_DATE, MATURITY, periods=_MC_STEPS + 1).to_pydatetime().tolist()
+        )
         pv_ki = _mc_price(
             gbm,
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.IN,
             barrier=80.0,
             monitoring=BarrierMonitoring.DISCRETE,
-            num_observations=_MC_STEPS + 1,
+            monitoring_dates=dates,
         )
         vanilla_spec = VanillaSpec(
             option_type=OptionType.CALL,
-            exercise_type=ExerciseType.EUROPEAN,
+            exercise_type=exercise_type,
             strike=STRIKE,
             maturity=MATURITY,
         )
@@ -1327,25 +2481,28 @@ class TestBarrierMCInceptionHit:
         ).present_value()
         assert np.isclose(pv_ki, pv_vanilla, rtol=1e-10)
 
-    def test_discrete_ki_inception_equals_vanilla_unaligned(self):
-        """Discrete DIC at inception with non-aligned observations → MC noise.
+    def test_discrete_ki_inception_equals_vanilla_unaligned(self, exercise_type):
+        """Discrete DIC at inception with non-aligned pricing-date observation.
 
-        With num_observations=12, monitoring dates are injected into the
-        grid, changing its size and thus the random draws. Both prices
-        converge to the same expectation; we compare within MC noise.
+        Monitoring dates include pricing_date but don't align with the
+        simulation grid, so extra dates get injected — random draws differ
+        from vanilla.  Both prices converge to the same expectation; we
+        compare within MC noise.
         """
+        dates = pd.date_range(PRICING_DATE, MATURITY, periods=12).to_pydatetime().tolist()
         gbm = _mc_gbm(spot=80.0)
         pv_ki = _mc_price(
             gbm,
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.IN,
             barrier=80.0,
             monitoring=BarrierMonitoring.DISCRETE,
-            num_observations=12,
+            monitoring_dates=dates,
         )
         vanilla_spec = VanillaSpec(
             option_type=OptionType.CALL,
-            exercise_type=ExerciseType.EUROPEAN,
+            exercise_type=exercise_type,
             strike=STRIKE,
             maturity=MATURITY,
         )
@@ -1355,12 +2512,14 @@ class TestBarrierMCInceptionHit:
         assert np.isclose(pv_ki, pv_vanilla, rtol=0.01)
 
 
+@pytest.mark.parametrize("exercise_type", _EXERCISE_TYPES)
 class TestBarrierMCDiscreteRebate:
     """Discrete monitoring rebate paths in MC."""
 
-    def test_discrete_ko_rebate_at_hit_positive(self):
+    def test_discrete_ko_rebate_at_hit_positive(self, exercise_type):
         """Discrete KO with rebate AT_HIT: PV should include rebate component."""
         pv_no_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=110.0,
@@ -1369,6 +2528,7 @@ class TestBarrierMCDiscreteRebate:
             num_observations=12,
         )
         pv_with_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=110.0,
@@ -1379,9 +2539,10 @@ class TestBarrierMCDiscreteRebate:
         )
         assert pv_with_rebate > pv_no_rebate
 
-    def test_discrete_ko_rebate_at_expiry_positive(self):
+    def test_discrete_ko_rebate_at_expiry_positive(self, exercise_type):
         """Discrete KO with rebate AT_EXPIRY: PV should include rebate component."""
         pv_no_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=110.0,
@@ -1390,6 +2551,7 @@ class TestBarrierMCDiscreteRebate:
             num_observations=12,
         )
         pv_with_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=110.0,
@@ -1400,9 +2562,10 @@ class TestBarrierMCDiscreteRebate:
         )
         assert pv_with_rebate > pv_no_rebate
 
-    def test_discrete_ki_rebate_at_expiry_positive(self):
+    def test_discrete_ki_rebate_at_expiry_positive(self, exercise_type):
         """Discrete KI with rebate AT_EXPIRY: never-knocked-in paths receive rebate."""
         pv_no_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.IN,
             barrier=85.0,
@@ -1412,6 +2575,7 @@ class TestBarrierMCDiscreteRebate:
             num_observations=12,
         )
         pv_with_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.IN,
             barrier=85.0,
@@ -1423,18 +2587,21 @@ class TestBarrierMCDiscreteRebate:
         assert pv_with_rebate > pv_no_rebate
 
 
+@pytest.mark.parametrize("exercise_type", _EXERCISE_TYPES)
 class TestBarrierMCContinuousRebateAtExpiry:
     """Continuous monitoring KO rebate AT_EXPIRY path in MC."""
 
-    def test_continuous_ko_rebate_at_expiry_positive(self):
+    def test_continuous_ko_rebate_at_expiry_positive(self, exercise_type):
         """Continuous KO with AT_EXPIRY rebate: PV includes discounted rebate."""
         pv_no_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=110.0,
             rebate=0.0,
         )
         pv_with_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.UP,
             action=BarrierAction.OUT,
             barrier=110.0,
@@ -1443,9 +2610,10 @@ class TestBarrierMCContinuousRebateAtExpiry:
         )
         assert pv_with_rebate > pv_no_rebate
 
-    def test_continuous_ki_rebate_at_expiry_positive(self):
+    def test_continuous_ki_rebate_at_expiry_positive(self, exercise_type):
         """Continuous KI with AT_EXPIRY rebate: never-in paths receive rebate."""
         pv_no_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.IN,
             barrier=85.0,
@@ -1453,6 +2621,7 @@ class TestBarrierMCContinuousRebateAtExpiry:
             rebate_timing=RebateTiming.AT_EXPIRY,
         )
         pv_with_rebate = _mc_price(
+            exercise_type=exercise_type,
             direction=BarrierDirection.DOWN,
             action=BarrierAction.IN,
             barrier=85.0,

@@ -11,6 +11,15 @@ PDE via finite differences for European and American options:
 - optional Rannacher smoothing for Crank–Nicolson
 - spatial grids: spot or log-spot
 - American handling: intrinsic projection or Gauss-Seidel/PSOR
+
+Discrete barriers
+-----------------
+Uses Boyle-Tian-inspired half-step barrier placement for discrete
+monitoring.  This tends to improve accuracy when the monitoring interval
+is not too fine relative to the PDE grid time-step.  If monitoring is
+extremely dense relative to the PDE grid, the correction can over-shift;
+in that regime the contract is close to continuously monitored and
+``BarrierMonitoring.CONTINUOUS`` is usually the better model choice.
 """
 
 from __future__ import annotations
@@ -58,7 +67,6 @@ from ..exceptions import (
 )
 from .contracts import BarrierSpec, PayoffSpec, PayoffBoundaryModel, VanillaSpec, WingBoundary
 from .params import PDEParams
-from .barrier_analytical import _is_triggered
 
 if TYPE_CHECKING:
     from .core import OptionValuation, UnderlyingData
@@ -131,8 +139,14 @@ def _build_tau_grid(
     base = np.linspace(0.0, time_to_maturity, time_steps + 1)
     if not extra_taus:
         return base
-    grid = np.unique(np.concatenate([base, np.array(extra_taus, dtype=float)]))
-    grid.sort()
+    # Round to 12dp on both inputs so np.unique can collapse near-duplicates.
+    # Extras already arrive at 12dp from the upstream tau converters
+    # (_barrier_monitoring_taus, _dividend_tau_schedule); the linspace base
+    # is bit-fresh.  Without the round, an extra that lands on the same
+    # physical time as a base point survives as a sub-1e-12 neighbour, then
+    # `T - tau` collapses both to the same float and downstream forward-rate
+    # calls raise on dt == 0.
+    grid = np.unique(np.round(np.concatenate([base, np.array(extra_taus, dtype=float)]), 12))
     return grid
 
 
@@ -372,6 +386,7 @@ def _build_log_grid(
     time_steps: int,
     method: PDEMethod,
     anchor_spot: float | None = None,
+    anchor_half_step: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Build log-spot grid.
 
@@ -390,15 +405,16 @@ def _build_log_grid(
     density directly: ``dz = (zmax_target - zmin_target) / spot_steps``.
 
     When ``anchor_spot`` is provided, the grid is sized so that the anchor
-    lies exactly on an interior node *and* the resulting domain is a
-    (possibly slight) superset of ``[zmin_target, zmax_target]``. For
-    CN/IMPLICIT this is achieved by recomputing ``dz`` from the binding
-    half (left or right of the anchor), i.e. the side that requires the
-    larger uniform ``dz`` to keep the anchor on-node while still covering
-    the target domain. The other side can then have up to roughly one cell
-    of slack. For explicit schemes ``dz`` is fixed by Hull's stability
-    heuristic, so the grid is shifted in place while keeping strict cover
-    of the target domain.
+    lies exactly on an interior node by default. If ``anchor_half_step`` is
+    true, the anchor instead lies halfway between two adjacent nodes. In both
+    cases the resulting domain is a (possibly slight) superset of
+    ``[zmin_target, zmax_target]``. For CN/IMPLICIT this is achieved by
+    recomputing ``dz`` from the binding half (left or right of the anchor),
+    i.e. the side that requires the larger uniform ``dz`` to keep the anchor
+    on-node or at a cell midpoint while still covering the target domain. The
+    other side can then have up to roughly one cell of slack. For explicit
+    schemes ``dz`` is fixed by Hull's stability heuristic, so the grid is
+    shifted in place while keeping strict cover of the target domain.
     """
     smax = float(smax_mult * max(spot, strike))
     smin = float(max(max(spot, strike) / smax_mult, 1.0e-8))
@@ -448,16 +464,22 @@ def _build_log_grid(
             # ``[zmin_target, zmax_target]``. If the target span is already
             # capped exactly by ``spot_steps * dz``, exact anchoring is only
             # possible when the anchor happens to lie on that fixed grid.
-            j_min = max(0, int(math.ceil((z_anchor - zmin_target) / dz - 1.0e-12)))
+            anchor_offset = 0.5 if anchor_half_step else 0.0
+            j_min = max(
+                0,
+                int(math.ceil((z_anchor - zmin_target) / dz - anchor_offset - 1.0e-12)),
+            )
             j_max = min(
-                spot_steps,
-                int(math.floor(spot_steps - (zmax_target - z_anchor) / dz + 1.0e-12)),
+                spot_steps - 1 if anchor_half_step else spot_steps,
+                int(
+                    math.floor(spot_steps - (zmax_target - z_anchor) / dz - anchor_offset + 1.0e-12)
+                ),
             )
             if j_min > j_max:
                 raise StabilityError(
                     "Unable to align anchor_spot on the log grid with current setup"
                 )
-            preferred_index = int(round((z_anchor - zmin) / dz))
+            preferred_index = int(round((z_anchor - zmin) / dz - anchor_offset))
             j_anchor = min(max(preferred_index, j_min), j_max)
         else:
             # CN/IMPLICIT: dz is free, so instead of shifting a fixed-dz
@@ -476,16 +498,17 @@ def _build_log_grid(
             #   - costs at most ~1/(spot_steps - 1) extra dz vs the bare-
             #     minimum tile of the target span.
             span = zmax_target - zmin_target
-            j_opt = int(round(spot_steps * (z_anchor - zmin_target) / span))
-            j_anchor = max(1, min(spot_steps - 1, j_opt))
-            left_dz = (z_anchor - zmin_target) / j_anchor
-            right_dz = (zmax_target - z_anchor) / (spot_steps - j_anchor)
+            anchor_offset = 0.5 if anchor_half_step else 0.0
+            j_opt = int(round(spot_steps * (z_anchor - zmin_target) / span - anchor_offset))
+            j_anchor = max(0 if anchor_half_step else 1, min(spot_steps - 1, j_opt))
+            left_dz = (z_anchor - zmin_target) / (j_anchor + anchor_offset)
+            right_dz = (zmax_target - z_anchor) / (spot_steps - j_anchor - anchor_offset)
             dz = max(left_dz, right_dz)
 
-        zmin = z_anchor - j_anchor * dz
+        zmin = z_anchor - (j_anchor + (0.5 if anchor_half_step else 0.0)) * dz
 
     Z = zmin + dz * np.arange(spot_steps + 1, dtype=float)
-    if anchor_spot is not None:
+    if anchor_spot is not None and not anchor_half_step:
         Z[j_anchor] = z_anchor
     S = np.exp(Z)
     return Z, S, dz
@@ -497,8 +520,9 @@ def _build_spot_grid(
     smax: float,
     spot_steps: int,
     anchor_spot: float | None = None,
+    anchor_half_step: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """Build a uniform spot grid, optionally aligning an anchor to a node."""
+    """Build a uniform spot grid, optionally aligning an anchor to a node or midpoint."""
     if anchor_spot is None:
         grid = np.linspace(smin, smax, spot_steps + 1)
         dS = (smax - smin) / spot_steps
@@ -508,6 +532,16 @@ def _build_spot_grid(
         raise ValidationError("anchor_spot must lie strictly inside the spot-grid domain")
 
     ratio = (anchor_spot - smin) / (smax - smin)
+    if anchor_half_step:
+        j_max = min(spot_steps - 1, int(math.floor(spot_steps * ratio - 0.5 + 1.0e-12)))
+        if j_max < 0:
+            raise StabilityError("Unable to align anchor_spot on the spot grid with current setup")
+        preferred_index = int(round(spot_steps * ratio - 0.5))
+        j_anchor = min(max(preferred_index, 0), j_max)
+        dS = (anchor_spot - smin) / (j_anchor + 0.5)
+        grid = smin + dS * np.arange(spot_steps + 1, dtype=float)
+        return grid, grid, dS
+
     j_max = min(spot_steps - 1, int(math.floor(spot_steps * ratio + 1.0e-12)))
     if j_max < 1:
         raise StabilityError("Unable to align anchor_spot on the spot grid with current setup")
@@ -1399,21 +1433,69 @@ class _FDGridGreeksMixin:
             return short_circuit[1]
         return self._grid_gamma_safe(S, V, j, spot)
 
-    def theta(self) -> float:
-        r"""Grid theta via backward difference between the last two time
-        slices.
+    def _grid_theta_bs_identity(
+        self,
+        S: np.ndarray,
+        V: np.ndarray,
+        j: int,
+        spot: float,
+        last_dtau: float,
+    ) -> float:
+        r"""Return per-calendar-day theta via the Black-Scholes PDE identity.
 
         .. math::
 
-            \Theta \approx \frac{V^{n}(S_0) - V^{n-1}(S_0)}{\Delta t}
+            \Theta = r V - (r - q) S \Delta - \tfrac{1}{2} \sigma^{2} S^{2} \Gamma
 
-        Returned per **calendar day** (divided by 365).
+        ``V`` is interpolated to exact ``spot`` with the same parabolic
+        Lagrange stencil used by :meth:`_grid_delta_at_spot`; ``r`` and
+        ``q`` are the forward rates over the first PDE step (exact for
+        flat curves, first-order local otherwise).  Result is divided by
+        365 to match the calendar-day convention used elsewhere.
         """
-        _, V, V_prev, last_dtau, j, _ = self._grid_greeks_data()
+        # PV at exactly spot (parabolic Lagrange through the delta stencil).
+        x0, x1, x2 = S[j - 1], S[j], S[j + 1]
+        v0, v1, v2 = V[j - 1], V[j], V[j + 1]
+        pv_at_spot = float(
+            v0 * (spot - x1) * (spot - x2) / ((x0 - x1) * (x0 - x2))
+            + v1 * (spot - x0) * (spot - x2) / ((x1 - x0) * (x1 - x2))
+            + v2 * (spot - x0) * (spot - x1) / ((x2 - x0) * (x2 - x1))
+        )
+        delta = self._grid_delta_at_spot(S, V, j, spot)
+        gamma = self._grid_gamma_safe(S, V, j, spot)
+
+        sigma = float(self.underlying.volatility)
+        dt_probe = max(last_dtau, 1.0e-8)
+        r = float(self.valuation_ctx.discount_curve.forward_rate(0.0, dt_probe))
+        q = 0.0
+        if self.underlying.dividend_curve is not None:
+            q = float(self.underlying.dividend_curve.forward_rate(0.0, dt_probe))
+
+        theta_annual = (
+            r * pv_at_spot - (r - q) * spot * delta - 0.5 * sigma * sigma * spot * spot * gamma
+        )
+        return float(theta_annual / 365.0)
+
+    def theta(self) -> float:
+        r"""Grid theta via the Black-Scholes PDE identity.
+
+        Uses :meth:`_grid_theta_bs_identity` so theta attains the same
+        order of accuracy as the grid delta and gamma — notably better
+        near steep spatial gradients such as a barrier, where a
+        first-order backward time-difference amplifies the local error
+        in ``V``.  Returned per **calendar day**.
+
+        Short-circuits to ``0`` when the option is American and the spot
+        node sits in the early-exercise region; the Black-Scholes PDE
+        becomes an inequality there and the identity no longer holds.
+        """
+        S, V, _, last_dtau, j, spot = self._grid_greeks_data()
+        short_circuit = self._intrinsic_short_circuit_greeks(S, V, j)
+        if short_circuit is not None:
+            return 0.0
         if last_dtau <= 0.0:
             return 0.0
-        theta_annual = (V_prev[j] - V[j]) / last_dtau
-        return float(theta_annual / 365.0)
+        return self._grid_theta_bs_identity(S, V, j, spot, last_dtau)
 
 
 class _FDValuationBase(_FDGridGreeksMixin):
@@ -1716,6 +1798,7 @@ def _fd_barrier_ko_core(
                 time_steps=time_steps,
                 method=method,
                 anchor_spot=barrier,
+                anchor_half_step=True,
             )
     else:
         # Spot grid
@@ -1730,6 +1813,7 @@ def _fd_barrier_ko_core(
                 smax=smax,
                 spot_steps=spot_steps,
                 anchor_spot=barrier,
+                anchor_half_step=True,
             )
 
     smin = float(S[0])
@@ -2114,6 +2198,7 @@ def _fd_barrier_ki_core(
             time_steps=time_steps,
             method=method,
             anchor_spot=barrier,
+            anchor_half_step=not continuous,
         )
     else:
         smax = float(smax_mult * ref_price)
@@ -2122,6 +2207,7 @@ def _fd_barrier_ki_core(
             smax=smax,
             spot_steps=spot_steps,
             anchor_spot=barrier,
+            anchor_half_step=not continuous,
         )
 
     smin = float(S[0])
@@ -2463,21 +2549,11 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         assert isinstance(valuation_ctx.params, PDEParams)
         self.pde_params = valuation_ctx.params
 
-    def _is_triggered_at_inception(self) -> bool:
-        spot = float(self.underlying.initial_value)
-        barrier = float(self._spec.barrier)
-        if not _is_triggered(spot, barrier, self._spec.direction):
-            return False
-
-        if self._spec.monitoring is BarrierMonitoring.CONTINUOUS:
-            return True
-
-        monitoring_dates = self.valuation_ctx._barrier_monitoring_dates()
-        assert monitoring_dates is not None
-        return any(date == self.valuation_ctx.pricing_date for date in monitoring_dates)
-
     def _resolved_knock_out_value(self) -> float | None:
-        if self._spec.action is not BarrierAction.OUT or not self._is_triggered_at_inception():
+        if (
+            self._spec.action is not BarrierAction.OUT
+            or not self.valuation_ctx._barrier_triggered_at_inception()
+        ):
             return None
 
         if self._spec.rebate <= 0.0:
@@ -2557,16 +2633,16 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         j = _FDGridGreeksMixin._spot_grid_index(S, spot)
         return _FDGridGreeksMixin._grid_gamma_safe(S, V, j, spot)
 
-    @staticmethod
     def _grid_theta_from_result(
+        self,
         result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
         spot: float,
     ) -> float:
-        _, S, V, V_prev, last_dtau = result
+        _, S, V, _, last_dtau = result
         if last_dtau <= 0.0:
             return 0.0
         j = _FDGridGreeksMixin._spot_grid_index(S, spot)
-        return float((V_prev[j] - V[j]) / last_dtau / 365.0)
+        return self._grid_theta_bs_identity(S, V, j, spot, last_dtau)
 
     def _base_solve_args(self) -> dict:
         """Build keyword arguments shared by both KO and KI solvers."""
@@ -2658,7 +2734,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
     def delta(self) -> float:
         spec = self._spec
-        if self._is_triggered_at_inception():
+        if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return 0.0
             return self._vanilla_equivalent_valuation().delta(greek_calc_method=None)
@@ -2675,7 +2751,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
     def gamma(self) -> float:
         """Return grid gamma, using native-surface parity for European KI barriers."""
         spec = self._spec
-        if self._is_triggered_at_inception():
+        if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return 0.0
             return self._vanilla_equivalent_valuation().gamma(greek_calc_method=None)
@@ -2691,7 +2767,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
     def theta(self) -> float:
         spec = self._spec
-        if self._is_triggered_at_inception():
+        if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return self._resolved_knock_out_theta()
             return self._vanilla_equivalent_valuation().theta(greek_calc_method=None)
@@ -2746,7 +2822,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
     def present_value(self) -> float:
         """Return present value from the PDE barrier solve."""
-        if self._is_triggered_at_inception():
+        if self.valuation_ctx._barrier_triggered_at_inception():
             if self._spec.action is BarrierAction.OUT:
                 triggered_value = self._resolved_knock_out_value()
                 if triggered_value is None:

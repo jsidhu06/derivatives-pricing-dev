@@ -54,7 +54,7 @@ from .binomial import (
 )
 from .bsm import _BSMEuropeanValuation
 from .asian_analytical import _AnalyticalAsianValuation
-from .barrier_analytical import _AnalyticalBarrierValuation
+from .barrier_analytical import _AnalyticalBarrierValuation, _is_triggered
 from .pde import _FDEuropeanValuation, _FDAmericanValuation, _FDBarrierValuation
 from ..rates import DiscountCurve
 from ..market_environment import MarketData
@@ -319,6 +319,19 @@ class OptionValuation:
             raise ConfigurationError(
                 f"{pricing_method.name} pricing requires an UnderlyingData instance, "
                 f"got {type(underlying).__name__}."
+            )
+
+        if (
+            pricing_method is PricingMethod.BINOMIAL
+            and isinstance(spec, BarrierSpec)
+            and underlying.discrete_dividends
+        ):
+            raise UnsupportedFeatureError(
+                "Binomial pricing of barrier options with discrete dividends is not supported. "
+                "The escrowed-dividend tree adjustment used for vanilla options does not "
+                "preserve the correct barrier-hit dynamics at ex-dividend dates. Accurate "
+                "treatment would require a different tree construction rather than the "
+                "standard recombining CRR barrier tree. Use PDE_FD or MONTE_CARLO instead."
             )
 
         # Assign early so helper methods (_asian_fixing_dates,
@@ -822,7 +835,17 @@ class OptionValuation:
             if pricing_method is PricingMethod.MONTE_CARLO:
                 return MonteCarloParams()
             if pricing_method is PricingMethod.BINOMIAL:
-                return BinomialParams.for_barriers() if is_barrier else BinomialParams()
+                if not is_barrier:
+                    return BinomialParams()
+                # Continuous barriers get Boyle-Lau step inflation automatically,
+                # so 1000 base steps typically suffice.  Discrete barriers have
+                # no equivalent auto-adjustment (the tree is built exactly at
+                # the user-specified num_steps), so we default higher to
+                # accommodate the harder tree/monitoring-date alignment.
+                assert isinstance(spec, BarrierSpec)
+                if spec.monitoring is BarrierMonitoring.CONTINUOUS:
+                    return BinomialParams.for_barriers()
+                return BinomialParams.for_barriers(num_steps=5000)
             if pricing_method is PricingMethod.PDE_FD:
                 return PDEParams.for_barriers() if is_barrier else PDEParams()
             return None
@@ -883,13 +906,38 @@ class OptionValuation:
         if spec.monitoring_dates is not None:
             return tuple(spec.monitoring_dates)
 
+        # N+1 dates from pricing_date to maturity; drop t=0 to leave N dates
+        # at T/N, 2T/N, ..., T.  Matches the standard academic convention for
+        # discretely-monitored barriers.
         return tuple(
             pd.date_range(
                 start=self.pricing_date,
                 end=self.maturity,
-                periods=spec.num_observations,
-            ).to_pydatetime()
+                periods=spec.num_observations + 1,
+            )[1:].to_pydatetime()
         )
+
+    def _barrier_triggered_at_inception(self) -> bool:
+        """Return ``True`` only if the barrier has been hit AND that hit is
+        observable at the pricing date.
+
+        Continuous monitoring treats every instant as an observation, so a
+        spot past the barrier at ``t=0`` is an immediate trigger.  Discrete
+        monitoring only observes the barrier at explicit monitoring dates;
+        the pricing date qualifies only if it appears in that schedule.
+        """
+        assert isinstance(self._spec, BarrierSpec), (
+            "_barrier_triggered_at_inception called on non-BarrierSpec valuation; "
+            "the dispatcher should route BarrierSpecs to barrier engines only."
+        )
+        spot = float(self._underlying.initial_value)
+        if not _is_triggered(spot, self._spec.barrier, self._spec.direction):
+            return False
+        if self._spec.monitoring is BarrierMonitoring.CONTINUOUS:
+            return True
+        mon_dates = self._barrier_monitoring_dates()
+        assert mon_dates is not None
+        return any(d == self.pricing_date for d in mon_dates)
 
     def _apply_control_variate(self, base_pv: float) -> float:
         """Apply European control-variate adjustment to American base PV.

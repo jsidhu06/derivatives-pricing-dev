@@ -26,7 +26,7 @@ Built for teaching, research, and production-adjacent workflows.
 E = European, A = American
 
 **Method details:** BSM uses closed-form Black-Scholes-Merton; Binomial uses Cox-Ross-Rubinstein trees;
-PDE_FD uses implicit, explicit, and Crank-Nicolson finite difference schemes;
+PDE_FD supports implicit, explicit, and Crank-Nicolson finite difference schemes;
 Monte Carlo uses Longstaff-Schwartz for American-style exercise.
 Asian analytical pricing uses Turnbull-Wakeman (arithmetic) and Kemna-Vorst (geometric),
 with Hull averaging on binomial trees. Barrier pricing supports continuous and discrete monitoring,
@@ -107,7 +107,7 @@ print(f"{'Delta:':<8} {val.delta():>10.4f}")
 The repo includes two companion directories:
 
 - **`examples/`** — concise notebooks showing how to call the public API for each feature
-  (European options, Americans, barriers, PDE_FD, Asian, Greeks, jump diffusion, discount curves).
+  (European and American vanilla options, Asians, barriers, Greeks, jump diffusion, discount curves).
 - **`tutorials/`** — deeper walkthroughs that teach the theory behind each pricing method
   (BSM, binomial trees, finite differences, Monte Carlo, Asian averaging, barrier pricing).
   Tutorials may access private/internal classes for demonstration purposes.

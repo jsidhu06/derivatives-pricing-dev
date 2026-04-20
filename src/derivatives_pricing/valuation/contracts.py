@@ -393,10 +393,16 @@ class BarrierSpec:
     contract_size : int | float
         Contract multiplier (default 100).
     num_observations : int, optional
-        Number of equally spaced monitoring observations for DISCRETE monitoring.
+        Number of equally spaced monitoring observations for DISCRETE
+        monitoring.  Generates ``N`` dates at ``t = T/N, 2T/N, ..., T``;
+        the pricing date (``t=0``) is **excluded**, in line with the
+        academic convention used by Broadie-Glasserman-Kou (1997) and
+        Boyle-Tian (1998).  Note this differs from ``AsianSpec``, where
+        ``num_observations`` includes the pricing date as a fixing.  To
+        include the pricing date in a barrier monitoring schedule, pass
+        it explicitly via ``monitoring_dates``.
     monitoring_dates : Sequence[dt.datetime], optional
-        Explicit monitoring dates for DISCRETE monitoring.  For future use by
-        Monte Carlo and PDE engines.
+        Explicit monitoring dates for DISCRETE monitoring.
     """
 
     option_type: OptionType
@@ -515,8 +521,8 @@ class BarrierSpec:
                     "num_observations or monitoring_dates."
                 )
             if self.num_observations is not None:
-                if not isinstance(self.num_observations, int) or self.num_observations < 2:
-                    raise ValidationError("num_observations must be an integer >= 2")
+                if not isinstance(self.num_observations, int) or self.num_observations < 1:
+                    raise ValidationError("num_observations must be an integer >= 1")
 
             if self.monitoring_dates is not None:
                 dates = tuple(self.monitoring_dates)

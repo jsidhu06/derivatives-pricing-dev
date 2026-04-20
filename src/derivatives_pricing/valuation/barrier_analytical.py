@@ -1,4 +1,4 @@
-"""Analytical barrier option valuation (Hull §26.9).
+"""Analytical barrier option valuation.
 
 Implements closed-form barrier pricing for all 8 standard barrier types:
 {up, down} × {in, out} × {call, put}.
@@ -17,11 +17,11 @@ Current scope
 
 References
 ----------
+Reiner, E. and Rubinstein, M. (1991). "Breaking Down the Barriers",
+    *Risk*, 4(8), 28–35.
 Hull, J. C. *Options, Futures, and Other Derivatives*, Section 26.9.
 Broadie, M., Glasserman, P. and Kou, S. (1997). "A Continuity Correction
     for Discrete Barrier Options", *Mathematical Finance*, 7(4), 325–349.
-Reiner, E. and Rubinstein, M. (1991). "Breaking Down the Barriers",
-    *Risk*, 4(8), 28–35.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def _is_triggered(
     barrier: float,
     direction: BarrierDirection,
 ) -> bool:
-    """Return True if the barrier has already been triggered at inception.
+    """Return ``True`` if the barrier is triggered.
 
     Parameters
     ----------
@@ -68,7 +68,7 @@ def _is_triggered(
     Returns
     -------
     bool
-        ``True`` when the barrier condition is satisfied at time zero.
+        ``True`` if the barrier is triggered.
     """
     if direction is BarrierDirection.UP:
         return spot >= barrier
@@ -87,8 +87,10 @@ def _broadie_glasserman_adjustment(
 ) -> float:
     """Apply Broadie-Glasserman-Kou continuity correction to a barrier level.
 
-    For discrete monitoring with *m* equally spaced observations over ``[0, T]``,
-    the corrected barrier is:
+    For discrete monitoring with *m* equally spaced observations at
+    ``t_i = i · T/m`` for ``i = 1, ..., m`` (i.e. the pricing date ``t = 0``
+    is excluded; the set of observation points is ``(0, T]``), the corrected
+    barrier is:
 
         H_adj = H · exp(±β · σ · √(T/m))
 
@@ -251,10 +253,10 @@ def _rebate_knock_in_at_expiry(
     return R * df_r - hit_pv
 
 
-# ── Hull §26.9 building-block terms ───────────────────────────────
+# ── Reiner-Rubinstein building-block terms ────────────────────────
 
 
-def _hull_barrier_terms(
+def _barrier_formula_terms(
     S: float,
     K: float,
     H: float,
@@ -266,7 +268,7 @@ def _hull_barrier_terms(
     eta: float,
     lam: float,
 ) -> tuple[float, float, float, float]:
-    """Compute the four building-block terms A, B, C, D from Hull §26.9.
+    """Compute the four Reiner-Rubinstein building-block terms A, B, C, D.
 
     Parameters
     ----------
@@ -322,7 +324,7 @@ def _hull_barrier_terms(
     return A, B, C, D
 
 
-def _hull_barrier_no_rebate(
+def _barrier_price_no_rebate(
     S: float,
     K: float,
     H: float,
@@ -336,7 +338,7 @@ def _hull_barrier_no_rebate(
     direction: BarrierDirection,
     action: BarrierAction,
 ) -> float:
-    """Analytical barrier option price (no rebate) from Hull §26.9.
+    """Analytical no-rebate barrier option price from the Reiner-Rubinstein formulas.
 
     Dispatches to the correct A/B/C/D combination based on the 16-case table.
 
@@ -371,7 +373,7 @@ def _hull_barrier_no_rebate(
     sigma2 = sigma**2
     lam = (r - q + sigma2 / 2.0) / sigma2
 
-    A, B, C, D = _hull_barrier_terms(S, K, H, sigma, T, df_r, df_q, phi, eta, lam)
+    A, B, C, D = _barrier_formula_terms(S, K, H, sigma, T, df_r, df_q, phi, eta, lam)
 
     is_call = option_type is OptionType.CALL
     is_down = direction is BarrierDirection.DOWN
@@ -413,7 +415,7 @@ def _hull_barrier_no_rebate(
 
 
 class _AnalyticalBarrierValuation:
-    """Analytical barrier option valuation engine (Hull §26.9).
+    """Analytical barrier option valuation engine.
 
     Dispatched by ``OptionValuation`` when ``spec`` is :class:`BarrierSpec` and
     ``pricing_method`` is ``BSM``.
@@ -426,7 +428,8 @@ class _AnalyticalBarrierValuation:
 
         if self.underlying.discrete_dividends:
             raise UnsupportedFeatureError(
-                "Analytical barrier formula does not support discrete dividends. Use MONTE_CARLO."
+                "Analytical barrier formula does not support discrete dividends. Use PDE_FD "
+                "or MONTE_CARLO."
             )
 
     def solve(self) -> float:
@@ -451,12 +454,12 @@ class _AnalyticalBarrierValuation:
         dividend_curve = underlying.dividend_curve
         df_q = float(dividend_curve.df(T)) if dividend_curve is not None else 1.0
 
-        # Flat-equivalent rates for Hull's formulas
+        # Flat-equivalent rates
         r = -np.log(df_r) / T
         q = -np.log(df_q) / T
 
         # ── Check if barrier already triggered at inception ──
-        if _is_triggered(S, H, spec.direction):
+        if ctx._barrier_triggered_at_inception():
             return self._triggered_at_inception(df_r, spec)
 
         # ── Discrete monitoring: Broadie-Glasserman adjustment ──
@@ -464,13 +467,13 @@ class _AnalyticalBarrierValuation:
             if spec.num_observations is None:
                 raise UnsupportedFeatureError(
                     "Analytical barrier pricing with DISCRETE monitoring requires "
-                    "num_observations (equally spaced). Use MONTE_CARLO for "
+                    "num_observations (equally spaced). Use BINOMIAL, PDE_FD or MONTE_CARLO for "
                     "explicit monitoring_dates."
                 )
             H = _broadie_glasserman_adjustment(H, sigma, T, spec.num_observations, spec.direction)
 
         # ── No-rebate barrier value ──
-        value = _hull_barrier_no_rebate(
+        value = _barrier_price_no_rebate(
             S,
             K,
             H,
