@@ -2155,15 +2155,8 @@ def test_barrier_rebate_european_vs_quantlib(
         r_curve=r_curve,
         q_curve=q_curve,
     )
-    # KO at-hit matches QL exactly; KI at-expiry differs because QL mixes
-    # at-hit/at-expiry timing in its complementary rebate calculation.
-    if action is BarrierAction.OUT:
-        analytic_tol = 1e-10
-    else:
-        analytic_tol = 0.005  # ~0.3–0.4% expected
-
     # TODO: Switch ql to FD engine for non-flat curves
-    assert np.isclose(dp_analytical, ql_analytical, rtol=analytic_tol), (
+    assert np.isclose(dp_analytical, ql_analytical, rtol=1e-10), (
         f"DP_AN {dp_analytical:.6f} vs QL_AN {ql_analytical:.6f}"
     )
     assert np.isclose(dp_pde, ql_analytical, rtol=3e-3, atol=1e-4), (

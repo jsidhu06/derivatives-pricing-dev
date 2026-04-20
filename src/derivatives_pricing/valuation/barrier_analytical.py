@@ -216,17 +216,21 @@ def _rebate_knock_out_at_expiry(
         return 0.0
 
     sigma2 = sigma**2
-    lam = (r - q + sigma2 / 2.0) / sigma2
+    # Log-spot (risk-neutral) drift μ = r − q − σ²/2.  The first-passage
+    # probability formula uses this drift directly
+    mu = r - q - sigma2 / 2.0
     sigma_sqrt_T = sigma * np.sqrt(T)
 
     eta = 1.0 if direction is BarrierDirection.DOWN else -1.0
     log_HS = np.log(H / S)
 
-    c1 = log_HS / sigma_sqrt_T + lam * sigma_sqrt_T
-    c2 = log_HS / sigma_sqrt_T - lam * sigma_sqrt_T
-
-    # Hitting probability via reflection principle
-    hit_prob = norm.cdf(eta * c1) + (H / S) ** (2.0 * lam - 2.0) * norm.cdf(eta * c2)
+    # Reflection-principle first-passage probability of a Brownian
+    # motion with drift: P(barrier hit on [0, T]) =
+    #     N(η·a) + (H/S)^{2μ/σ²} · N(η·b)
+    # where a = (ln(H/S) − μT)/σ√T  and  b = (ln(H/S) + μT)/σ√T.
+    a = (log_HS - mu * T) / sigma_sqrt_T
+    b = (log_HS + mu * T) / sigma_sqrt_T
+    hit_prob = norm.cdf(eta * a) + (H / S) ** (2.0 * mu / sigma2) * norm.cdf(eta * b)
 
     return R * df_r * hit_prob
 
