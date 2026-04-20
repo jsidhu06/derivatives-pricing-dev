@@ -20,6 +20,7 @@ Design notes
 from __future__ import annotations
 from dataclasses import dataclass, replace as dc_replace
 from collections.abc import Sequence
+from functools import wraps
 from typing import Any
 import datetime as dt
 import logging
@@ -245,6 +246,31 @@ def as_underlying_data(process: GBMProcess | UnderlyingData) -> UnderlyingData:
     )
 
 
+def _memoize_result(fn):
+    """Cache an :class:`OptionValuation` accessor's output on the instance.
+
+    Keys on ``(fn.__name__, *sorted(kwargs.items()))``.  OptionValuation
+    instances are effectively immutable — any "change" to inputs happens
+    via :func:`dataclasses.replace` on the underlying/spec, yielding a
+    fresh OV with its own empty cache — so output caching is safe and
+    needs no explicit invalidation.  Exceptions propagate without being
+    cached.  Internal calls like ``self.present_value()`` inside
+    ``gamma``/``theta`` transparently benefit from a prior PV cache hit.
+    """
+
+    @wraps(fn)
+    def wrapper(self, **kwargs):
+        key = (fn.__name__,) + tuple(sorted(kwargs.items()))
+        cache = self._cache
+        if key in cache:
+            return cache[key]
+        result = fn(self, **kwargs)
+        cache[key] = result
+        return result
+
+    return wrapper
+
+
 class OptionValuation:
     """Single-factor option valuation facade and dispatcher.
     Instances are effectively immutable once created — constructor arguments are exposed as
@@ -397,10 +423,15 @@ class OptionValuation:
         # Dispatch to appropriate pricing method implementation
         self._impl = self._build_impl()
 
+        # Output cache for repeated calls to PV / greek accessors.  Keyed
+        # by (method_name, *sorted_kwargs).  See `_memoize_result` above.
+        self._cache: dict[tuple, float] = {}
+
     # ──────────────────────────────
     # Public API (methods)
     # ──────────────────────────────
 
+    @_memoize_result
     def present_value(self) -> float:
         """Calculate present value of the derivative."""
         base_pv = float(self._impl.present_value())
@@ -418,6 +449,7 @@ class OptionValuation:
             )
         return pv_pathwise()
 
+    @_memoize_result
     def delta(
         self,
         *,
@@ -470,6 +502,7 @@ class OptionValuation:
             - self._build_valuation(underlying=dn).present_value()
         ) / (2 * epsilon)
 
+    @_memoize_result
     def gamma(
         self,
         *,
@@ -528,6 +561,7 @@ class OptionValuation:
 
         return (value_right - 2 * value_center + value_left) / (epsilon**2)
 
+    @_memoize_result
     def vega(
         self,
         *,
@@ -575,6 +609,7 @@ class OptionValuation:
         )
         return vega
 
+    @_memoize_result
     def theta(
         self,
         *,
@@ -633,6 +668,7 @@ class OptionValuation:
 
         return (value_bumped - value_now) / time_bump_days
 
+    @_memoize_result
     def rho(
         self,
         *,
