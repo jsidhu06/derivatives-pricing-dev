@@ -87,8 +87,10 @@ def _broadie_glasserman_adjustment(
 ) -> float:
     """Apply Broadie-Glasserman-Kou continuity correction to a barrier level.
 
-    For discrete monitoring with *m* equally spaced observations over ``[0, T]``,
-    the corrected barrier is:
+    For discrete monitoring with *m* equally spaced observations at
+    ``t_i = i · T/m`` for ``i = 1, ..., m`` (i.e. the pricing date ``t = 0``
+    is excluded; the set of observation points is ``(0, T]``), the corrected
+    barrier is:
 
         H_adj = H · exp(±β · σ · √(T/m))
 
@@ -426,7 +428,8 @@ class _AnalyticalBarrierValuation:
 
         if self.underlying.discrete_dividends:
             raise UnsupportedFeatureError(
-                "Analytical barrier formula does not support discrete dividends. Use MONTE_CARLO."
+                "Analytical barrier formula does not support discrete dividends. Use PDE_FD "
+                "or MONTE_CARLO."
             )
 
     def solve(self) -> float:
@@ -464,7 +467,7 @@ class _AnalyticalBarrierValuation:
             if spec.num_observations is None:
                 raise UnsupportedFeatureError(
                     "Analytical barrier pricing with DISCRETE monitoring requires "
-                    "num_observations (equally spaced). Use MONTE_CARLO for "
+                    "num_observations (equally spaced). Use BINOMIAL, PDE_FD or MONTE_CARLO for "
                     "explicit monitoring_dates."
                 )
             H = _broadie_glasserman_adjustment(H, sigma, T, spec.num_observations, spec.direction)
