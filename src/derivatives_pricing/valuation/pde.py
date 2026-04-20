@@ -1508,6 +1508,11 @@ class _FDValuationBase(_FDGridGreeksMixin):
         self.underlying = valuation_ctx.underlying  # type: ignore[assignment]
         assert isinstance(valuation_ctx.params, PDEParams)
         self.pde_params = valuation_ctx.params
+        # Lazy PDE-solve cache.  Populated on first ``_solve`` call and
+        # shared by every subsequent PV / grid-greek access on this
+        # instance, so ``delta`` / ``gamma`` / ``theta`` after a
+        # ``present_value`` call are O(1) grid lookups.
+        self._solve_result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float] | None = None
 
     def solve(self) -> tuple[float, np.ndarray, np.ndarray]:
         """Compute the full FD solution on the spot grid at pricing time."""
@@ -1515,6 +1520,13 @@ class _FDValuationBase(_FDGridGreeksMixin):
         return pv, S, V
 
     def _solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
+        """Memoised PDE solve result (see ``_compute_solve`` for the real work)."""
+        if self._solve_result is not None:
+            return self._solve_result
+        self._solve_result = self._compute_solve()
+        return self._solve_result
+
+    def _compute_solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the PDE finite-difference solve."""
         params = self.pde_params
 
@@ -2548,6 +2560,21 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         self._spec: BarrierSpec = valuation_ctx.spec  # type: ignore[assignment]
         assert isinstance(valuation_ctx.params, PDEParams)
         self.pde_params = valuation_ctx.params
+        # Lazy PDE-solve caches.  ``_solve_result`` holds the full 5-tuple
+        # returned by the backward PDE solve (KO directly; EU KI via
+        # parity; AM KI via the two-surface coupled solver).
+        # ``_ki_components_result`` holds the raw KO + vanilla solves used
+        # by European-KI parity greeks.  Both are populated on first
+        # demand and shared across every subsequent PV / greek call on
+        # this instance.
+        self._solve_result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float] | None = None
+        self._ki_components_result: (
+            tuple[
+                tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+                tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+            ]
+            | None
+        ) = None
 
     def _resolved_knock_out_value(self) -> float | None:
         if (
@@ -2705,11 +2732,26 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
     def _solve_european_ki_components(
         self,
     ) -> tuple[
-        dict,
         tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
         tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
     ]:
-        """Return the native KO and vanilla solves used by European KI parity."""
+        """Return the native KO and vanilla solves used by European KI parity.
+
+        Memoised on the instance: the first call runs both solves; every
+        subsequent call (e.g. from :meth:`delta`, :meth:`gamma`,
+        :meth:`theta`, or internally from :meth:`_solve`) is O(1).
+        """
+        if self._ki_components_result is not None:
+            return self._ki_components_result
+        self._ki_components_result = self._compute_european_ki_components()
+        return self._ki_components_result
+
+    def _compute_european_ki_components(
+        self,
+    ) -> tuple[
+        tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+        tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+    ]:
         solve_args = self._base_solve_args()
         ko_result = _fd_barrier_ko_core(**solve_args)
         van_result = _fd_core(
@@ -2730,7 +2772,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
             space_grid=solve_args["space_grid"],
             american_solver=PDEEarlyExercise.INTRINSIC,
         )
-        return solve_args, ko_result, van_result
+        return ko_result, van_result
 
     def delta(self) -> float:
         spec = self._spec
@@ -2742,7 +2784,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
             return super().delta()
 
-        _, ko_result, van_result = self._solve_european_ki_components()
+        ko_result, van_result = self._solve_european_ki_components()
         spot = float(self.underlying.initial_value)
         return self._grid_delta_from_result(van_result, spot) - self._grid_delta_from_result(
             ko_result, spot
@@ -2759,7 +2801,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
             return super().gamma()
 
-        _, ko_result, van_result = self._solve_european_ki_components()
+        ko_result, van_result = self._solve_european_ki_components()
         spot = float(self.underlying.initial_value)
         return self._grid_gamma_from_result(van_result, spot) - self._grid_gamma_from_result(
             ko_result, spot
@@ -2775,7 +2817,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
             return super().theta()
 
-        _, ko_result, van_result = self._solve_european_ki_components()
+        ko_result, van_result = self._solve_european_ki_components()
         spot = float(self.underlying.initial_value)
         ko_theta = self._grid_theta_from_result(ko_result, spot)
         vanilla_theta = self._grid_theta_from_result(van_result, spot)
@@ -2783,6 +2825,21 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         return vanilla_theta + rebate_theta - ko_theta
 
     def _solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
+        """Memoised PDE solve result.
+
+        The first call runs the backward solve (KO directly, American KI
+        via the coupled two-surface solver, European KI via parity on the
+        cached KO + vanilla components).  Every subsequent call on the
+        same instance — including those triggered transparently by the
+        grid-greek mixin's :meth:`delta`, :meth:`gamma`, :meth:`theta` —
+        is an O(1) tuple lookup.
+        """
+        if self._solve_result is not None:
+            return self._solve_result
+        self._solve_result = self._compute_solve()
+        return self._solve_result
+
+    def _compute_solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the PDE solve, handling KI via parity or coupled PDE."""
         spec = self._spec
         solve_args = self._base_solve_args()
@@ -2796,16 +2853,18 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
         # European knock-in via parity: V_KI = V_vanilla + R * df_T - V_KO
         # When R=0 this reduces to V_vanilla - V_KO.
-        ko_args, ko_result, van_result = self._solve_european_ki_components()
+        ko_result, van_result = self._solve_european_ki_components()
         ko_price, S_ko, V_ko, V_ko_prev, last_dtau_ko = ko_result
         van_price, S_van, V_van, V_van_prev, _ = van_result
 
-        df_T = float(ko_args["discount_curve"].df(ko_args["time_to_maturity"]))
+        ttm = float(solve_args["time_to_maturity"])
+        discount_curve = solve_args["discount_curve"]
+        df_T = float(discount_curve.df(ttm))
         ki_price = van_price + spec.rebate * df_T - ko_price
 
         if last_dtau_ko > 0.0:
-            previous_ttm = max(float(ko_args["time_to_maturity"]) - last_dtau_ko, 0.0)
-            rebate_prev = float(spec.rebate) * float(ko_args["discount_curve"].df(previous_ttm))
+            previous_ttm = max(ttm - last_dtau_ko, 0.0)
+            rebate_prev = float(spec.rebate) * float(discount_curve.df(previous_ttm))
         else:
             rebate_prev = float(spec.rebate) * df_T
 
