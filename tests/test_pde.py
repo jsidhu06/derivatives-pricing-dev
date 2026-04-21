@@ -8,6 +8,7 @@ QuantLib comparisons live in test_quantlib_comparison.py.
 
 from dataclasses import replace as dc_replace
 import datetime as dt
+import logging
 
 import numpy as np
 import pytest
@@ -41,6 +42,8 @@ from helpers import (
     MATURITY,
 )
 from derivatives_pricing.valuation.params import PDEParams
+
+logger = logging.getLogger(__name__)
 
 
 def test_pde_fd_grid_method_equivalence_european():
@@ -629,6 +632,126 @@ def test_pde_fd_barrier_european_ki_rebate_grid_matches_direct_near_spot():
 
     assert np.allclose(V_parity[window], V_direct_on_parity[window], atol=0.002)
     assert np.allclose(V_parity_prev[window], V_direct_prev_on_parity[window], atol=0.002)
+
+
+@pytest.mark.parametrize(
+    "option_type,spot,strike,direction,barrier,rebate",
+    [
+        pytest.param(
+            OptionType.CALL,
+            100.0,
+            100.0,
+            BarrierDirection.DOWN,
+            90.0,
+            0.0,
+            id="down_in_call_no_rebate",
+        ),
+        pytest.param(
+            OptionType.PUT,
+            100.0,
+            100.0,
+            BarrierDirection.UP,
+            110.0,
+            2.0,
+            id="up_in_put_rebate",
+        ),
+        pytest.param(
+            OptionType.PUT,
+            100.0,
+            100.0,
+            BarrierDirection.DOWN,
+            90.0,
+            1.5,
+            id="down_in_put_rebate",
+        ),
+    ],
+)
+def test_pde_fd_barrier_european_ki_facade_vs_direct_core_greeks(
+    option_type: OptionType,
+    spot: float,
+    strike: float,
+    direction: BarrierDirection,
+    barrier: float,
+    rebate: float,
+):
+    """European KI facade (parity) and direct two-surface core should agree on PV + greeks.
+
+    The facade path for European KI goes through ``_compute_european_ki_components``
+    (V_KI = V_vanilla − V_KO + rebate PV leg). The direct path calls
+    ``_fd_barrier_ki_core(early_exercise=False)`` — the same two-surface coupled
+    solver used for American KI but with exercise disabled. Both solve the same
+    continuous barrier pricing problem via different numerics, so PV and grid
+    greeks should match to within grid-refinement error.
+    """
+    curve_r = DiscountCurve.flat(0.05, 2)
+    curve_q = DiscountCurve.flat(0.02, 2)
+    pricing_date = dt.datetime(2025, 1, 1)
+    maturity = dt.datetime(2025, 12, 31)
+
+    md = MarketData(pricing_date, curve_r, currency="USD")
+    ud = UnderlyingData(
+        initial_value=spot,
+        volatility=0.25,
+        market_data=md,
+        dividend_curve=curve_q,
+    )
+    barrier_spec = BarrierSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=strike,
+        maturity=maturity,
+        barrier=barrier,
+        direction=direction,
+        action=BarrierAction.IN,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=rebate,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
+    params = PDEParams.for_barriers(
+        spot_steps=800,
+        time_steps=800,
+    )
+
+    # Facade (parity) path
+    valuation = OptionValuation(ud, barrier_spec, PricingMethod.PDE_FD, params=params)
+    facade_pv = valuation.present_value()
+    facade_delta = valuation.delta()
+    facade_gamma = valuation.gamma()
+    facade_theta = valuation.theta()
+
+    # Direct two-surface core path (early_exercise=False)
+    impl = _FDBarrierValuation(valuation)
+    direct_result = _fd_barrier_ki_core(**impl._base_solve_args())
+    direct_pv = float(direct_result[0])
+    direct_delta = impl._grid_delta_from_result(direct_result, spot)
+    direct_gamma = impl._grid_gamma_from_result(direct_result, spot)
+    direct_theta = impl._grid_theta_from_result(direct_result, spot)
+
+    logger.info(
+        "KI facade-vs-direct [%s %s H=%g S=%g rebate=%g]: "
+        "PV parity=%.6f direct=%.6f | "
+        "Δ parity=%.6f direct=%.6f | "
+        "Γ parity=%.6f direct=%.6f | "
+        "Θ parity=%.6f direct=%.6f",
+        option_type.value,
+        direction.value,
+        barrier,
+        spot,
+        rebate,
+        facade_pv,
+        direct_pv,
+        facade_delta,
+        direct_delta,
+        facade_gamma,
+        direct_gamma,
+        facade_theta,
+        direct_theta,
+    )
+
+    assert np.isclose(facade_pv, direct_pv, rtol=0.005, atol=1e-3)
+    assert np.isclose(facade_delta, direct_delta, rtol=0.01, atol=1e-3)
+    assert np.isclose(facade_gamma, direct_gamma, rtol=0.01, atol=1e-3)
+    assert np.isclose(facade_theta, direct_theta, rtol=0.01, atol=1e-3)
 
 
 @pytest.mark.slow
