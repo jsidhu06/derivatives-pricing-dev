@@ -395,14 +395,11 @@ def _build_log_grid(
     ``dz_hull = vol * sqrt(3 * dt)`` when the target log-domain fits within
     ``spot_steps * dz_hull``. For ``EXPLICIT_HULL`` this is the special
     spacing that recovers the trinomial-equivalent explicit discretization
-    with up/mid/down probabilities ``1/6, 2/3, 1/6``. Choosing a finer
-    ``dz`` than ``dz_hull`` at fixed ``dt`` no longer preserves that
-    equivalence and may violate the explicit scheme's stability or
-    monotonicity conditions.
+    with up/mid/down probabilities ``1/6, 2/3, 1/6``.
 
     For unconditionally stable schemes (``IMPLICIT``, ``CRANK_NICOLSON``)
-    neither concern applies, so ``spot_steps`` controls the spatial
-    density directly: ``dz = (zmax_target - zmin_target) / spot_steps``.
+    ``spot_steps`` controls the spatial density directly:
+    ``dz = (zmax_target - zmin_target) / spot_steps``.
 
     When ``anchor_spot`` is provided, the grid is sized so that the anchor
     lies exactly on an interior node by default. If ``anchor_half_step`` is
@@ -416,6 +413,9 @@ def _build_log_grid(
     schemes ``dz`` is fixed by Hull's stability heuristic, so the grid is
     shifted in place while keeping strict cover of the target domain.
     """
+    if anchor_half_step and anchor_spot is None:
+        raise ValidationError("anchor_half_step requires anchor_spot to be provided")
+
     smax = float(smax_mult * max(spot, strike))
     smin = float(max(max(spot, strike) / smax_mult, 1.0e-8))
     zmin_target = np.log(smin)
@@ -448,70 +448,67 @@ def _build_log_grid(
         zmin = zmin_target
         zmax = zmax_target
 
-    if anchor_spot is not None:
-        if anchor_spot <= 0.0:
-            raise ValidationError("anchor_spot must be positive for log-spot grids")
+    if anchor_spot is None:
+        Z = zmin + dz * np.arange(spot_steps + 1, dtype=float)
+        return Z, np.exp(Z), dz
 
-        z_anchor = float(np.log(anchor_spot))
-        if not (zmin_target <= z_anchor <= zmax_target):
-            raise ValidationError("anchor_spot must lie within the log-grid target domain")
+    if anchor_spot <= 0.0:
+        raise ValidationError("anchor_spot must be positive for log-spot grids")
 
-        if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
-            # Explicit schemes use Hull's dz_hull heuristic, which leaves
-            # ``grid_width = spot_steps * dz`` strictly larger than the
-            # target span (when not capped). dz is fixed by stability, so
-            # we shift the grid in place while keeping strict cover of
-            # ``[zmin_target, zmax_target]``. If the target span is already
-            # capped exactly by ``spot_steps * dz``, exact anchoring is only
-            # possible when the anchor happens to lie on that fixed grid.
-            anchor_offset = 0.5 if anchor_half_step else 0.0
-            j_min = max(
-                0,
-                int(math.ceil((z_anchor - zmin_target) / dz - anchor_offset - 1.0e-12)),
-            )
-            j_max = min(
-                spot_steps - 1 if anchor_half_step else spot_steps,
-                int(
-                    math.floor(spot_steps - (zmax_target - z_anchor) / dz - anchor_offset + 1.0e-12)
-                ),
-            )
-            if j_min > j_max:
-                raise StabilityError(
-                    "Unable to align anchor_spot on the log grid with current setup"
-                )
-            preferred_index = int(round((z_anchor - zmin) / dz - anchor_offset))
-            j_anchor = min(max(preferred_index, j_min), j_max)
-        else:
-            # CN/IMPLICIT: dz is free, so instead of shifting a fixed-dz
-            # grid (which forces an unsatisfiable strict-cover constraint
-            # when dz exactly tiles the target span), we *grow* dz on the
-            # binding half. Pick the integer node closest to where the
-            # anchor naturally falls, then compute the dz required to cover
-            # the left and right halves separately; whichever side requires
-            # the larger dz is the binding side, and the other side absorbs
-            # the slack. The result is a uniform grid that:
-            #   - places the anchor exactly on an interior node,
-            #   - is strictly tight to the target on the binding side,
-            #   - has up to one cell of slack outside the target on the
-            #     other side (i.e. a slight superset of the target — never
-            #     under-covers),
-            #   - costs at most ~1/(spot_steps - 1) extra dz vs the bare-
-            #     minimum tile of the target span.
-            span = zmax_target - zmin_target
-            anchor_offset = 0.5 if anchor_half_step else 0.0
-            j_opt = int(round(spot_steps * (z_anchor - zmin_target) / span - anchor_offset))
-            j_anchor = max(0 if anchor_half_step else 1, min(spot_steps - 1, j_opt))
-            left_dz = (z_anchor - zmin_target) / (j_anchor + anchor_offset)
-            right_dz = (zmax_target - z_anchor) / (spot_steps - j_anchor - anchor_offset)
-            dz = max(left_dz, right_dz)
+    z_anchor = float(np.log(anchor_spot))
+    if not (zmin_target <= z_anchor <= zmax_target):
+        raise ValidationError("anchor_spot must lie within the log-grid target domain")
 
-        zmin = z_anchor - (j_anchor + (0.5 if anchor_half_step else 0.0)) * dz
+    anchor_offset = 0.5 if anchor_half_step else 0.0
 
+    if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
+        # Explicit schemes use Hull's dz_hull heuristic, which leaves
+        # ``grid_width = spot_steps * dz`` strictly larger than the
+        # target span (when not capped). dz is fixed by stability, so
+        # we shift the grid in place while keeping strict cover of
+        # ``[zmin_target, zmax_target]``. If the target span is already
+        # capped exactly by ``spot_steps * dz``, exact anchoring is only
+        # possible when the anchor happens to lie on that fixed grid.
+        j_min = max(
+            0,
+            int(math.ceil((z_anchor - zmin_target) / dz - anchor_offset - 1.0e-12)),
+        )
+        j_max = min(
+            spot_steps - 1 if anchor_half_step else spot_steps,
+            int(math.floor(spot_steps - (zmax_target - z_anchor) / dz - anchor_offset + 1.0e-12)),
+        )
+        if j_min > j_max:
+            raise StabilityError("Unable to align anchor_spot on the log grid with current setup")
+        preferred_index = int(round((z_anchor - zmin) / dz - anchor_offset))
+        j_anchor = min(max(preferred_index, j_min), j_max)
+    else:
+        # CN/IMPLICIT: dz is free, so instead of shifting a fixed-dz
+        # grid (which forces an unsatisfiable strict-cover constraint
+        # when dz exactly tiles the target span), we *grow* dz on the
+        # binding half. Pick the integer node closest to where the
+        # anchor naturally falls, then compute the dz required to cover
+        # the left and right halves separately; whichever side requires
+        # the larger dz is the binding side, and the other side absorbs
+        # the slack. The result is a uniform grid that:
+        #   - places the anchor exactly on an interior node,
+        #   - is strictly tight to the target on the binding side,
+        #   - has up to one cell of slack outside the target on the
+        #     other side (i.e. a slight superset of the target — never
+        #     under-covers),
+        #   - costs at most ~1/(spot_steps - 1) extra dz vs the bare-
+        #     minimum tile of the target span.
+        span = zmax_target - zmin_target
+        j_opt = int(round(spot_steps * (z_anchor - zmin_target) / span - anchor_offset))
+        j_anchor = max(0 if anchor_half_step else 1, min(spot_steps - 1, j_opt))
+        left_dz = (z_anchor - zmin_target) / (j_anchor + anchor_offset)
+        right_dz = (zmax_target - z_anchor) / (spot_steps - j_anchor - anchor_offset)
+        dz = max(left_dz, right_dz)
+
+    zmin = z_anchor - (j_anchor + anchor_offset) * dz
     Z = zmin + dz * np.arange(spot_steps + 1, dtype=float)
-    if anchor_spot is not None and not anchor_half_step:
+    if not anchor_half_step:
         Z[j_anchor] = z_anchor
-    S = np.exp(Z)
-    return Z, S, dz
+    return Z, np.exp(Z), dz
 
 
 def _build_spot_grid(
