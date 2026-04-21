@@ -731,7 +731,7 @@ def _implicit_cn_step(
     right: float,
     method: PDEMethod,
     intrinsic: np.ndarray | None,
-    american_solver: PDEEarlyExercise,
+    american_solver: PDEEarlyExercise | None,
     omega: float | None,
     tol: float | None,
     max_iter: int | None,
@@ -798,7 +798,7 @@ def _validate_fd_inputs(
     discount_curve: DiscountCurve,
     early_exercise: bool,
     method: PDEMethod,
-    american_solver: PDEEarlyExercise,
+    american_solver: PDEEarlyExercise | None,
     omega: float | None,
     tol: float | None,
     max_iter: int | None,
@@ -817,6 +817,8 @@ def _validate_fd_inputs(
         raise ValidationError("volatility must be positive")
     if discount_curve is None:
         raise ValidationError("discount_curve is required for PDE valuation")
+    if early_exercise and american_solver is None:
+        raise ValidationError("american_solver is required when early_exercise=True")
     if early_exercise and american_solver is PDEEarlyExercise.GAUSS_SEIDEL:
         if omega is None or tol is None or max_iter is None:
             raise ValidationError(
@@ -963,7 +965,7 @@ def _fd_core(
     method: PDEMethod,
     rannacher_steps: int,
     space_grid: PDESpaceGrid,
-    american_solver: PDEEarlyExercise,
+    american_solver: PDEEarlyExercise | None = None,
     omega: float | None = None,
     tol: float | None = None,
     max_iter: int | None = None,
@@ -1258,10 +1260,12 @@ class _FDGridGreeksMixin:
 
         Differentiates the quadratic interpolant through nodes
         ``(S[j-1], S[j], S[j+1])`` at the actual spot rather than at the
-        nearest node ``S[j]``. This is essential for KI parity, where the
-        vanilla and KO surfaces live on different grids and ``S[j]`` may
-        differ between them by up to one grid step — subtracting deltas at
-        different actual spots biases the result.
+        nearest node ``S[j]``. This removes an O(spot - S[j]) discretization
+        bias that shows up whenever the query spot doesn't coincide with a
+        grid node.
+
+        This is especially important for KI parity as the vanilla and KO
+        surfaces live on different grids.
         """
         x0, x1, x2 = S[j - 1], S[j], S[j + 1]
         v0, v1, v2 = V[j - 1], V[j], V[j + 1]
@@ -1277,11 +1281,15 @@ class _FDGridGreeksMixin:
 
         A 3-point parabolic fit gives a *constant* second derivative
         (``f''(x) = 2a``), so a parabolic at-spot evaluation is identical
-        to the at-index value — useful for KI parity, where vanilla and
-        KO live on different grids and we need both gammas referenced to
-        the same physical ``spot``. A 4-point cubic Lagrange yields
+        to the at-index value. A 4-point cubic Lagrange yields
         ``f''(x) = 6ax + 2b`` (linear in ``x``), so evaluating at exactly
-        ``spot`` decouples the result from the local node placement.
+        ``spot`` decouples the result from the local node placement and
+        removes an O(spot - S[j]) bias whenever the query spot doesn't
+        coincide with a grid node.
+
+        Especially important for KI parity: vanilla and KO live on
+        different grids, so both gammas need to be referenced to the same
+        physical ``spot`` rather than to differently-placed ``S[j]`` nodes.
 
         Uses nodes ``(S[j-1], S[j], S[j+1], S[j+2])``; the index ``j`` is
         clamped so all four neighbours exist.
@@ -1590,9 +1598,7 @@ class _FDValuationBase(_FDGridGreeksMixin):
             method=params.method,
             rannacher_steps=int(params.rannacher_steps),
             space_grid=params.space_grid,
-            american_solver=params.american_solver
-            if self._early_exercise
-            else PDEEarlyExercise.INTRINSIC,
+            american_solver=params.american_solver if self._early_exercise else None,
             omega=float(params.omega) if self._early_exercise else None,
             tol=float(params.tol) if self._early_exercise else None,
             max_iter=int(params.max_iter) if self._early_exercise else None,
@@ -1728,7 +1734,7 @@ def _fd_barrier_ko_core(
     method: PDEMethod,
     rannacher_steps: int,
     space_grid: PDESpaceGrid,
-    american_solver: PDEEarlyExercise,
+    american_solver: PDEEarlyExercise | None = None,
     omega: float | None = None,
     tol: float | None = None,
     max_iter: int | None = None,
@@ -2148,7 +2154,7 @@ def _fd_barrier_ki_core(
     method: PDEMethod,
     rannacher_steps: int,
     space_grid: PDESpaceGrid,
-    american_solver: PDEEarlyExercise,
+    american_solver: PDEEarlyExercise | None = None,
     omega: float | None = None,
     tol: float | None = None,
     max_iter: int | None = None,
@@ -2415,7 +2421,7 @@ def _fd_barrier_ki_core(
         # sub-grid restricted to nodes on the far side of the barrier,
         # with V_act[j_H] as the inner Dirichlet boundary.
         if continuous:
-            # Inner BC: V_act at barrier; outer BC: rebate PV or vanilla
+            # Inner BC: V_act at barrier; outer BC: rebate PV (0 if no rebate)
             rebate_bv = rebate * df_tT
             if direction is BarrierDirection.DOWN:
                 left_inact = float(V_act[j_H])  # inner (barrier side)
@@ -2717,9 +2723,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
             method=params.method,
             rannacher_steps=int(params.rannacher_steps),
             space_grid=params.space_grid,
-            american_solver=(
-                params.american_solver if early_exercise else PDEEarlyExercise.INTRINSIC
-            ),
+            american_solver=params.american_solver if early_exercise else None,
             omega=float(params.omega) if early_exercise else None,
             tol=float(params.tol) if early_exercise else None,
             max_iter=int(params.max_iter) if early_exercise else None,
@@ -2767,7 +2771,6 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
             method=solve_args["method"],
             rannacher_steps=solve_args["rannacher_steps"],
             space_grid=solve_args["space_grid"],
-            american_solver=PDEEarlyExercise.INTRINSIC,
         )
         return ko_result, van_result
 
