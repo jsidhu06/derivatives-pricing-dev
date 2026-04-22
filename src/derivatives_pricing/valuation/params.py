@@ -256,7 +256,7 @@ class PDEParams:
         argument accepted by the constructor can be passed to override
         individual fields.
         """
-        defaults = cls(spot_steps=2400, time_steps=800, space_grid=PDESpaceGrid.LOG_SPOT)
+        defaults = cls(spot_steps=1200, time_steps=800, space_grid=PDESpaceGrid.LOG_SPOT)
         return dc_replace(defaults, **overrides) if overrides else defaults
 
     def __post_init__(self) -> None:

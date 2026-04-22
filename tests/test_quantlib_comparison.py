@@ -16,8 +16,6 @@ from derivatives_pricing.enums import (
     DayCountConvention,
     ExerciseType,
     OptionType,
-    PDEMethod,
-    PDESpaceGrid,
     PricingMethod,
     RebateTiming,
 )
@@ -1610,13 +1608,7 @@ def _dp_barrier_analytical_price(
     return _dp_price(ud, spec, PricingMethod.BSM)
 
 
-_BARRIER_PDE_CFG = PDEParams(
-    spot_steps=2400,
-    time_steps=800,
-    method=PDEMethod.CRANK_NICOLSON,
-    space_grid=PDESpaceGrid.LOG_SPOT,
-)
-_BARRIER_BINOM_CFG = BinomialParams(num_steps=1000)
+_BARRIER_BINOM_CFG = BinomialParams.for_barriers()
 
 
 def _barrier_resolved_curves(
@@ -1713,7 +1705,7 @@ def _dp_barrier_pde_price(
         rebate_timing=rebate_timing,
         monitoring=monitoring,
     )
-    return _dp_price(ud, spec, PricingMethod.PDE_FD, _BARRIER_PDE_CFG)
+    return _dp_price(ud, spec, PricingMethod.PDE_FD)
 
 
 def _dp_barrier_binomial_price(
@@ -1742,7 +1734,7 @@ def _dp_barrier_binomial_price(
         rebate_timing=rebate_timing,
         monitoring=monitoring,
     )
-    return _dp_price(ud, spec, PricingMethod.BINOMIAL, _BARRIER_BINOM_CFG)
+    return _dp_price(ud, spec, PricingMethod.BINOMIAL)
 
 
 _BARRIER_MC_PATHS = 150_000
@@ -2738,7 +2730,7 @@ def test_barrier_european_discrete_divs_pde_vs_quantlib(
         strike=strike,
         exercise_type=ExerciseType.EUROPEAN,
     )
-    dp_pde = OptionValuation(ud, spec, PricingMethod.PDE_FD, _BARRIER_PDE_CFG).present_value()
+    dp_pde = OptionValuation(ud, spec, PricingMethod.PDE_FD).present_value()
 
     ql_fd = _ql_barrier_fd_with_discrete_divs(
         direction=direction,
@@ -2824,7 +2816,7 @@ def test_barrier_european_boundary_date_discrete_divs_pde_vs_quantlib(
         strike=strike,
         exercise_type=ExerciseType.EUROPEAN,
     )
-    dp_pde = OptionValuation(ud, spec, PricingMethod.PDE_FD, _BARRIER_PDE_CFG).present_value()
+    dp_pde = OptionValuation(ud, spec, PricingMethod.PDE_FD).present_value()
 
     # QL workaround: shift spot by pricing-date div, strip that entry from schedule.
     ql_spot = _BARRIER_SPOT - pricing_div

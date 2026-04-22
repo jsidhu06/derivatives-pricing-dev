@@ -24,8 +24,6 @@ from derivatives_pricing.enums import (
     DayCountConvention,
     ExerciseType,
     OptionType,
-    PDEMethod,
-    PDESpaceGrid,
     PricingMethod,
     RebateTiming,
 )
@@ -915,14 +913,8 @@ _BARRIER_VOL = 0.25
 _BARRIER_RATE = 0.05
 _BARRIER_DIV = 0.02
 _BARRIER_NUMERICAL_SPOT_BUMP_RATIO = 0.025
-_BARRIER_NUMERICAL_THETA_DAYS = 21.0
-_BARRIER_PDE_CFG = PDEParams(
-    spot_steps=800,
-    time_steps=800,
-    method=PDEMethod.CRANK_NICOLSON,
-    space_grid=PDESpaceGrid.LOG_SPOT,
-)
-_BARRIER_BINOM_CFG = BinomialParams(num_steps=400)
+_BARRIER_PDE_CFG = PDEParams.for_barriers()
+_BARRIER_BINOM_CFG = BinomialParams.for_barriers()
 
 _QL_BARRIER_TYPE = {
     (BarrierDirection.DOWN, BarrierAction.IN): ql.Barrier.DownIn,
