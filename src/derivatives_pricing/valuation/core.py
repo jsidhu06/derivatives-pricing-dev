@@ -24,6 +24,7 @@ from functools import wraps
 from typing import Any
 import datetime as dt
 import logging
+import threading
 import numpy as np
 import pandas as pd
 from ..utils import calculate_year_fraction
@@ -256,6 +257,13 @@ def _memoize_result(fn):
     needs no explicit invalidation.  Exceptions propagate without being
     cached.  Internal calls like ``self.present_value()`` inside
     ``gamma``/``theta`` transparently benefit from a prior PV cache hit.
+
+    Thread-safety: uses double-checked locking on a per-instance
+    ``_cache_lock``.  The fast path (cache hit) is lock-free — it relies
+    on the GIL to make dict lookup atomic — so concurrent cache hits
+    don't serialise.  On a miss, a single thread computes under the lock
+    while others wait and then read the cached result, preventing
+    redundant solves when multiple threads query the same OV simultaneously.
     """
 
     @wraps(fn)
@@ -264,9 +272,12 @@ def _memoize_result(fn):
         cache = self._cache
         if key in cache:
             return cache[key]
-        result = fn(self, **kwargs)
-        cache[key] = result
-        return result
+        with self._cache_lock:
+            if key in cache:
+                return cache[key]
+            result = fn(self, **kwargs)
+            cache[key] = result
+            return result
 
     return wrapper
 
@@ -425,7 +436,15 @@ class OptionValuation:
 
         # Output cache for repeated calls to PV / greek accessors.  Keyed
         # by (method_name, *sorted_kwargs).  See `_memoize_result` above.
-        self._cache: dict[tuple, float] = {}
+        # The lock is per-instance (not class-level) so concurrent calls
+        # on different OVs don't serialise — only concurrent calls on the
+        # same OV coordinate to avoid redundant compute.
+        self._cache: dict[tuple, Any] = {}
+        # ``RLock`` (not ``Lock``) so the same thread can re-enter the
+        # memoised accessors: e.g. ``gamma()`` internally calls
+        # ``present_value()``, which would dead-lock a plain ``Lock``
+        # because both hit ``_memoize_result`` and acquire this same lock.
+        self._cache_lock = threading.RLock()
 
     # ──────────────────────────────
     # Public API (methods)
@@ -440,14 +459,25 @@ class OptionValuation:
 
         return float(self._apply_control_variate(base_pv))
 
+    @_memoize_result
     def present_value_pathwise(self) -> np.ndarray:
-        """Return discounted pathwise present values (Monte Carlo only)."""
+        """Return discounted pathwise present values (Monte Carlo only).
+
+        The returned array is a read-only view over the engine's cached
+        pathwise PVs.  The read-only flag is enforced by numpy
+        (``ValueError`` on any attempted mutation) so the cache stays
+        intact even if a caller attempts to modify the result.  Callers
+        who need a mutable copy should call ``.copy()`` explicitly.
+        """
         pv_pathwise = getattr(self._impl, "present_value_pathwise", None)
         if pv_pathwise is None:
             raise UnsupportedFeatureError(
                 "present_value_pathwise is only implemented for Monte Carlo valuation."
             )
-        return pv_pathwise()
+        arr = np.asarray(pv_pathwise())
+        view = arr.view()
+        view.flags.writeable = False
+        return view
 
     @_memoize_result
     def delta(

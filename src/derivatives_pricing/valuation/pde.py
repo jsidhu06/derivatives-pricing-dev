@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 import logging
 import math
+import threading
 import datetime as dt
 import warnings
 
@@ -1516,8 +1517,14 @@ class _FDValuationBase(_FDGridGreeksMixin):
         # Lazy PDE-solve cache.  Populated on first ``_solve`` call and
         # shared by every subsequent PV / grid-greek access on this
         # instance, so ``delta`` / ``gamma`` / ``theta`` after a
-        # ``present_value`` call are O(1) grid lookups.
+        # ``present_value`` call are O(1) grid lookups.  Double-checked
+        # locking keeps the fast path lock-free on cache hits while
+        # guaranteeing at most one expensive solve under concurrent access.
         self._solve_result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float] | None = None
+        # ``RLock`` so nested caching calls within the same thread don't
+        # deadlock (e.g. an engine that dispatches to another cached
+        # helper while holding the solve lock).
+        self._solve_lock = threading.RLock()
 
     def solve(self) -> tuple[float, np.ndarray, np.ndarray]:
         """Compute the full FD solution on the spot grid at pricing time."""
@@ -1528,8 +1535,11 @@ class _FDValuationBase(_FDGridGreeksMixin):
         """Memoised PDE solve result (see ``_compute_solve`` for the real work)."""
         if self._solve_result is not None:
             return self._solve_result
-        self._solve_result = self._compute_solve()
-        return self._solve_result
+        with self._solve_lock:
+            if self._solve_result is not None:
+                return self._solve_result
+            self._solve_result = self._compute_solve()
+            return self._solve_result
 
     def _compute_solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the PDE finite-difference solve."""
@@ -2578,6 +2588,14 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
             ]
             | None
         ) = None
+        # Separate ``RLock``s for the two independent caches.  European
+        # KI ``_compute_solve`` internally calls
+        # ``_solve_european_ki_components`` which acquires a different
+        # lock — no deadlock risk there — but we still use re-entrant
+        # locks to future-proof against nested cached calls on the same
+        # lock within a single thread.
+        self._solve_lock = threading.RLock()
+        self._ki_components_lock = threading.RLock()
 
     def _resolved_knock_out_value(self) -> float | None:
         if (
@@ -2744,8 +2762,11 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         """
         if self._ki_components_result is not None:
             return self._ki_components_result
-        self._ki_components_result = self._compute_european_ki_components()
-        return self._ki_components_result
+        with self._ki_components_lock:
+            if self._ki_components_result is not None:
+                return self._ki_components_result
+            self._ki_components_result = self._compute_european_ki_components()
+            return self._ki_components_result
 
     def _compute_european_ki_components(
         self,
@@ -2843,8 +2864,11 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         """
         if self._solve_result is not None:
             return self._solve_result
-        self._solve_result = self._compute_solve()
-        return self._solve_result
+        with self._solve_lock:
+            if self._solve_result is not None:
+                return self._solve_result
+            self._solve_result = self._compute_solve()
+            return self._solve_result
 
     def _compute_solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the PDE solve, handling KI via parity or coupled PDE."""
