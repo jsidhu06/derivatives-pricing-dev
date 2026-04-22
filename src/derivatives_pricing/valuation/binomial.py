@@ -7,6 +7,7 @@ extensions used by the core dispatcher.
 from __future__ import annotations
 from typing import TYPE_CHECKING
 import logging
+import threading
 import warnings
 import numpy as np
 import pandas as pd
@@ -48,16 +49,27 @@ class _BinomialValuationBase:
         # CRR backward pass, and (on the barrier subclass) the KO / KI
         # lattices.  These are pure functions of the immutable instance
         # state, so the first call populates the cache and every later
-        # PV / tree-greek access is an O(1) dict lookup.
+        # PV / tree-greek access is an O(1) dict lookup.  Double-checked
+        # locking keeps the hit path lock-free and avoids redundant tree
+        # solves under concurrent access.
         self._cache: dict[tuple, object] = {}
+        # ``RLock`` (not ``Lock``) — ``_cached`` entries routinely call
+        # other ``_cached`` entries inside their compute callables
+        # (e.g. ``_compute_solve_backward`` calls
+        # ``_setup_binomial_parameters``), which re-acquires this same
+        # lock on the same thread.  A plain ``Lock`` would deadlock.
+        self._cache_lock = threading.RLock()
 
     def _cached(self, key: tuple, compute):
         """Return ``self._cache[key]``, populating it with ``compute()`` on miss."""
         if key in self._cache:
             return self._cache[key]
-        value = compute()
-        self._cache[key] = value
-        return value
+        with self._cache_lock:
+            if key in self._cache:
+                return self._cache[key]
+            value = compute()
+            self._cache[key] = value
+            return value
 
     def _effective_num_steps(self) -> int:
         """Return the canonical tree depth for this engine instance."""

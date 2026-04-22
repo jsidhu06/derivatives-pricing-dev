@@ -24,6 +24,7 @@ from functools import wraps
 from typing import Any
 import datetime as dt
 import logging
+import threading
 import numpy as np
 import pandas as pd
 from ..utils import calculate_year_fraction
@@ -256,6 +257,13 @@ def _memoize_result(fn):
     needs no explicit invalidation.  Exceptions propagate without being
     cached.  Internal calls like ``self.present_value()`` inside
     ``gamma``/``theta`` transparently benefit from a prior PV cache hit.
+
+    Thread-safety: uses double-checked locking on a per-instance
+    ``_cache_lock``.  The fast path (cache hit) is lock-free — it relies
+    on the GIL to make dict lookup atomic — so concurrent cache hits
+    don't serialise.  On a miss, a single thread computes under the lock
+    while others wait and then read the cached result, preventing
+    redundant solves when multiple threads query the same OV simultaneously.
     """
 
     @wraps(fn)
@@ -264,9 +272,12 @@ def _memoize_result(fn):
         cache = self._cache
         if key in cache:
             return cache[key]
-        result = fn(self, **kwargs)
-        cache[key] = result
-        return result
+        with self._cache_lock:
+            if key in cache:
+                return cache[key]
+            result = fn(self, **kwargs)
+            cache[key] = result
+            return result
 
     return wrapper
 
@@ -425,7 +436,15 @@ class OptionValuation:
 
         # Output cache for repeated calls to PV / greek accessors.  Keyed
         # by (method_name, *sorted_kwargs).  See `_memoize_result` above.
+        # The lock is per-instance (not class-level) so concurrent calls
+        # on different OVs don't serialise — only concurrent calls on the
+        # same OV coordinate to avoid redundant compute.
         self._cache: dict[tuple, float] = {}
+        # ``RLock`` (not ``Lock``) so the same thread can re-enter the
+        # memoised accessors: e.g. ``gamma()`` internally calls
+        # ``present_value()``, which would dead-lock a plain ``Lock``
+        # because both hit ``_memoize_result`` and acquire this same lock.
+        self._cache_lock = threading.RLock()
 
     # ──────────────────────────────
     # Public API (methods)

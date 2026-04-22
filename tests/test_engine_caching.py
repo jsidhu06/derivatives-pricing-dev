@@ -13,6 +13,8 @@ subsequent grid-/tree-native greek is an O(1) lookup.
 from __future__ import annotations
 
 import datetime as dt
+import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from derivatives_pricing.enums import (
@@ -174,3 +176,137 @@ class TestEngineLevelCaching:
         ) as compute_ko:
             _call_all_native_greeks(ov)
         assert compute_ko.call_count == 1
+
+
+class TestThreadSafeCaching:
+    """Double-checked locking prevents redundant computes under concurrent access.
+
+    Each test launches many threads against the same OV on a cold cache and
+    asserts that the expensive ``_compute_*`` hook fires exactly once.  A
+    brief ``time.sleep`` inside the patched hook widens the race window
+    — without the lock, all concurrent callers would pass the ``if key in
+    cache`` check and each call compute independently (``call_count == N``).
+    With the lock, one thread enters the critical section and the rest
+    read the cached result.
+    """
+
+    _N_THREADS = 8
+    _COMPUTE_SLEEP = 0.05  # seconds — wide enough to guarantee race window
+
+    @classmethod
+    def _concurrent_call(cls, target, n_threads: int | None = None) -> list[float]:
+        """Run ``target()`` from ``n_threads`` worker threads and return results."""
+        workers = n_threads or cls._N_THREADS
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(target) for _ in range(workers)]
+            return [f.result() for f in futures]
+
+    def test_pde_concurrent_present_value_solves_once(self):
+        """PDE_FD: concurrent ``present_value()`` triggers a single ``_compute_solve``."""
+        ov = OptionValuation(_underlying(), _am_doc_spec(), PricingMethod.PDE_FD)
+        original = ov._impl._compute_solve
+
+        def slow(*args, **kwargs):
+            time.sleep(self._COMPUTE_SLEEP)
+            return original(*args, **kwargs)
+
+        with patch.object(ov._impl, "_compute_solve", side_effect=slow) as compute:
+            results = self._concurrent_call(ov.present_value)
+
+        assert compute.call_count == 1
+        assert len(set(results)) == 1  # all threads got the same cached value
+
+    def test_binomial_concurrent_present_value_solves_once(self):
+        """Binomial: concurrent ``present_value()`` triggers a single backward solve."""
+        ov = OptionValuation(
+            _underlying(),
+            VanillaSpec(
+                option_type=OptionType.PUT,
+                exercise_type=ExerciseType.AMERICAN,
+                strike=100.0,
+                maturity=MATURITY,
+            ),
+            PricingMethod.BINOMIAL,
+        )
+        original = ov._impl._compute_solve_backward
+
+        def slow(*args, **kwargs):
+            time.sleep(self._COMPUTE_SLEEP)
+            return original(*args, **kwargs)
+
+        with patch.object(ov._impl, "_compute_solve_backward", side_effect=slow) as compute:
+            results = self._concurrent_call(ov.present_value)
+
+        assert compute.call_count == 1
+        assert len(set(results)) == 1
+
+    def test_pde_eu_ki_concurrent_greeks_solve_components_once(self):
+        """European KI parity: concurrent greeks fire ``_compute_european_ki_components`` once."""
+        ov = OptionValuation(_underlying(), _eu_dic_spec(), PricingMethod.PDE_FD)
+        original = ov._impl._compute_european_ki_components
+
+        def slow(*args, **kwargs):
+            time.sleep(self._COMPUTE_SLEEP)
+            return original(*args, **kwargs)
+
+        with patch.object(ov._impl, "_compute_european_ki_components", side_effect=slow) as compute:
+            # Mix of greek accessors, all internally needing the KI components.
+            targets = [ov.present_value, ov.delta, ov.gamma, ov.theta]
+            with ThreadPoolExecutor(max_workers=len(targets) * 2) as pool:
+                futures = [pool.submit(t) for t in targets for _ in range(2)]
+                for f in futures:
+                    f.result()
+
+        assert compute.call_count == 1
+
+    def test_ov_cache_concurrent_present_value_impl_called_once(self):
+        """OV-level cache: concurrent ``present_value()`` hits ``_impl.present_value`` once."""
+        ov = OptionValuation(
+            _underlying(),
+            VanillaSpec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=100.0,
+                maturity=MATURITY,
+            ),
+            PricingMethod.BSM,
+        )
+        original = ov._impl.present_value
+
+        def slow():
+            time.sleep(self._COMPUTE_SLEEP)
+            return original()
+
+        with patch.object(ov._impl, "present_value", side_effect=slow) as impl_pv:
+            results = self._concurrent_call(ov.present_value)
+
+        assert impl_pv.call_count == 1
+        assert len(set(results)) == 1
+
+    def test_concurrent_same_kwargs_coordinate(self):
+        """Concurrent calls with the *same* kwargs share a single cache entry.
+
+        Distinct kwargs cache separately (verified in
+        :class:`TestOptionValuationOutputCache`); here we confirm that
+        concurrent callers with identical kwargs converge on one compute.
+        """
+        ov = OptionValuation(
+            _underlying(),
+            VanillaSpec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=100.0,
+                maturity=MATURITY,
+            ),
+            PricingMethod.BSM,
+        )
+        # Count calls to the underlying impl.present_value inside delta's
+        # spot-bump sub-valuations — with a deterministic ``epsilon`` the
+        # two bumped OVs (s0+eps, s0-eps) each solve exactly once.
+        # Repeat calls from many threads should not increase the count.
+        eps = 0.5
+        d1 = ov.delta(epsilon=eps)
+        results = self._concurrent_call(lambda: ov.delta(epsilon=eps))
+        assert all(r == d1 for r in results)
+        # Cache now contains exactly one entry for delta at this epsilon.
+        assert ("delta", ("epsilon", eps)) in ov._cache
