@@ -17,6 +17,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
+import numpy as np
+import pytest
+
 from derivatives_pricing.enums import (
     BarrierAction,
     BarrierDirection,
@@ -28,6 +31,11 @@ from derivatives_pricing.enums import (
 )
 from derivatives_pricing.market_environment import MarketData
 from derivatives_pricing.rates import DiscountCurve
+from derivatives_pricing.stochastic_processes import (
+    GBMParams,
+    GBMProcess,
+    SimulationConfig,
+)
 from derivatives_pricing.valuation import (
     BarrierSpec,
     OptionValuation,
@@ -310,3 +318,86 @@ class TestThreadSafeCaching:
         assert all(r == d1 for r in results)
         # Cache now contains exactly one entry for delta at this epsilon.
         assert ("delta", ("epsilon", eps)) in ov._cache
+
+
+def _mc_gbm_process() -> GBMProcess:
+    """Construct a small GBMProcess for Monte Carlo pathwise tests."""
+    md = MarketData(
+        PRICING_DATE,
+        DiscountCurve.flat(0.05, 2.0),
+        currency="USD",
+        day_count_convention=DayCountConvention.ACT_365F,
+    )
+    return GBMProcess(
+        md,
+        GBMParams(initial_value=100.0, volatility=0.20),
+        SimulationConfig(paths=2_000, num_steps=12, end_date=MATURITY),
+    )
+
+
+def _mc_vanilla_spec() -> VanillaSpec:
+    return VanillaSpec(
+        option_type=OptionType.CALL,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=100.0,
+        maturity=MATURITY,
+    )
+
+
+class TestPathwisePresentValueCache:
+    """``present_value_pathwise`` is memoised and returns a read-only view.
+
+    The pathwise MC accessor is the one accessor returning an ``ndarray``
+    rather than a ``float``, so it must explicitly enforce the cache
+    contract via ``ndarray.flags.writeable = False`` — a mutation attempt
+    raises ``ValueError`` from numpy, protecting the cached array from
+    accidental corruption regardless of caller discipline.
+    """
+
+    def test_repeated_pathwise_call_skips_impl(self):
+        """Second ``present_value_pathwise()`` hits the OV cache without touching the impl."""
+        ov = OptionValuation(_mc_gbm_process(), _mc_vanilla_spec(), PricingMethod.MONTE_CARLO)
+        ov.present_value_pathwise()  # warm cache
+        with patch.object(
+            ov._impl, "present_value_pathwise", wraps=ov._impl.present_value_pathwise
+        ) as impl_pv:
+            ov.present_value_pathwise()
+            ov.present_value_pathwise()
+        assert impl_pv.call_count == 0
+
+    def test_pathwise_returns_read_only_view(self):
+        """Returned array is read-only — mutation raises ``ValueError``."""
+        ov = OptionValuation(_mc_gbm_process(), _mc_vanilla_spec(), PricingMethod.MONTE_CARLO)
+        arr = ov.present_value_pathwise()
+        assert not arr.flags.writeable
+        with pytest.raises(ValueError, match="assignment destination is read-only"):
+            arr[0] = 0.0
+
+    def test_pathwise_copy_is_mutable(self):
+        """``.copy()`` of the returned array is mutable and does not affect the cache."""
+        ov = OptionValuation(_mc_gbm_process(), _mc_vanilla_spec(), PricingMethod.MONTE_CARLO)
+        arr_before = ov.present_value_pathwise()
+        mutable = arr_before.copy()
+        mutable[0] = 0.0
+        arr_after = ov.present_value_pathwise()
+        assert arr_after[0] != 0.0  # cached array unaffected
+        assert np.array_equal(arr_before, arr_after)
+
+    def test_concurrent_pathwise_solves_once(self):
+        """Concurrent ``present_value_pathwise()`` triggers a single impl call."""
+        ov = OptionValuation(_mc_gbm_process(), _mc_vanilla_spec(), PricingMethod.MONTE_CARLO)
+        original = ov._impl.present_value_pathwise
+
+        def slow():
+            time.sleep(0.05)
+            return original()
+
+        with patch.object(ov._impl, "present_value_pathwise", side_effect=slow) as impl_pv:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(ov.present_value_pathwise) for _ in range(8)]
+                results = [f.result() for f in futures]
+
+        assert impl_pv.call_count == 1
+        # All threads got the same (read-only) array reference.
+        assert all(np.array_equal(r, results[0]) for r in results)
+        assert all(not r.flags.writeable for r in results)

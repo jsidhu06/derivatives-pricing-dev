@@ -439,7 +439,7 @@ class OptionValuation:
         # The lock is per-instance (not class-level) so concurrent calls
         # on different OVs don't serialise — only concurrent calls on the
         # same OV coordinate to avoid redundant compute.
-        self._cache: dict[tuple, float] = {}
+        self._cache: dict[tuple, Any] = {}
         # ``RLock`` (not ``Lock``) so the same thread can re-enter the
         # memoised accessors: e.g. ``gamma()`` internally calls
         # ``present_value()``, which would dead-lock a plain ``Lock``
@@ -459,14 +459,25 @@ class OptionValuation:
 
         return float(self._apply_control_variate(base_pv))
 
+    @_memoize_result
     def present_value_pathwise(self) -> np.ndarray:
-        """Return discounted pathwise present values (Monte Carlo only)."""
+        """Return discounted pathwise present values (Monte Carlo only).
+
+        The returned array is a read-only view over the engine's cached
+        pathwise PVs.  The read-only flag is enforced by numpy
+        (``ValueError`` on any attempted mutation) so the cache stays
+        intact even if a caller attempts to modify the result.  Callers
+        who need a mutable copy should call ``.copy()`` explicitly.
+        """
         pv_pathwise = getattr(self._impl, "present_value_pathwise", None)
         if pv_pathwise is None:
             raise UnsupportedFeatureError(
                 "present_value_pathwise is only implemented for Monte Carlo valuation."
             )
-        return pv_pathwise()
+        arr = np.asarray(pv_pathwise())
+        view = arr.view()
+        view.flags.writeable = False
+        return view
 
     @_memoize_result
     def delta(
