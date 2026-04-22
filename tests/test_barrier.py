@@ -21,6 +21,7 @@ from derivatives_pricing.enums import (
     ExerciseType,
     GreekCalculationMethod,
     OptionType,
+    PDEMethod,
     PDESpaceGrid,
     PricingMethod,
     RebateTiming,
@@ -318,7 +319,8 @@ class TestDiscreteBarrierPDEGridPlacement:
         assert not np.any(np.isclose(grid, barrier, atol=1.0e-12))
         assert np.isclose(0.5 * (grid[left_idx] + grid[left_idx + 1]), barrier, atol=1.0e-12)
 
-    def test_log_grid_places_barrier_at_half_step_in_log_space(self):
+    @pytest.mark.parametrize("method", [PDEMethod.IMPLICIT, PDEMethod.CRANK_NICOLSON])
+    def test_log_grid_places_barrier_at_half_step_in_log_space(self, method):
         barrier = 95.0
         Z, grid, _ = _build_log_grid(
             spot=SPOT,
@@ -328,7 +330,7 @@ class TestDiscreteBarrierPDEGridPlacement:
             smax_mult=4.0,
             spot_steps=200,
             time_steps=200,
-            method=PricingMethod.PDE_FD,
+            method=method,
             anchor_spot=barrier,
             anchor_half_step=True,
         )
@@ -340,7 +342,7 @@ class TestDiscreteBarrierPDEGridPlacement:
         assert np.isclose(0.5 * (Z[left_idx] + Z[left_idx + 1]), np.log(barrier), atol=1.0e-12)
         dz = np.diff(Z)[0]
         y_d_prime = np.log(barrier) + 0.5 * dz
-        assert len(np.where(Z == y_d_prime)[0]) > 0
+        assert np.isclose(Z, y_d_prime, atol=1.0e-12).sum() == 1
 
 
 # ===========================================================================
