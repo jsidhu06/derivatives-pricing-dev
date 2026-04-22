@@ -66,6 +66,14 @@ pip install derivatives-pricing
 # or pip install derivatives-pricing[numba] for optional PDE_FD solver acceleration
 ```
 
+> **Beta feature — barrier options.** Barrier option pricing is currently
+> available as a pre-release. To install (or upgrade from a prior stable
+> version), pass both `--pre` and `-U`:
+>
+> ```bash
+> pip install --pre -U derivatives-pricing
+> ```
+
 For development:
 
 ```bash
@@ -80,15 +88,24 @@ Requires Python 3.10 – 3.13
 
 ```python
 import datetime as dt
+
 import derivatives_pricing as dp
 
 pricing_date = dt.datetime(2025, 1, 1)
 maturity = dt.datetime(2025, 7, 1)
 
 dc = dp.DiscountCurve.flat(rate=0.05, end_time=1.0)
-md = dp.MarketData(pricing_date=pricing_date, discount_curve=dc, currency="USD")
+md = dp.MarketData(
+    pricing_date=pricing_date,
+    discount_curve=dc,
+    currency="USD",
+)
 
-underlying = dp.UnderlyingData(initial_value=100.0, volatility=0.20, market_data=md)
+underlying = dp.UnderlyingData(
+    initial_value=100.0,
+    volatility=0.20,
+    market_data=md,
+)
 
 spec = dp.VanillaSpec(
     option_type=dp.OptionType.CALL,
@@ -97,7 +114,11 @@ spec = dp.VanillaSpec(
     maturity=maturity,
 )
 
-val = dp.OptionValuation(underlying=underlying, spec=spec, pricing_method=dp.PricingMethod.BSM)
+val = dp.OptionValuation(
+    underlying=underlying,
+    spec=spec,
+    pricing_method=dp.PricingMethod.BSM,
+)
 print(f"{'PV:':<8} {val.present_value():>10.4f}")
 print(f"{'Delta:':<8} {val.delta():>10.4f}")
 ```
@@ -115,8 +136,7 @@ The repo includes two companion directories:
 ## Tests
 
 ```bash
-pytest -q
-# or pytest -q --runslow (to include slow tests)
+pytest -q -n auto --runslow
 ```
 
 ## Project Structure
