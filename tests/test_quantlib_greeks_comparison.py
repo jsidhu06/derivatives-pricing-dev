@@ -993,11 +993,21 @@ def _ql_barrier_option(
     rebate: float = 0.0,
     r_curve: DiscountCurve | None = None,
     q_curve: DiscountCurve | None = None,
+    discrete_dividends: Sequence[tuple[dt.datetime, float]] | None = None,
     grid_points: int = 800,
     time_steps: int = 800,
     binom_steps: int = 400,
 ) -> "ql_typing.BarrierOption":
-    """Build a QuantLib barrier option with the requested pricing engine."""
+    """Build a QuantLib barrier option with the requested pricing engine.
+
+    ``discrete_dividends`` is only supported with ``engine='fd'`` —
+    QL's AnalyticBarrierEngine and BinomialCRRBarrierEngine don't accept
+    a DividendVector.
+    """
+    if discrete_dividends is not None and engine != "fd":
+        raise ValueError(
+            f"discrete_dividends is only supported with engine='fd', got engine={engine!r}"
+        )
     eval_date = ql.Date(PRICING_DATE.day, PRICING_DATE.month, PRICING_DATE.year)
     ql.Settings.instance().evaluationDate = eval_date
     ql_dc = ql.Actual365Fixed()
@@ -1025,7 +1035,13 @@ def _ql_barrier_option(
     if engine == "analytic":
         opt.setPricingEngine(ql.AnalyticBarrierEngine(pr))
     elif engine == "fd":
-        opt.setPricingEngine(ql.FdBlackScholesBarrierEngine(pr, time_steps, grid_points))
+        if discrete_dividends is not None:
+            div_vector = _ql_dividend_vector(discrete_dividends)
+            opt.setPricingEngine(
+                ql.FdBlackScholesBarrierEngine(pr, div_vector, time_steps, grid_points)
+            )
+        else:
+            opt.setPricingEngine(ql.FdBlackScholesBarrierEngine(pr, time_steps, grid_points))
     elif engine == "binomial":
         opt.setPricingEngine(ql.BinomialCRRBarrierEngine(pr, binom_steps))
     else:
@@ -1535,4 +1551,124 @@ def test_american_barrier_greeks_vs_quantlib(
         skip_missing_rhs=True,
         atol=5e-3,
         logger=None,
+    )
+
+
+# ── European barrier + discrete dividends: DP PDE greeks vs QL FD native ───
+# Mirrors the PV cross-check in test_quantlib_comparison.py
+# (test_barrier_european_discrete_divs_pde_vs_quantlib) but for Greeks.
+# Uses QL's native engine-populated greeks (opt.delta/gamma/theta), which
+# FdBlackScholesBarrierEngine exposes directly from the grid.
+
+_BARRIER_DISCRETE_DIV_GREEK_SCENARIOS = [
+    pytest.param(
+        BarrierDirection.DOWN,
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        id="down_out_call",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.IN,
+        OptionType.CALL,
+        100.0,
+        120.0,
+        id="up_in_call",
+    ),
+    pytest.param(
+        BarrierDirection.UP,
+        BarrierAction.OUT,
+        OptionType.PUT,
+        100.0,
+        120.0,
+        id="up_out_put",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "direction,action,option_type,strike,barrier",
+    _BARRIER_DISCRETE_DIV_GREEK_SCENARIOS,
+)
+def test_barrier_european_discrete_divs_greeks_pde_vs_quantlib(
+    direction, action, option_type, strike, barrier
+):
+    """European barrier + discrete cash dividends: DP PDE greeks vs QL FD
+    native (engine-populated) greeks.
+
+    QL's FdBlackScholesBarrierEngine with a DividendVector exposes
+    delta/gamma/theta directly from the grid.  Pricing-date dividends are
+    skipped here because QL raises ``theta not provided`` for up-in
+    barriers whenever a dividend sits on the evaluation date (see the PV
+    test's boundary-date variant for the spot-shift workaround).  Mid-life
+    and maturity-date dividends are both supported natively.
+    """
+    discrete_divs = [
+        (PRICING_DATE + dt.timedelta(days=90), 2.0),
+        (PRICING_DATE + dt.timedelta(days=270), 2.0),
+        (MATURITY, 1.0),
+    ]
+
+    ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
+    rc = DiscountCurve.flat(_BARRIER_RATE, end_time=ttm)
+    md = MarketData(PRICING_DATE, rc, currency=CURRENCY)
+    ud = UnderlyingData(
+        initial_value=_BARRIER_SPOT,
+        volatility=_BARRIER_VOL,
+        market_data=md,
+        discrete_dividends=discrete_divs,
+    )
+    spec = BarrierSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=strike,
+        maturity=MATURITY,
+        barrier=barrier,
+        direction=direction,
+        action=action,
+        rebate=0.0,
+        rebate_timing=RebateTiming.AT_HIT,
+    )
+    ov = OptionValuation(ud, spec, PricingMethod.PDE_FD, params=_BARRIER_PDE_CFG)
+    dp_greeks = _dp_barrier_greeks_from_valuation(ov, spot=_BARRIER_SPOT)
+
+    # QL side — build engine once, read native greeks directly.
+    # All dividends are cash-discrete so set continuous div yield to zero.
+    opt = _ql_barrier_option(
+        engine="fd",
+        exercise_type=ExerciseType.EUROPEAN,
+        direction=direction,
+        action=action,
+        barrier=barrier,
+        option_type=option_type,
+        strike=strike,
+        spot=_BARRIER_SPOT,
+        vol=_BARRIER_VOL,
+        q_curve=DiscountCurve.flat(0.0, end_time=ttm),
+        discrete_dividends=discrete_divs,
+    )
+    opt.NPV()  # trigger Results population before reading greeks
+
+    ql_greeks = {
+        "delta": opt.delta(),
+        "gamma": opt.gamma(),
+        "theta": opt.theta() / 365.0,  # QL returns annualised theta
+    }
+
+    # Tolerances: European barriers + native greeks should agree well.
+    tols = {"delta": 0.01, "gamma": 0.02, "theta": 0.01}
+    assert_greeks_close(
+        lhs=dp_greeks,
+        rhs=ql_greeks,
+        tols=tols,
+        log_prefix=(
+            f"European barrier discrete-div {direction.value}-{action.value} "
+            f"{option_type.value} K={strike:.0f} H={barrier:.0f}"
+        ),
+        lhs_name="DP_PDE",
+        rhs_name="QL_FD",
+        atol=5e-3,
+        logger=logger,
     )
