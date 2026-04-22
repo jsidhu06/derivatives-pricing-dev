@@ -880,24 +880,21 @@ class OptionValuation:
         params: ValuationParams | None,
         spec: VanillaSpec | PayoffSpec | AsianSpec | BarrierSpec,
     ) -> ValuationParams | None:
-        is_barrier = isinstance(spec, BarrierSpec)
         if params is None:
             if pricing_method is PricingMethod.MONTE_CARLO:
                 return MonteCarloParams()
             if pricing_method is PricingMethod.BINOMIAL:
-                if not is_barrier:
-                    return BinomialParams()
-                # Continuous barriers get Boyle-Lau step inflation automatically,
-                # so 1000 base steps typically suffice.  Discrete barriers have
-                # no equivalent auto-adjustment (the tree is built exactly at
-                # the user-specified num_steps), so we default higher to
-                # accommodate the harder tree/monitoring-date alignment.
-                assert isinstance(spec, BarrierSpec)
-                if spec.monitoring is BarrierMonitoring.CONTINUOUS:
-                    return BinomialParams.for_barriers()
-                return BinomialParams.for_barriers(num_steps=5000)
+                if isinstance(spec, BarrierSpec):
+                    # Continuous barriers get Boyle-Lau step inflation automatically,
+                    # so 1000 base steps typically suffice.  Discrete barriers have
+                    # no equivalent auto-adjustment (the tree is built exactly at
+                    # the user-specified num_steps), so we default higher to
+                    # accommodate the harder tree/monitoring-date alignment.
+                    num_steps = 1000 if spec.monitoring is BarrierMonitoring.CONTINUOUS else 5000
+                    return BinomialParams(num_steps=num_steps)
+                return BinomialParams()
             if pricing_method is PricingMethod.PDE_FD:
-                return PDEParams.for_barriers() if is_barrier else PDEParams()
+                return PDEParams.for_barriers() if isinstance(spec, BarrierSpec) else PDEParams()
             return None
 
         if pricing_method is PricingMethod.MONTE_CARLO:

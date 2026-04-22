@@ -131,17 +131,6 @@ class BinomialParams:
     control_variate_european: bool = False
     log_timings: bool = False
 
-    @classmethod
-    def for_barriers(cls, **overrides: Any) -> BinomialParams:
-        """Create params that mirror the library's internal barrier defaults.
-
-        Returns a ``BinomialParams`` instance with higher step count suitable
-        for barrier pricing.  Any keyword argument accepted by the constructor
-        can be passed to override individual fields.
-        """
-        defaults = cls(num_steps=1000)
-        return dc_replace(defaults, **overrides) if overrides else defaults
-
     def __post_init__(self) -> None:
         for name in ("num_steps",):
             if type(getattr(self, name)) is not int:

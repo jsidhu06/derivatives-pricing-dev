@@ -1608,7 +1608,7 @@ def _dp_barrier_analytical_price(
     return _dp_price(ud, spec, PricingMethod.BSM)
 
 
-_BARRIER_BINOM_CFG = BinomialParams.for_barriers()
+_BARRIER_BINOM_CFG = BinomialParams(num_steps=1000)
 
 
 def _barrier_resolved_curves(

@@ -914,7 +914,7 @@ _BARRIER_RATE = 0.05
 _BARRIER_DIV = 0.02
 _BARRIER_NUMERICAL_SPOT_BUMP_RATIO = 0.025
 _BARRIER_PDE_CFG = PDEParams.for_barriers()
-_BARRIER_BINOM_CFG = BinomialParams.for_barriers()
+_BARRIER_BINOM_CFG = BinomialParams(num_steps=1000)
 
 _QL_BARRIER_TYPE = {
     (BarrierDirection.DOWN, BarrierAction.IN): ql.Barrier.DownIn,
