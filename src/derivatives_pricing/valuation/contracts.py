@@ -212,10 +212,16 @@ class AsianSpec:
         Start of averaging period. If None, uses pricing date.
     num_observations : int, optional
         Number of **future** equally spaced averaging observation time points
-        within the averaging window.  For fresh (unseasoned) options this equals
-        the total observation count.  For seasoned options, set this to the
-        number of *remaining* observations; ``observed_count`` tracks the
-        already-observed fixings separately.
+        within the averaging window.  Generates ``N`` dates evenly spaced
+        between ``averaging_start`` (or pricing date if unset) and
+        ``maturity`` **inclusive of both endpoints** — so the first fixing
+        lands on ``averaging_start`` / pricing date and the last on
+        ``maturity``.  Note this differs from ``BarrierSpec``, where
+        ``num_observations`` excludes the pricing date and places all
+        dates strictly inside ``(0, T]``.  For fresh (unseasoned) options
+        this equals the total observation count.  For seasoned options,
+        set this to the number of *remaining* observations;
+        ``observed_count`` tracks the already-observed fixings separately.
     contract_size : int | float
         Contract multiplier (default 100).  Not applied by ``OptionValuation``
         (which returns per-unit values); intended for portfolio-level position
