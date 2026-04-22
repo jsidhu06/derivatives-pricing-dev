@@ -216,17 +216,21 @@ def _rebate_knock_out_at_expiry(
         return 0.0
 
     sigma2 = sigma**2
-    lam = (r - q + sigma2 / 2.0) / sigma2
+    # Log-spot (risk-neutral) drift μ = r − q − σ²/2.  The first-passage
+    # probability formula uses this drift directly
+    mu = r - q - sigma2 / 2.0
     sigma_sqrt_T = sigma * np.sqrt(T)
 
     eta = 1.0 if direction is BarrierDirection.DOWN else -1.0
     log_HS = np.log(H / S)
 
-    c1 = log_HS / sigma_sqrt_T + lam * sigma_sqrt_T
-    c2 = log_HS / sigma_sqrt_T - lam * sigma_sqrt_T
-
-    # Hitting probability via reflection principle
-    hit_prob = norm.cdf(eta * c1) + (H / S) ** (2.0 * lam - 2.0) * norm.cdf(eta * c2)
+    # Reflection-principle first-passage probability of a Brownian
+    # motion with drift: P(barrier hit on [0, T]) =
+    #     N(η·a) + (H/S)^{2μ/σ²} · N(η·b)
+    # where a = (ln(H/S) − μT)/σ√T  and  b = (ln(H/S) + μT)/σ√T.
+    a = (log_HS - mu * T) / sigma_sqrt_T
+    b = (log_HS + mu * T) / sigma_sqrt_T
+    hit_prob = norm.cdf(eta * a) + (H / S) ** (2.0 * mu / sigma2) * norm.cdf(eta * b)
 
     return R * df_r * hit_prob
 
@@ -435,6 +439,44 @@ class _AnalyticalBarrierValuation:
     def solve(self) -> float:
         """Return the analytical barrier option value."""
         return self.present_value()
+
+    def theta(self) -> float:
+        r"""Barrier theta via the Black-Scholes PDE identity.
+
+        .. math::
+
+            \Theta = r V - (r - q) S \Delta - \tfrac{1}{2} \sigma^{2} S^{2} \Gamma
+
+        ``V`` is the closed-form barrier price; ``Δ`` and ``Γ`` come from
+        central-difference bump-and-revalue around the same closed-form
+        evaluator (routed through :attr:`valuation_ctx` so repeated calls
+        hit the OV-level cache).  The identity is exact in the
+        continuation region (triggered-at-inception cases already
+        short-circuit in :meth:`present_value`) and delivers better
+        accuracy than a naive forward-difference time bump.
+
+        Returned per **calendar day**
+        """
+        ctx = self.valuation_ctx
+        underlying = self.underlying
+
+        S = float(underlying.initial_value)
+        sigma = float(underlying.volatility)
+        sigma2 = sigma**2
+        T = ctx._maturity_year_fraction()
+
+        df_r = float(ctx.discount_curve.df(T))
+        r = -np.log(df_r) / T
+        dividend_curve = underlying.dividend_curve
+        df_q = float(dividend_curve.df(T)) if dividend_curve is not None else 1.0
+        q = -np.log(df_q) / T
+
+        V = ctx.present_value()
+        delta = ctx.delta()
+        gamma = ctx.gamma()
+
+        theta_annual = r * V - (r - q) * S * delta - 0.5 * sigma2 * S * S * gamma
+        return float(theta_annual / 365.0)
 
     def present_value(self) -> float:
         """Compute the analytical barrier option price."""

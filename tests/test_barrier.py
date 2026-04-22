@@ -21,6 +21,7 @@ from derivatives_pricing.enums import (
     ExerciseType,
     GreekCalculationMethod,
     OptionType,
+    PDEMethod,
     PDESpaceGrid,
     PricingMethod,
     RebateTiming,
@@ -318,7 +319,8 @@ class TestDiscreteBarrierPDEGridPlacement:
         assert not np.any(np.isclose(grid, barrier, atol=1.0e-12))
         assert np.isclose(0.5 * (grid[left_idx] + grid[left_idx + 1]), barrier, atol=1.0e-12)
 
-    def test_log_grid_places_barrier_at_half_step_in_log_space(self):
+    @pytest.mark.parametrize("method", [PDEMethod.IMPLICIT, PDEMethod.CRANK_NICOLSON])
+    def test_log_grid_places_barrier_at_half_step_in_log_space(self, method):
         barrier = 95.0
         Z, grid, _ = _build_log_grid(
             spot=SPOT,
@@ -328,7 +330,7 @@ class TestDiscreteBarrierPDEGridPlacement:
             smax_mult=4.0,
             spot_steps=200,
             time_steps=200,
-            method=PricingMethod.PDE_FD,
+            method=method,
             anchor_spot=barrier,
             anchor_half_step=True,
         )
@@ -340,7 +342,7 @@ class TestDiscreteBarrierPDEGridPlacement:
         assert np.isclose(0.5 * (Z[left_idx] + Z[left_idx + 1]), np.log(barrier), atol=1.0e-12)
         dz = np.diff(Z)[0]
         y_d_prime = np.log(barrier) + 0.5 * dz
-        assert len(np.where(Z == y_d_prime)[0]) > 0
+        assert np.isclose(Z, y_d_prime, atol=1.0e-12).sum() == 1
 
 
 # ===========================================================================
@@ -1257,7 +1259,8 @@ class TestBarrierPresentValueAgainstBroadieGlasserman:
     Scenarios are taken from:
 
     Mark Broadie & Paul Glasserman (1997) "A Continuity Correction for
-    Discrete Barrier Options", Mathematical Finance, 7(4), 325–349.
+    Discrete Barrier Options", Mathematical Finance, 7(4), 325–349,
+    Table 2.1.
 
     The paper's "True" column is computed by a trinomial procedure
     specifically modified to handle discrete barriers, and is effectively
@@ -1268,11 +1271,15 @@ class TestBarrierPresentValueAgainstBroadieGlasserman:
     Barrier swept from 85 through 99 (near-the-money).
 
     The DP PDE_FD engine uses the Boyle-Tian half-step barrier placement,
-    which brings it to near-exact agreement (< 0.1% on all rows).
-    Binomial is looser due to tree-to-monitoring-date alignment noise,
-    especially where the barrier approaches spot.  BSM (BG continuity
-    correction) tracks well until the barrier gets very close to spot
-    (H=99) where the asymptotic correction degrades.
+    which brings it to near-exact agreement with _TRUTH (< 0.1% on all
+    rows).  Binomial is looser due to tree-to-monitoring-date alignment
+    noise, especially where the barrier approaches spot.
+
+    BSM implements the Broadie-Glasserman-Kou closed-form correction,
+    so it cannot (and is not expected to) match _TRUTH once the barrier
+    approaches spot.  Instead, BSM is asserted against the paper's own
+    'Corrected' column (_BGK_CORRECTED) — the value the BGK formula
+    produces.
     """
 
     _T_YEARS = 0.2
@@ -1282,7 +1289,7 @@ class TestBarrierPresentValueAgainstBroadieGlasserman:
         calculate_year_fraction(PRICING_DATE, _PAPER_MATURITY, DayCountConvention.ACT_365F) == 0.2
     ), "Paper maturity should be exactly 0.2 years under ACT/365F"
 
-    # barrier → trinomial-truth value from the paper.
+    # barrier → paper-truth PV, trinomial reference ('True' column).
     _TRUTH: dict[int, float] = {
         85: 6.322,
         86: 6.306,
@@ -1301,14 +1308,37 @@ class TestBarrierPresentValueAgainstBroadieGlasserman:
         99: 2.337,
     }
 
+    # barrier → paper's 'Corrected' column (1): the closed-form BGK value
+    # (continuous formula with barrier shifted by beta·sigma·sqrt(dt)).
+    _BGK_CORRECTED: dict[int, float] = {
+        85: 6.322,
+        86: 6.306,
+        87: 6.281,
+        88: 6.242,
+        89: 6.184,
+        90: 6.098,
+        91: 5.977,
+        92: 5.810,
+        93: 5.585,
+        94: 5.288,
+        95: 4.907,
+        96: 4.428,
+        97: 3.836,
+        98: 3.121,
+        99: 2.271,
+    }
+
     _NUM_OBSERVATIONS = 50
 
     # Per-engine tolerances — calibrated from observed behaviour:
-    # PDE_FD hits truth to within ~0.1% everywhere, locked in tight.
-    # Binomial can drift up to ~3% when the barrier is close to spot.
-    # BSM's BG correction degrades sharply as H → S0 (barrier 99).
+    # PDE_FD / Binomial assert against _TRUTH (they solve the discrete
+    # problem).  PDE_FD hits to within ~0.1% everywhere with Boyle-Tian
+    # half-step placement; Binomial drifts up to ~3% as H → S0.
+    # BSM asserts against _BGK_CORRECTED (it implements the closed-form
+    # asymptotic correction, not a discrete solve) — should match the
+    # paper's Corrected column to the printed 3-dp precision.
     _TOLS: dict[PricingMethod, dict[str, float]] = {
-        PricingMethod.BSM: dict(rtol=0.030, atol=1.0e-3),
+        PricingMethod.BSM: dict(rtol=0.0, atol=1.5e-3),
         PricingMethod.BINOMIAL: dict(rtol=0.035, atol=1.0e-3),
         PricingMethod.PDE_FD: dict(rtol=0.002, atol=1.0e-3),
     }
@@ -1345,37 +1375,194 @@ class TestBarrierPresentValueAgainstBroadieGlasserman:
         )
 
     @pytest.mark.parametrize(
-        "barrier,truth",
-        list(_TRUTH.items()),
+        "barrier",
+        list(_TRUTH.keys()),
         ids=[f"H_{b}" for b in _TRUTH],
     )
-    def test_doc_present_value_matches_trinomial_truth(
-        self,
-        barrier: int,
-        truth: float,
-    ):
-        """One barrier level → log all three engines, assert each against truth."""
+    def test_doc_present_value_matches_paper(self, barrier: int):
+        """One barrier level → log all three engines, assert each against
+        its appropriate paper reference: BSM vs Corrected, others vs True."""
         spec = self._make_spec(float(barrier))
         underlying = self._paper_underlying()
+
+        truth = self._TRUTH[barrier]
+        corrected = self._BGK_CORRECTED[barrier]
 
         engine_pvs: dict[PricingMethod, float] = {}
         for method in (PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
             engine_pvs[method] = float(OptionValuation(underlying, spec, method).present_value())
 
         logger.info(
-            "BG97 DOC H=%d m=%d | truth=%.3f dp_bsm=%.3f dp_bn=%.3f dp_fd=%.3f",
+            "BG97 DOC PV H=%d m=%d | true=%.3f corrected=%.3f | dp_bsm=%.3f dp_bn=%.3f dp_fd=%.3f",
             barrier,
             self._NUM_OBSERVATIONS,
             truth,
+            corrected,
             engine_pvs[PricingMethod.BSM],
             engine_pvs[PricingMethod.BINOMIAL],
             engine_pvs[PricingMethod.PDE_FD],
         )
 
+        references: dict[PricingMethod, tuple[str, float]] = {
+            PricingMethod.BSM: ("Corrected", corrected),
+            PricingMethod.BINOMIAL: ("True", truth),
+            PricingMethod.PDE_FD: ("True", truth),
+        }
         for method, pv in engine_pvs.items():
+            label, ref = references[method]
             tol = self._TOLS[method]
-            assert np.isclose(pv, truth, **tol), (
-                f"{method.name} PV mismatch at H={barrier}: got {pv:.6f}, expected {truth:.6f}"
+            assert np.isclose(pv, ref, **tol), (
+                f"{method.name} PV mismatch at H={barrier} vs {label}: "
+                f"got {pv:.6f}, expected {ref:.6f}"
+            )
+
+
+class TestBarrierDeltaAgainstBroadieGlasserman:
+    """Compare discrete DOC deltas against Broadie & Glasserman Table 2.4.
+
+    Scenarios are taken from:
+
+    Mark Broadie & Paul Glasserman (1997) "A Continuity Correction for
+    Discrete Barrier Options", Mathematical Finance, 7(4), 325-349,
+    Table 2.4.
+
+    Same setup as the PV table (S0 = K = 100, sigma = 30%, T = 0.2 yr,
+    r = 10%, q = 0, m = 50, barrier 85-99) but pinning the delta at
+    inception.
+
+    Mirrors the PV test's reference strategy: Binomial and PDE_FD are
+    asserted against the paper's 'True' delta column (ground truth for
+    the discrete problem, obtained via extensive numerical computation);
+    BSM is asserted against the paper's 'Corrected' column (the value
+    the closed-form BGK correction produces), because that is what the
+    BSM engine implements.
+    """
+
+    _T_YEARS = 0.2
+    _PAPER_MATURITY = PRICING_DATE + dt.timedelta(days=_T_YEARS * 365)
+
+    # barrier → paper-truth delta (BG97 Table 2.4, 'True' column).
+    _TRUTH: dict[int, float] = {
+        85: 0.591,
+        86: 0.594,
+        87: 0.600,
+        88: 0.607,
+        89: 0.618,
+        90: 0.633,
+        91: 0.653,
+        92: 0.678,
+        93: 0.711,
+        94: 0.750,
+        95: 0.798,
+        96: 0.854,
+        97: 0.917,
+        98: 0.966,
+        99: 0.958,
+    }
+
+    # barrier → paper's 'Corrected' delta (BGK closed-form value).
+    _BGK_CORRECTED: dict[int, float] = {
+        85: 0.591,
+        86: 0.594,
+        87: 0.600,
+        88: 0.607,
+        89: 0.618,
+        90: 0.633,
+        91: 0.653,
+        92: 0.678,
+        93: 0.710,
+        94: 0.750,
+        95: 0.798,
+        96: 0.853,
+        97: 0.917,
+        98: 0.988,
+        99: 1.066,
+    }
+
+    _NUM_OBSERVATIONS = 50
+
+    # Per-engine tolerances:
+    # PDE_FD / Binomial assert against _TRUTH.  PDE_FD hits truth tight
+    # via Boyle-Tian half-step placement; Binomial drifts when H → S0.
+    # BSM asserts against _BGK_CORRECTED — should match the paper's
+    # Corrected column to the printed 3-dp precision at all 15 barriers.
+    _TOLS: dict[PricingMethod, dict[str, float]] = {
+        PricingMethod.BSM: dict(rtol=0.0, atol=1.5e-3),
+        PricingMethod.BINOMIAL: dict(rtol=0.025, atol=2.0e-3),
+        PricingMethod.PDE_FD: dict(rtol=0.010, atol=2.0e-3),
+    }
+
+    @staticmethod
+    def _paper_market_data() -> MarketData:
+        return MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.10, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _paper_underlying(cls) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=100.0,
+            volatility=0.30,
+            market_data=cls._paper_market_data(),
+        )
+
+    @classmethod
+    def _make_spec(cls, barrier: float) -> BarrierSpec:
+        return _barrier_spec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=100.0,
+            maturity=cls._PAPER_MATURITY,
+            barrier=barrier,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=cls._NUM_OBSERVATIONS,
+        )
+
+    @pytest.mark.parametrize(
+        "barrier",
+        list(_TRUTH.keys()),
+        ids=[f"H_{b}" for b in _TRUTH],
+    )
+    def test_doc_delta_matches_paper(self, barrier: int):
+        """One barrier level → log all three engines, assert each against
+        its appropriate paper reference: BSM vs Corrected, others vs True."""
+        spec = self._make_spec(float(barrier))
+        underlying = self._paper_underlying()
+
+        truth = self._TRUTH[barrier]
+        corrected = self._BGK_CORRECTED[barrier]
+
+        engine_deltas: dict[PricingMethod, float] = {}
+        for method in (PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
+            engine_deltas[method] = float(OptionValuation(underlying, spec, method).delta())
+
+        logger.info(
+            "BG97 DOC Δ H=%d m=%d | true=%.3f corrected=%.3f | dp_bsm=%.3f dp_bn=%.3f dp_fd=%.3f",
+            barrier,
+            self._NUM_OBSERVATIONS,
+            truth,
+            corrected,
+            engine_deltas[PricingMethod.BSM],
+            engine_deltas[PricingMethod.BINOMIAL],
+            engine_deltas[PricingMethod.PDE_FD],
+        )
+
+        references: dict[PricingMethod, tuple[str, float]] = {
+            PricingMethod.BSM: ("Corrected", corrected),
+            PricingMethod.BINOMIAL: ("True", truth),
+            PricingMethod.PDE_FD: ("True", truth),
+        }
+        for method, delta in engine_deltas.items():
+            label, ref = references[method]
+            tol = self._TOLS[method]
+            assert np.isclose(delta, ref, **tol), (
+                f"{method.name} Δ mismatch at H={barrier} vs {label}: "
+                f"got {delta:.6f}, expected {ref:.6f}"
             )
 
 

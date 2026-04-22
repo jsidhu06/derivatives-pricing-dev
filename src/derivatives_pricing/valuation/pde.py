@@ -395,14 +395,11 @@ def _build_log_grid(
     ``dz_hull = vol * sqrt(3 * dt)`` when the target log-domain fits within
     ``spot_steps * dz_hull``. For ``EXPLICIT_HULL`` this is the special
     spacing that recovers the trinomial-equivalent explicit discretization
-    with up/mid/down probabilities ``1/6, 2/3, 1/6``. Choosing a finer
-    ``dz`` than ``dz_hull`` at fixed ``dt`` no longer preserves that
-    equivalence and may violate the explicit scheme's stability or
-    monotonicity conditions.
+    with up/mid/down probabilities ``1/6, 2/3, 1/6``.
 
     For unconditionally stable schemes (``IMPLICIT``, ``CRANK_NICOLSON``)
-    neither concern applies, so ``spot_steps`` controls the spatial
-    density directly: ``dz = (zmax_target - zmin_target) / spot_steps``.
+    ``spot_steps`` controls the spatial density directly:
+    ``dz = (zmax_target - zmin_target) / spot_steps``.
 
     When ``anchor_spot`` is provided, the grid is sized so that the anchor
     lies exactly on an interior node by default. If ``anchor_half_step`` is
@@ -416,6 +413,9 @@ def _build_log_grid(
     schemes ``dz`` is fixed by Hull's stability heuristic, so the grid is
     shifted in place while keeping strict cover of the target domain.
     """
+    if anchor_half_step and anchor_spot is None:
+        raise ValidationError("anchor_half_step requires anchor_spot to be provided")
+
     smax = float(smax_mult * max(spot, strike))
     smin = float(max(max(spot, strike) / smax_mult, 1.0e-8))
     zmin_target = np.log(smin)
@@ -448,70 +448,67 @@ def _build_log_grid(
         zmin = zmin_target
         zmax = zmax_target
 
-    if anchor_spot is not None:
-        if anchor_spot <= 0.0:
-            raise ValidationError("anchor_spot must be positive for log-spot grids")
+    if anchor_spot is None:
+        Z = zmin + dz * np.arange(spot_steps + 1, dtype=float)
+        return Z, np.exp(Z), dz
 
-        z_anchor = float(np.log(anchor_spot))
-        if not (zmin_target <= z_anchor <= zmax_target):
-            raise ValidationError("anchor_spot must lie within the log-grid target domain")
+    if anchor_spot <= 0.0:
+        raise ValidationError("anchor_spot must be positive for log-spot grids")
 
-        if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
-            # Explicit schemes use Hull's dz_hull heuristic, which leaves
-            # ``grid_width = spot_steps * dz`` strictly larger than the
-            # target span (when not capped). dz is fixed by stability, so
-            # we shift the grid in place while keeping strict cover of
-            # ``[zmin_target, zmax_target]``. If the target span is already
-            # capped exactly by ``spot_steps * dz``, exact anchoring is only
-            # possible when the anchor happens to lie on that fixed grid.
-            anchor_offset = 0.5 if anchor_half_step else 0.0
-            j_min = max(
-                0,
-                int(math.ceil((z_anchor - zmin_target) / dz - anchor_offset - 1.0e-12)),
-            )
-            j_max = min(
-                spot_steps - 1 if anchor_half_step else spot_steps,
-                int(
-                    math.floor(spot_steps - (zmax_target - z_anchor) / dz - anchor_offset + 1.0e-12)
-                ),
-            )
-            if j_min > j_max:
-                raise StabilityError(
-                    "Unable to align anchor_spot on the log grid with current setup"
-                )
-            preferred_index = int(round((z_anchor - zmin) / dz - anchor_offset))
-            j_anchor = min(max(preferred_index, j_min), j_max)
-        else:
-            # CN/IMPLICIT: dz is free, so instead of shifting a fixed-dz
-            # grid (which forces an unsatisfiable strict-cover constraint
-            # when dz exactly tiles the target span), we *grow* dz on the
-            # binding half. Pick the integer node closest to where the
-            # anchor naturally falls, then compute the dz required to cover
-            # the left and right halves separately; whichever side requires
-            # the larger dz is the binding side, and the other side absorbs
-            # the slack. The result is a uniform grid that:
-            #   - places the anchor exactly on an interior node,
-            #   - is strictly tight to the target on the binding side,
-            #   - has up to one cell of slack outside the target on the
-            #     other side (i.e. a slight superset of the target — never
-            #     under-covers),
-            #   - costs at most ~1/(spot_steps - 1) extra dz vs the bare-
-            #     minimum tile of the target span.
-            span = zmax_target - zmin_target
-            anchor_offset = 0.5 if anchor_half_step else 0.0
-            j_opt = int(round(spot_steps * (z_anchor - zmin_target) / span - anchor_offset))
-            j_anchor = max(0 if anchor_half_step else 1, min(spot_steps - 1, j_opt))
-            left_dz = (z_anchor - zmin_target) / (j_anchor + anchor_offset)
-            right_dz = (zmax_target - z_anchor) / (spot_steps - j_anchor - anchor_offset)
-            dz = max(left_dz, right_dz)
+    z_anchor = float(np.log(anchor_spot))
+    if not (zmin_target <= z_anchor <= zmax_target):
+        raise ValidationError("anchor_spot must lie within the log-grid target domain")
 
-        zmin = z_anchor - (j_anchor + (0.5 if anchor_half_step else 0.0)) * dz
+    anchor_offset = 0.5 if anchor_half_step else 0.0
 
+    if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
+        # Explicit schemes use Hull's dz_hull heuristic, which leaves
+        # ``grid_width = spot_steps * dz`` strictly larger than the
+        # target span (when not capped). dz is fixed by stability, so
+        # we shift the grid in place while keeping strict cover of
+        # ``[zmin_target, zmax_target]``. If the target span is already
+        # capped exactly by ``spot_steps * dz``, exact anchoring is only
+        # possible when the anchor happens to lie on that fixed grid.
+        j_min = max(
+            0,
+            int(math.ceil((z_anchor - zmin_target) / dz - anchor_offset - 1.0e-12)),
+        )
+        j_max = min(
+            spot_steps - 1 if anchor_half_step else spot_steps,
+            int(math.floor(spot_steps - (zmax_target - z_anchor) / dz - anchor_offset + 1.0e-12)),
+        )
+        if j_min > j_max:
+            raise StabilityError("Unable to align anchor_spot on the log grid with current setup")
+        preferred_index = int(round((z_anchor - zmin) / dz - anchor_offset))
+        j_anchor = min(max(preferred_index, j_min), j_max)
+    else:
+        # CN/IMPLICIT: dz is free, so instead of shifting a fixed-dz
+        # grid (which forces an unsatisfiable strict-cover constraint
+        # when dz exactly tiles the target span), we *grow* dz on the
+        # binding half. Pick the integer node closest to where the
+        # anchor naturally falls, then compute the dz required to cover
+        # the left and right halves separately; whichever side requires
+        # the larger dz is the binding side, and the other side absorbs
+        # the slack. The result is a uniform grid that:
+        #   - places the anchor exactly on an interior node,
+        #   - is strictly tight to the target on the binding side,
+        #   - has up to one cell of slack outside the target on the
+        #     other side (i.e. a slight superset of the target — never
+        #     under-covers),
+        #   - costs at most ~1/(spot_steps - 1) extra dz vs the bare-
+        #     minimum tile of the target span.
+        span = zmax_target - zmin_target
+        j_opt = int(round(spot_steps * (z_anchor - zmin_target) / span - anchor_offset))
+        j_anchor = max(0 if anchor_half_step else 1, min(spot_steps - 1, j_opt))
+        left_dz = (z_anchor - zmin_target) / (j_anchor + anchor_offset)
+        right_dz = (zmax_target - z_anchor) / (spot_steps - j_anchor - anchor_offset)
+        dz = max(left_dz, right_dz)
+
+    zmin = z_anchor - (j_anchor + anchor_offset) * dz
     Z = zmin + dz * np.arange(spot_steps + 1, dtype=float)
-    if anchor_spot is not None and not anchor_half_step:
+    if not anchor_half_step:
         Z[j_anchor] = z_anchor
-    S = np.exp(Z)
-    return Z, S, dz
+    return Z, np.exp(Z), dz
 
 
 def _build_spot_grid(
@@ -734,7 +731,7 @@ def _implicit_cn_step(
     right: float,
     method: PDEMethod,
     intrinsic: np.ndarray | None,
-    american_solver: PDEEarlyExercise,
+    american_solver: PDEEarlyExercise | None,
     omega: float | None,
     tol: float | None,
     max_iter: int | None,
@@ -801,7 +798,7 @@ def _validate_fd_inputs(
     discount_curve: DiscountCurve,
     early_exercise: bool,
     method: PDEMethod,
-    american_solver: PDEEarlyExercise,
+    american_solver: PDEEarlyExercise | None,
     omega: float | None,
     tol: float | None,
     max_iter: int | None,
@@ -820,6 +817,8 @@ def _validate_fd_inputs(
         raise ValidationError("volatility must be positive")
     if discount_curve is None:
         raise ValidationError("discount_curve is required for PDE valuation")
+    if early_exercise and american_solver is None:
+        raise ValidationError("american_solver is required when early_exercise=True")
     if early_exercise and american_solver is PDEEarlyExercise.GAUSS_SEIDEL:
         if omega is None or tol is None or max_iter is None:
             raise ValidationError(
@@ -966,7 +965,7 @@ def _fd_core(
     method: PDEMethod,
     rannacher_steps: int,
     space_grid: PDESpaceGrid,
-    american_solver: PDEEarlyExercise,
+    american_solver: PDEEarlyExercise | None = None,
     omega: float | None = None,
     tol: float | None = None,
     max_iter: int | None = None,
@@ -1261,10 +1260,12 @@ class _FDGridGreeksMixin:
 
         Differentiates the quadratic interpolant through nodes
         ``(S[j-1], S[j], S[j+1])`` at the actual spot rather than at the
-        nearest node ``S[j]``. This is essential for KI parity, where the
-        vanilla and KO surfaces live on different grids and ``S[j]`` may
-        differ between them by up to one grid step — subtracting deltas at
-        different actual spots biases the result.
+        nearest node ``S[j]``. This removes an O(spot - S[j]) discretization
+        bias that shows up whenever the query spot doesn't coincide with a
+        grid node.
+
+        This is especially important for KI parity as the vanilla and KO
+        surfaces live on different grids.
         """
         x0, x1, x2 = S[j - 1], S[j], S[j + 1]
         v0, v1, v2 = V[j - 1], V[j], V[j + 1]
@@ -1280,11 +1281,15 @@ class _FDGridGreeksMixin:
 
         A 3-point parabolic fit gives a *constant* second derivative
         (``f''(x) = 2a``), so a parabolic at-spot evaluation is identical
-        to the at-index value — useful for KI parity, where vanilla and
-        KO live on different grids and we need both gammas referenced to
-        the same physical ``spot``. A 4-point cubic Lagrange yields
+        to the at-index value. A 4-point cubic Lagrange yields
         ``f''(x) = 6ax + 2b`` (linear in ``x``), so evaluating at exactly
-        ``spot`` decouples the result from the local node placement.
+        ``spot`` decouples the result from the local node placement and
+        removes an O(spot - S[j]) bias whenever the query spot doesn't
+        coincide with a grid node.
+
+        Especially important for KI parity: vanilla and KO live on
+        different grids, so both gammas need to be referenced to the same
+        physical ``spot`` rather than to differently-placed ``S[j]`` nodes.
 
         Uses nodes ``(S[j-1], S[j], S[j+1], S[j+2])``; the index ``j`` is
         clamped so all four neighbours exist.
@@ -1508,6 +1513,11 @@ class _FDValuationBase(_FDGridGreeksMixin):
         self.underlying = valuation_ctx.underlying  # type: ignore[assignment]
         assert isinstance(valuation_ctx.params, PDEParams)
         self.pde_params = valuation_ctx.params
+        # Lazy PDE-solve cache.  Populated on first ``_solve`` call and
+        # shared by every subsequent PV / grid-greek access on this
+        # instance, so ``delta`` / ``gamma`` / ``theta`` after a
+        # ``present_value`` call are O(1) grid lookups.
+        self._solve_result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float] | None = None
 
     def solve(self) -> tuple[float, np.ndarray, np.ndarray]:
         """Compute the full FD solution on the spot grid at pricing time."""
@@ -1515,6 +1525,13 @@ class _FDValuationBase(_FDGridGreeksMixin):
         return pv, S, V
 
     def _solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
+        """Memoised PDE solve result (see ``_compute_solve`` for the real work)."""
+        if self._solve_result is not None:
+            return self._solve_result
+        self._solve_result = self._compute_solve()
+        return self._solve_result
+
+    def _compute_solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the PDE finite-difference solve."""
         params = self.pde_params
 
@@ -1581,9 +1598,7 @@ class _FDValuationBase(_FDGridGreeksMixin):
             method=params.method,
             rannacher_steps=int(params.rannacher_steps),
             space_grid=params.space_grid,
-            american_solver=params.american_solver
-            if self._early_exercise
-            else PDEEarlyExercise.INTRINSIC,
+            american_solver=params.american_solver if self._early_exercise else None,
             omega=float(params.omega) if self._early_exercise else None,
             tol=float(params.tol) if self._early_exercise else None,
             max_iter=int(params.max_iter) if self._early_exercise else None,
@@ -1719,7 +1734,7 @@ def _fd_barrier_ko_core(
     method: PDEMethod,
     rannacher_steps: int,
     space_grid: PDESpaceGrid,
-    american_solver: PDEEarlyExercise,
+    american_solver: PDEEarlyExercise | None = None,
     omega: float | None = None,
     tol: float | None = None,
     max_iter: int | None = None,
@@ -2139,7 +2154,7 @@ def _fd_barrier_ki_core(
     method: PDEMethod,
     rannacher_steps: int,
     space_grid: PDESpaceGrid,
-    american_solver: PDEEarlyExercise,
+    american_solver: PDEEarlyExercise | None = None,
     omega: float | None = None,
     tol: float | None = None,
     max_iter: int | None = None,
@@ -2406,7 +2421,7 @@ def _fd_barrier_ki_core(
         # sub-grid restricted to nodes on the far side of the barrier,
         # with V_act[j_H] as the inner Dirichlet boundary.
         if continuous:
-            # Inner BC: V_act at barrier; outer BC: rebate PV or vanilla
+            # Inner BC: V_act at barrier; outer BC: rebate PV (0 if no rebate)
             rebate_bv = rebate * df_tT
             if direction is BarrierDirection.DOWN:
                 left_inact = float(V_act[j_H])  # inner (barrier side)
@@ -2548,6 +2563,21 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         self._spec: BarrierSpec = valuation_ctx.spec  # type: ignore[assignment]
         assert isinstance(valuation_ctx.params, PDEParams)
         self.pde_params = valuation_ctx.params
+        # Lazy PDE-solve caches.  ``_solve_result`` holds the full 5-tuple
+        # returned by the backward PDE solve (KO directly; EU KI via
+        # parity; AM KI via the two-surface coupled solver).
+        # ``_ki_components_result`` holds the raw KO + vanilla solves used
+        # by European-KI parity greeks.  Both are populated on first
+        # demand and shared across every subsequent PV / greek call on
+        # this instance.
+        self._solve_result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float] | None = None
+        self._ki_components_result: (
+            tuple[
+                tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+                tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+            ]
+            | None
+        ) = None
 
     def _resolved_knock_out_value(self) -> float | None:
         if (
@@ -2693,9 +2723,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
             method=params.method,
             rannacher_steps=int(params.rannacher_steps),
             space_grid=params.space_grid,
-            american_solver=(
-                params.american_solver if early_exercise else PDEEarlyExercise.INTRINSIC
-            ),
+            american_solver=params.american_solver if early_exercise else None,
             omega=float(params.omega) if early_exercise else None,
             tol=float(params.tol) if early_exercise else None,
             max_iter=int(params.max_iter) if early_exercise else None,
@@ -2705,11 +2733,26 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
     def _solve_european_ki_components(
         self,
     ) -> tuple[
-        dict,
         tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
         tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
     ]:
-        """Return the native KO and vanilla solves used by European KI parity."""
+        """Return the native KO and vanilla solves used by European KI parity.
+
+        Memoised on the instance: the first call runs both solves; every
+        subsequent call (e.g. from :meth:`delta`, :meth:`gamma`,
+        :meth:`theta`, or internally from :meth:`_solve`) is O(1).
+        """
+        if self._ki_components_result is not None:
+            return self._ki_components_result
+        self._ki_components_result = self._compute_european_ki_components()
+        return self._ki_components_result
+
+    def _compute_european_ki_components(
+        self,
+    ) -> tuple[
+        tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+        tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+    ]:
         solve_args = self._base_solve_args()
         ko_result = _fd_barrier_ko_core(**solve_args)
         van_result = _fd_core(
@@ -2728,25 +2771,31 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
             method=solve_args["method"],
             rannacher_steps=solve_args["rannacher_steps"],
             space_grid=solve_args["space_grid"],
-            american_solver=PDEEarlyExercise.INTRINSIC,
         )
-        return solve_args, ko_result, van_result
+        return ko_result, van_result
+
+    def _is_european_ki(self) -> bool:
+        """True iff this spec is a European knock-in — the only case that
+        needs native-surface parity (V_KI = V_vanilla − V_KO + rebate leg)
+        rather than the mixin's direct grid extraction."""
+        spec = self._spec
+        return spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN
 
     def delta(self) -> float:
         spec = self._spec
         if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return 0.0
-            return self._vanilla_equivalent_valuation().delta(greek_calc_method=None)
+            return self._vanilla_equivalent_valuation().delta()
 
-        if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
-            return super().delta()
+        if self._is_european_ki():
+            ko_result, van_result = self._solve_european_ki_components()
+            spot = float(self.underlying.initial_value)
+            return self._grid_delta_from_result(van_result, spot) - self._grid_delta_from_result(
+                ko_result, spot
+            )
 
-        _, ko_result, van_result = self._solve_european_ki_components()
-        spot = float(self.underlying.initial_value)
-        return self._grid_delta_from_result(van_result, spot) - self._grid_delta_from_result(
-            ko_result, spot
-        )
+        return super().delta()
 
     def gamma(self) -> float:
         """Return grid gamma, using native-surface parity for European KI barriers."""
@@ -2754,35 +2803,50 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return 0.0
-            return self._vanilla_equivalent_valuation().gamma(greek_calc_method=None)
+            return self._vanilla_equivalent_valuation().gamma()
 
-        if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
-            return super().gamma()
+        if self._is_european_ki():
+            ko_result, van_result = self._solve_european_ki_components()
+            spot = float(self.underlying.initial_value)
+            return self._grid_gamma_from_result(van_result, spot) - self._grid_gamma_from_result(
+                ko_result, spot
+            )
 
-        _, ko_result, van_result = self._solve_european_ki_components()
-        spot = float(self.underlying.initial_value)
-        return self._grid_gamma_from_result(van_result, spot) - self._grid_gamma_from_result(
-            ko_result, spot
-        )
+        return super().gamma()
 
     def theta(self) -> float:
         spec = self._spec
         if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return self._resolved_knock_out_theta()
-            return self._vanilla_equivalent_valuation().theta(greek_calc_method=None)
+            return self._vanilla_equivalent_valuation().theta()
 
-        if not (spec.action is BarrierAction.IN and spec.exercise_type is ExerciseType.EUROPEAN):
-            return super().theta()
+        if self._is_european_ki():
+            ko_result, van_result = self._solve_european_ki_components()
+            spot = float(self.underlying.initial_value)
+            ko_theta = self._grid_theta_from_result(ko_result, spot)
+            vanilla_theta = self._grid_theta_from_result(van_result, spot)
+            rebate_theta = self._discounted_rebate_theta(ko_result[-1])
+            return vanilla_theta + rebate_theta - ko_theta
 
-        _, ko_result, van_result = self._solve_european_ki_components()
-        spot = float(self.underlying.initial_value)
-        ko_theta = self._grid_theta_from_result(ko_result, spot)
-        vanilla_theta = self._grid_theta_from_result(van_result, spot)
-        rebate_theta = self._discounted_rebate_theta(ko_result[-1])
-        return vanilla_theta + rebate_theta - ko_theta
+        return super().theta()
 
     def _solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
+        """Memoised PDE solve result.
+
+        The first call runs the backward solve (KO directly, American KI
+        via the coupled two-surface solver, European KI via parity on the
+        cached KO + vanilla components).  Every subsequent call on the
+        same instance — including those triggered transparently by the
+        grid-greek mixin's :meth:`delta`, :meth:`gamma`, :meth:`theta` —
+        is an O(1) tuple lookup.
+        """
+        if self._solve_result is not None:
+            return self._solve_result
+        self._solve_result = self._compute_solve()
+        return self._solve_result
+
+    def _compute_solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the PDE solve, handling KI via parity or coupled PDE."""
         spec = self._spec
         solve_args = self._base_solve_args()
@@ -2796,16 +2860,18 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
 
         # European knock-in via parity: V_KI = V_vanilla + R * df_T - V_KO
         # When R=0 this reduces to V_vanilla - V_KO.
-        ko_args, ko_result, van_result = self._solve_european_ki_components()
+        ko_result, van_result = self._solve_european_ki_components()
         ko_price, S_ko, V_ko, V_ko_prev, last_dtau_ko = ko_result
         van_price, S_van, V_van, V_van_prev, _ = van_result
 
-        df_T = float(ko_args["discount_curve"].df(ko_args["time_to_maturity"]))
+        ttm = float(solve_args["time_to_maturity"])
+        discount_curve = solve_args["discount_curve"]
+        df_T = float(discount_curve.df(ttm))
         ki_price = van_price + spec.rebate * df_T - ko_price
 
         if last_dtau_ko > 0.0:
-            previous_ttm = max(float(ko_args["time_to_maturity"]) - last_dtau_ko, 0.0)
-            rebate_prev = float(spec.rebate) * float(ko_args["discount_curve"].df(previous_ttm))
+            previous_ttm = max(ttm - last_dtau_ko, 0.0)
+            rebate_prev = float(spec.rebate) * float(discount_curve.df(previous_ttm))
         else:
             rebate_prev = float(spec.rebate) * df_T
 

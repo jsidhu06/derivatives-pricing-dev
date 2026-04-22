@@ -119,21 +119,6 @@ class TestBinomialParams:
         with pytest.raises(ValidationError, match="num_steps must be an int"):
             BinomialParams(num_steps=True)
 
-    def test_for_barriers_defaults(self):
-        p = BinomialParams.for_barriers()
-        assert p.num_steps == 1000
-        assert p.mc_paths is None
-        assert p.control_variate_european is False
-
-    def test_for_barriers_with_overrides(self):
-        p = BinomialParams.for_barriers(num_steps=2000, log_timings=True)
-        assert p.num_steps == 2000
-        assert p.log_timings is True
-
-    def test_for_barriers_rejects_invalid_override(self):
-        with pytest.raises(ValidationError, match="num_steps must be >= 1"):
-            BinomialParams.for_barriers(num_steps=0)
-
 
 # ---------------------------------------------------------------------------
 # PDEParams
@@ -207,7 +192,7 @@ class TestPDEParams:
 
     def test_for_barriers_defaults(self):
         p = PDEParams.for_barriers()
-        assert p.spot_steps == 2400
+        assert p.spot_steps == 1200
         assert p.time_steps == 800
         assert p.space_grid is PDESpaceGrid.LOG_SPOT
         assert p.method is PDEMethod.CRANK_NICOLSON
@@ -215,7 +200,7 @@ class TestPDEParams:
 
     def test_for_barriers_with_overrides(self):
         p = PDEParams.for_barriers(log_timings=True, control_variate_european=True)
-        assert p.spot_steps == 2400
+        assert p.spot_steps == 1200
         assert p.time_steps == 800
         assert p.log_timings is True
         assert p.control_variate_european is True

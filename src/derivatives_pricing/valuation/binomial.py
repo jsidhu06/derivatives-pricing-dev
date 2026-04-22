@@ -44,12 +44,30 @@ class _BinomialValuationBase:
         self.underlying: UnderlyingData = valuation_ctx.underlying  # type: ignore[assignment]
         assert isinstance(valuation_ctx.params, BinomialParams)
         self.binom_params = valuation_ctx.params
+        # Lazy caches for deterministic intermediates — tree setup, the
+        # CRR backward pass, and (on the barrier subclass) the KO / KI
+        # lattices.  These are pure functions of the immutable instance
+        # state, so the first call populates the cache and every later
+        # PV / tree-greek access is an O(1) dict lookup.
+        self._cache: dict[tuple, object] = {}
+
+    def _cached(self, key: tuple, compute):
+        """Return ``self._cache[key]``, populating it with ``compute()`` on miss."""
+        if key in self._cache:
+            return self._cache[key]
+        value = compute()
+        self._cache[key] = value
+        return value
 
     def _effective_num_steps(self) -> int:
         """Return the canonical tree depth for this engine instance."""
         return int(self.binom_params.num_steps)
 
     def _setup_binomial_parameters(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return ``(discount_factors, p, spot_lattice)`` — cached after first call."""
+        return self._cached(("setup_binomial_parameters",), self._compute_binomial_parameters)
+
+    def _compute_binomial_parameters(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Setup binomial tree parameters and lattice.
 
 
@@ -206,6 +224,19 @@ class _BinomialValuationBase:
         return self.valuation_ctx.spec.payoff(instrument_values)  # type: ignore[union-attr]
 
     def _solve_backward(self, *, early_exercise: bool) -> np.ndarray:
+        """Return the CRR backward-induction lattice — cached per ``early_exercise``.
+
+        The cache key includes ``early_exercise`` because the tree topology
+        changes between vanilla and American recursions; within a single
+        instance the value is fixed (so at most one entry is ever stored),
+        but keying defensively means unexpected mixed calls can't collide.
+        """
+        return self._cached(
+            ("solve_backward", early_exercise),
+            lambda: self._compute_solve_backward(early_exercise=early_exercise),
+        )
+
+    def _compute_solve_backward(self, *, early_exercise: bool) -> np.ndarray:
         """Run CRR backward induction, optionally with early exercise.
 
         Parameters
@@ -1044,6 +1075,13 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         return option_lattice
 
     def _solve_knock_out(self, *, early_exercise: bool) -> np.ndarray:
+        """Return the KO lattice — cached so ``present_value`` + tree greeks share work."""
+        return self._cached(
+            ("solve_knock_out", early_exercise),
+            lambda: self._compute_knock_out(early_exercise=early_exercise),
+        )
+
+    def _compute_knock_out(self, *, early_exercise: bool) -> np.ndarray:
         num_steps = self._effective_num_steps()
         discount_factors, p, spot_lattice = self._setup_binomial_parameters()
         intrinsic = self._get_intrinsic_values(spot_lattice)
@@ -1090,6 +1128,13 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         return option_lattice
 
     def _solve_knock_in(self, *, early_exercise: bool) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(active, inactive)`` KI lattices — cached for PV + tree-greek reuse."""
+        return self._cached(
+            ("solve_knock_in", early_exercise),
+            lambda: self._compute_knock_in(early_exercise=early_exercise),
+        )
+
+    def _compute_knock_in(self, *, early_exercise: bool) -> tuple[np.ndarray, np.ndarray]:
         num_steps = self._effective_num_steps()
         discount_factors, p, spot_lattice = self._setup_binomial_parameters()
         intrinsic = self._get_intrinsic_values(spot_lattice)
