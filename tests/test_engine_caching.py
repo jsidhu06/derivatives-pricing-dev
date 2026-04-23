@@ -42,6 +42,7 @@ from derivatives_pricing.valuation import (
     UnderlyingData,
     VanillaSpec,
 )
+from derivatives_pricing.valuation.params import MonteCarloParams
 
 
 PRICING_DATE = dt.datetime(2025, 1, 1)
@@ -344,6 +345,22 @@ def _mc_vanilla_spec() -> VanillaSpec:
     )
 
 
+def _mc_ov() -> OptionValuation:
+    """Build a seeded MC OV for pathwise-cache tests.
+
+    Seeding makes path realisations deterministic across test ordering
+    and parallel workers (pytest-xdist) — otherwise the test outcome can
+    depend on whatever numpy global RNG state happens to be at test
+    start, which can flip path-level values between OTM and ITM.
+    """
+    return OptionValuation(
+        _mc_gbm_process(),
+        _mc_vanilla_spec(),
+        PricingMethod.MONTE_CARLO,
+        params=MonteCarloParams(random_seed=42),
+    )
+
+
 class TestPathwisePresentValueCache:
     """``present_value_pathwise`` is memoised and returns a read-only view.
 
@@ -356,7 +373,7 @@ class TestPathwisePresentValueCache:
 
     def test_repeated_pathwise_call_skips_impl(self):
         """Second ``present_value_pathwise()`` hits the OV cache without touching the impl."""
-        ov = OptionValuation(_mc_gbm_process(), _mc_vanilla_spec(), PricingMethod.MONTE_CARLO)
+        ov = _mc_ov()
         ov.present_value_pathwise()  # warm cache
         with patch.object(
             ov._impl, "present_value_pathwise", wraps=ov._impl.present_value_pathwise
@@ -367,7 +384,7 @@ class TestPathwisePresentValueCache:
 
     def test_pathwise_returns_read_only_view(self):
         """Returned array is read-only — mutation raises ``ValueError``."""
-        ov = OptionValuation(_mc_gbm_process(), _mc_vanilla_spec(), PricingMethod.MONTE_CARLO)
+        ov = _mc_ov()
         arr = ov.present_value_pathwise()
         assert not arr.flags.writeable
         with pytest.raises(ValueError, match="assignment destination is read-only"):
@@ -375,17 +392,25 @@ class TestPathwisePresentValueCache:
 
     def test_pathwise_copy_is_mutable(self):
         """``.copy()`` of the returned array is mutable and does not affect the cache."""
-        ov = OptionValuation(_mc_gbm_process(), _mc_vanilla_spec(), PricingMethod.MONTE_CARLO)
+        ov = _mc_ov()
         arr_before = ov.present_value_pathwise()
+        # Snapshot the pre-mutation state in a fresh (mutable) array so we
+        # can detect cache corruption even though arr_before itself is
+        # a read-only view sharing memory with the cached array.
+        snapshot = arr_before.copy()
         mutable = arr_before.copy()
-        mutable[0] = 0.0
+        # Sentinel chosen so the assertion is robust regardless of path
+        # realisation — a call PV is never negative, so -999.0 is
+        # unambiguously "not a real value."
+        sentinel = -999.0
+        mutable[0] = sentinel
         arr_after = ov.present_value_pathwise()
-        assert arr_after[0] != 0.0  # cached array unaffected
-        assert np.array_equal(arr_before, arr_after)
+        assert mutable[0] == sentinel  # copy is writable
+        assert np.array_equal(arr_after, snapshot)  # cache untouched
 
     def test_concurrent_pathwise_solves_once(self):
         """Concurrent ``present_value_pathwise()`` triggers a single impl call."""
-        ov = OptionValuation(_mc_gbm_process(), _mc_vanilla_spec(), PricingMethod.MONTE_CARLO)
+        ov = _mc_ov()
         original = ov._impl.present_value_pathwise
 
         def slow():
