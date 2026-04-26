@@ -27,7 +27,7 @@ import logging
 import threading
 import numpy as np
 import pandas as pd
-from ..utils import calculate_year_fraction
+from ..utils import calculate_year_fraction, coerce_positive_float
 from ..stochastic_processes import PathSimulation, GBMProcess
 from ..exceptions import ConfigurationError, UnsupportedFeatureError, ValidationError
 from ..enums import (
@@ -152,6 +152,17 @@ class UnderlyingData:
     dividend_curve: DiscountCurve | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "initial_value",
+            coerce_positive_float(self.initial_value, name="UnderlyingData.initial_value"),
+        )
+        object.__setattr__(
+            self,
+            "volatility",
+            coerce_positive_float(self.volatility, name="UnderlyingData.volatility", strict=False),
+        )
+
         if self.discrete_dividends is not None:
             cleaned: list[tuple[dt.datetime, float]] = []
             for ex_date, amount in self.discrete_dividends:

@@ -10,6 +10,9 @@ import numpy as np
 import pytest
 
 from derivatives_pricing.enums import (
+    BarrierAction,
+    BarrierDirection,
+    BarrierMonitoring,
     ExerciseType,
     OptionType,
     PDESpaceGrid,
@@ -28,6 +31,7 @@ from helpers import (
     pv as _pv,
 )
 from derivatives_pricing.valuation import (
+    BarrierSpec,
     BinomialParams,
     VanillaSpec,
     PDEParams,
@@ -140,6 +144,23 @@ class TestZeroVolatility:
         spec = _spec(strike=90.0, option_type=OptionType.CALL)
         with pytest.raises(ValidationError, match="volatility must be positive"):
             _pv(ud, spec, PricingMethod.PDE_FD)
+
+    # --- Construction-time validation: negative vol & non-positive spot rejected ---
+
+    @pytest.mark.parametrize("vol", [-1e-12, -0.2, -1.0])
+    def test_underlying_rejects_negative_vol(self, vol):
+        """UnderlyingData rejects σ < 0; σ = 0 is the deterministic limit and is allowed."""
+        with pytest.raises(ValidationError, match=r"volatility must be >= 0"):
+            _underlying(vol=vol)
+
+    def test_underlying_rejects_nan_vol(self):
+        with pytest.raises(ValidationError, match=r"volatility must be finite"):
+            _underlying(vol=float("nan"))
+
+    @pytest.mark.parametrize("spot", [0.0, -1e-12, -100.0])
+    def test_underlying_rejects_non_positive_spot(self, spot):
+        with pytest.raises(ValidationError, match=r"initial_value must be > 0"):
+            _underlying(spot=spot)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -594,3 +615,106 @@ class TestAmericanEdgeCases:
         )
         intrinsic = strike - spot
         assert pv >= intrinsic - 0.01
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Barrier options: tiny / zero σ overflow guard
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestBarrierZeroVolatility:
+    """BSM barrier formula contains ``(H/S)**(2*lambda)`` with
+    ``lambda = (r-q+sigma^2/2)/sigma^2``.  As σ → 0 either λ overflows or
+    the divide-by-zero kicks in.  The engine must fall back to the
+    deterministic-forward limit instead of returning silent NaN.
+    """
+
+    def _barrier_spec(
+        self,
+        direction: BarrierDirection,
+        action: BarrierAction,
+        barrier: float,
+        strike: float = 100.0,
+        option_type: OptionType = OptionType.CALL,
+    ) -> BarrierSpec:
+        return BarrierSpec(
+            option_type=option_type,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=strike,
+            maturity=MATURITY,
+            currency="USD",
+            barrier=barrier,
+            direction=direction,
+            action=action,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+
+    @staticmethod
+    def _T_and_df(ud) -> tuple[float, float]:
+        """Year fraction and risk-free DF the engine actually uses."""
+        from derivatives_pricing.utils import calculate_year_fraction
+
+        T = calculate_year_fraction(PRICING_DATE, MATURITY)
+        return T, float(ud.discount_curve.df(T))
+
+    @pytest.mark.parametrize("vol", [0.0, 1e-12, 1e-10, 1e-8, 1e-4])
+    def test_uoc_tiny_vol_returns_deterministic_forward(self, vol):
+        """UOC with tiny σ: forward = S·exp(rT) < H, option survives →
+        discounted forward intrinsic."""
+        spot, strike, barrier = 100.0, 100.0, 130.0
+        ud = _underlying(spot=spot, vol=vol)
+        spec = self._barrier_spec(BarrierDirection.UP, BarrierAction.OUT, barrier, strike)
+        pv = _pv(ud, spec, PricingMethod.BSM)
+
+        T, df_r = self._T_and_df(ud)
+        S_T = spot * np.exp(RATE * T)
+        assert S_T < barrier  # not knocked out by forward
+        expected = df_r * max(S_T - strike, 0.0)
+        assert np.isfinite(pv)
+        assert np.isclose(pv, expected, rtol=1e-10)
+
+    @pytest.mark.parametrize("vol", [0.0, 1e-12, 1e-8])
+    def test_uoc_tiny_vol_knocked_out_at_forward(self, vol):
+        """UOC where forward crosses barrier deterministically → knocked out → 0."""
+        spot, strike, barrier = 100.0, 100.0, 102.0  # forward (~102.54) > barrier
+        ud = _underlying(spot=spot, vol=vol)
+        spec = self._barrier_spec(BarrierDirection.UP, BarrierAction.OUT, barrier, strike)
+        pv = _pv(ud, spec, PricingMethod.BSM)
+
+        T, _ = self._T_and_df(ud)
+        S_T = spot * np.exp(RATE * T)
+        assert S_T > barrier  # knocked out by forward
+        assert np.isfinite(pv)
+        assert pv == 0.0
+
+    @pytest.mark.parametrize("vol", [0.0, 1e-12, 1e-8])
+    def test_dop_tiny_vol_returns_deterministic_forward(self, vol):
+        """Down-and-out put with tiny σ: forward stays above down-barrier → survives."""
+        spot, strike, barrier = 100.0, 110.0, 80.0
+        ud = _underlying(spot=spot, vol=vol)
+        spec = self._barrier_spec(
+            BarrierDirection.DOWN,
+            BarrierAction.OUT,
+            barrier,
+            strike,
+            option_type=OptionType.PUT,
+        )
+        pv = _pv(ud, spec, PricingMethod.BSM)
+
+        T, df_r = self._T_and_df(ud)
+        S_T = spot * np.exp(RATE * T)
+        assert S_T > barrier  # not knocked out
+        expected = df_r * max(strike - S_T, 0.0)
+        assert np.isfinite(pv)
+        assert np.isclose(pv, expected, rtol=1e-10)
+
+    @pytest.mark.parametrize("vol", [0.0, 1e-12, 1e-8])
+    def test_uic_tiny_vol_not_hit_returns_zero(self, vol):
+        """Up-and-in call with tiny σ: forward never reaches barrier → KI never
+        activates, no rebate → 0."""
+        spot, strike, barrier = 100.0, 100.0, 130.0
+        ud = _underlying(spot=spot, vol=vol)
+        spec = self._barrier_spec(BarrierDirection.UP, BarrierAction.IN, barrier, strike)
+        pv = _pv(ud, spec, PricingMethod.BSM)
+        assert np.isfinite(pv)
+        assert pv == 0.0
