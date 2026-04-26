@@ -1127,20 +1127,28 @@ def _brownian_bridge_hit_prob(
     """
     p = np.zeros_like(S_i)
 
+    # At sigma == 0 the path is deterministic and monotone, so any in-step
+    # crossing must show up at an endpoint -- the `crossed` mask catches it
+    # and the Brownian-bridge correction is both undefined (1/sigma**2) and
+    # unnecessary (interior hit probability is 0).
+    sigma_positive = sigma > 0.0
+
     if direction is BarrierDirection.UP:
         crossed = (S_i >= barrier) | (S_next >= barrier)
-        both_below = ~crossed
-        if np.any(both_below):
-            log_a = np.log(barrier / S_i[both_below])
-            log_b = np.log(barrier / S_next[both_below])
-            p[both_below] = np.exp(-2.0 * log_a * log_b / (sigma**2 * dt_step))
+        if sigma_positive:
+            both_below = ~crossed
+            if np.any(both_below):
+                log_a = np.log(barrier / S_i[both_below])
+                log_b = np.log(barrier / S_next[both_below])
+                p[both_below] = np.exp(-2.0 * log_a * log_b / (sigma**2 * dt_step))
     else:
         crossed = (S_i <= barrier) | (S_next <= barrier)
-        both_above = ~crossed
-        if np.any(both_above):
-            log_a = np.log(S_i[both_above] / barrier)
-            log_b = np.log(S_next[both_above] / barrier)
-            p[both_above] = np.exp(-2.0 * log_a * log_b / (sigma**2 * dt_step))
+        if sigma_positive:
+            both_above = ~crossed
+            if np.any(both_above):
+                log_a = np.log(S_i[both_above] / barrier)
+                log_b = np.log(S_next[both_above] / barrier)
+                p[both_above] = np.exp(-2.0 * log_a * log_b / (sigma**2 * dt_step))
 
     p[crossed] = 1.0
     return np.clip(p, 0.0, 1.0)
