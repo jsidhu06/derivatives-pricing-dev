@@ -507,3 +507,13 @@ class BarrierSpec:
                 if dates[-1] > self.maturity:
                     raise ValidationError("monitoring_dates must not extend beyond maturity.")
                 object.__setattr__(self, "monitoring_dates", dates)
+
+    def is_triggered(self, spot: float) -> bool:
+        """Return ``True`` if ``spot`` has crossed the barrier.
+
+        UP barriers trigger when ``spot >= self.barrier``; DOWN barriers
+        trigger when ``spot <= self.barrier``.
+        """
+        if self.direction is BarrierDirection.UP:
+            return spot >= self.barrier
+        return spot <= self.barrier

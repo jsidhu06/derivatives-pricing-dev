@@ -49,32 +49,6 @@ if TYPE_CHECKING:
 # ── Shared helpers ──────────────────────────────────────────────────
 
 
-def _is_triggered(
-    spot: float,
-    barrier: float,
-    direction: BarrierDirection,
-) -> bool:
-    """Return ``True`` if the barrier is triggered.
-
-    Parameters
-    ----------
-    spot
-        Current spot price.
-    barrier
-        Barrier level.
-    direction
-        UP or DOWN.
-
-    Returns
-    -------
-    bool
-        ``True`` if the barrier is triggered.
-    """
-    if direction is BarrierDirection.UP:
-        return spot >= barrier
-    return spot <= barrier
-
-
 _BG_BETA = 0.5826  # Broadie-Glasserman-Kou constant
 
 

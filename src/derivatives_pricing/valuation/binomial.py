@@ -28,7 +28,6 @@ from ..exceptions import (
     ValidationError,
 )
 from .params import BinomialParams
-from .barrier_analytical import _is_triggered
 
 if TYPE_CHECKING:
     from .core import AsianSpec, BarrierSpec, OptionValuation, UnderlyingData
@@ -972,7 +971,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         #     `_solve_backward` (not the barrier-aware solver), so barrier
         #     alignment is irrelevant.
         # Skip both the inflation and any warning for those cases.
-        if _is_triggered(spot, barrier, self.spec.direction):
+        if self.spec.is_triggered(spot):
             return base_steps
 
         log_distance = np.log(max(spot, barrier) / min(spot, barrier))

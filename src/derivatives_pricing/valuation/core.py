@@ -56,7 +56,7 @@ from .binomial import (
 )
 from .bsm import _BSMEuropeanValuation
 from .asian_analytical import _AnalyticalAsianValuation
-from .barrier_analytical import _AnalyticalBarrierValuation, _is_triggered
+from .barrier_analytical import _AnalyticalBarrierValuation
 from .pde import _FDEuropeanValuation, _FDAmericanValuation, _FDBarrierValuation
 from ..rates import DiscountCurve
 from ..market_environment import MarketData
@@ -1019,7 +1019,7 @@ class OptionValuation:
             "the dispatcher should route BarrierSpecs to barrier engines only."
         )
         spot = float(self._underlying.initial_value)
-        if not _is_triggered(spot, self._spec.barrier, self._spec.direction):
+        if not self._spec.is_triggered(spot):
             return False
         if self._spec.monitoring is BarrierMonitoring.CONTINUOUS:
             return True
