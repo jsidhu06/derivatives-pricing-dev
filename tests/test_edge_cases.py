@@ -10,10 +10,12 @@ import numpy as np
 import pytest
 
 from derivatives_pricing.enums import (
+    AsianAveraging,
     BarrierAction,
     BarrierDirection,
     BarrierMonitoring,
     ExerciseType,
+    GreekCalculationMethod,
     OptionType,
     PDESpaceGrid,
     PricingMethod,
@@ -21,7 +23,13 @@ from derivatives_pricing.enums import (
 from derivatives_pricing.exceptions import (
     ArbitrageViolationError,
     NumericalError,
+    UnsupportedFeatureError,
     ValidationError,
+)
+from derivatives_pricing.stochastic_processes import (
+    GBMParams,
+    GBMProcess,
+    SimulationConfig,
 )
 from helpers import (
     flat_curve,
@@ -31,12 +39,15 @@ from helpers import (
     pv as _pv,
 )
 from derivatives_pricing.valuation import (
+    AsianSpec,
     BarrierSpec,
     BinomialParams,
+    MonteCarloParams,
     VanillaSpec,
     PDEParams,
     UnderlyingData,
 )
+from derivatives_pricing.valuation.core import OptionValuation
 
 PRICING_DATE = dt.datetime(2025, 1, 1)
 MATURITY = dt.datetime(2025, 7, 3)  # ~0.5y
@@ -718,3 +729,113 @@ class TestBarrierZeroVolatility:
         pv = _pv(ud, spec, PricingMethod.BSM)
         assert np.isfinite(pv)
         assert pv == 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Asian options: σ = 0 explicitly rejected by the analytical formula
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestAsianZeroVolatility:
+    """Geometric/arithmetic Asian closed-forms reject σ = 0 explicitly."""
+
+    @pytest.mark.parametrize(
+        "averaging",
+        [AsianAveraging.GEOMETRIC, AsianAveraging.ARITHMETIC],
+    )
+    def test_asian_analytical_rejects_zero_vol(self, averaging):
+        ud = _underlying(vol=0.0)
+        spec = AsianSpec(
+            averaging=averaging,
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=100.0,
+            maturity=MATURITY,
+            currency="USD",
+            num_observations=12,
+        )
+        with pytest.raises(ValidationError, match=r"volatility must be positive"):
+            _pv(ud, spec, PricingMethod.BSM)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MC likelihood-ratio greeks: σ = 0 rejected (score function diverges)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestMCLikelihoodRatioGreeksZeroVolatility:
+    """LR estimators divide by σ; the lognormal density is degenerate at σ=0."""
+
+    @pytest.fixture
+    def _ov_zero_vol(self):
+        md = market_data(
+            pricing_date=PRICING_DATE,
+            discount_curve=_DEFAULT_RATE_CURVE,
+            currency="USD",
+        )
+        sim = SimulationConfig(paths=2_000, num_steps=12, end_date=MATURITY)
+        gbm = GBMProcess(md, GBMParams(initial_value=100.0, volatility=0.0), sim)
+        spec = make_vanilla_spec(
+            strike=100.0,
+            maturity=MATURITY,
+            option_type=OptionType.CALL,
+            currency="USD",
+        )
+        return OptionValuation(
+            gbm,
+            spec,
+            PricingMethod.MONTE_CARLO,
+            params=MonteCarloParams(random_seed=42),
+        )
+
+    @pytest.mark.parametrize("greek", ["delta", "vega", "theta", "rho"])
+    def test_lr_greek_rejects_zero_vol(self, _ov_zero_vol, greek):
+        with pytest.raises(UnsupportedFeatureError, match=r"Likelihood-ratio .* sigma=0"):
+            getattr(_ov_zero_vol, greek)(greek_calc_method=GreekCalculationMethod.LIKELIHOOD_RATIO)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Cross-engine vol = 0 agreement (BSM vs MC vanilla)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestVanillaZeroVolCrossEngine:
+    """At σ = 0 BSM and MC must both return discounted forward intrinsic."""
+
+    @pytest.mark.parametrize(
+        "option_type,strike",
+        [
+            (OptionType.CALL, 90.0),  # ITM call
+            (OptionType.PUT, 110.0),  # ITM put
+            (OptionType.CALL, 110.0),  # OTM call
+            (OptionType.PUT, 90.0),  # OTM put
+        ],
+    )
+    def test_bsm_and_mc_agree_at_zero_vol(self, option_type, strike):
+        md = market_data(
+            pricing_date=PRICING_DATE,
+            discount_curve=_DEFAULT_RATE_CURVE,
+            currency="USD",
+        )
+        ud = UnderlyingData(initial_value=100.0, volatility=0.0, market_data=md)
+        sim = SimulationConfig(paths=1_000, num_steps=12, end_date=MATURITY)
+        gbm = GBMProcess(md, GBMParams(initial_value=100.0, volatility=0.0), sim)
+        spec = make_vanilla_spec(
+            strike=strike,
+            maturity=MATURITY,
+            option_type=option_type,
+            currency="USD",
+        )
+
+        bsm_pv = _pv(ud, spec, PricingMethod.BSM)
+        mc_pv = OptionValuation(
+            gbm,
+            spec,
+            PricingMethod.MONTE_CARLO,
+            params=MonteCarloParams(random_seed=42),
+        ).present_value()
+
+        assert np.isfinite(bsm_pv) and np.isfinite(mc_pv)
+        # All paths identical at σ=0 → MC variance is exactly zero, so the
+        # two engines should agree to machine precision (modulo float rounding).
+        assert np.isclose(bsm_pv, mc_pv, rtol=1e-10, atol=1e-10)
