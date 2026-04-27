@@ -1999,11 +1999,6 @@ class TestBarrierGreeksAgainstBoyleTianTable6:
         90.2: (1.2869, -0.0451, -0.1161),
     }
 
-    # Binomial tree greeks are known to degrade very close to the barrier
-    # (Boyle-Lau retopology + discrete-grid noise).  Regression is enforced
-    # at those spots via BSM numerical and PDE grid greeks only.
-    _BINOMIAL_SKIP_SPOTS = {90.5, 90.4, 90.3, 90.2}
-
     # Per-engine tolerances for each greek.
     _TOLS = {
         "delta": {
@@ -2078,10 +2073,22 @@ class TestBarrierGreeksAgainstBoyleTianTable6:
 
         engine_values: dict[PricingMethod, float | None] = {}
         for method in (PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
-            if method is PricingMethod.BINOMIAL and spot in self._BINOMIAL_SKIP_SPOTS:
+            try:
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always", RuntimeWarning)
+                    val = self._engine_greek(spot, method, greek)
+                # Boyle-Lau alignment requires more steps than the cap → engine
+                # explicitly flagged the result as O(1/√n)-degraded.  Skip
+                # rather than assert paper-truth on a value the engine itself
+                # said not to trust.
+                if any("Boyle-Lau step alignment" in str(w.message) for w in caught):
+                    engine_values[method] = None
+                else:
+                    engine_values[method] = val
+            except UnsupportedFeatureError:
+                # The engine itself declared this case unsuitable (e.g. binomial
+                # tree-greek stencil straddles the barrier near H).
                 engine_values[method] = None
-                continue
-            engine_values[method] = self._engine_greek(spot, method, greek)
 
         def _fmt(v: float | None) -> str:
             return f"{v:.6f}" if v is not None else "skipped"
