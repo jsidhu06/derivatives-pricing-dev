@@ -2612,22 +2612,6 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         ttm = self.valuation_ctx._maturity_year_fraction()
         return float(self._spec.rebate) * float(self.valuation_ctx.discount_curve.df(ttm))
 
-    def _vanilla_equivalent_valuation(self) -> OptionValuation:
-        from .core import OptionValuation
-
-        vanilla_spec = VanillaSpec(
-            option_type=self._spec.option_type,
-            exercise_type=self._spec.exercise_type,
-            strike=self._spec.strike,
-            maturity=self._spec.maturity,
-        )
-        return OptionValuation(
-            underlying=self.underlying,
-            spec=vanilla_spec,
-            pricing_method=self.valuation_ctx.pricing_method,
-            params=self.valuation_ctx.params,
-        )
-
     def _last_dtau(self) -> float:
         solve_args = self._base_solve_args()
         time_to_maturity = float(solve_args["time_to_maturity"])
@@ -2807,7 +2791,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return 0.0
-            return self._vanilla_equivalent_valuation().delta()
+            return self.valuation_ctx._vanilla_equivalent_valuation().delta()
 
         if self._is_european_ki():
             ko_result, van_result = self._solve_european_ki_components()
@@ -2824,7 +2808,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return 0.0
-            return self._vanilla_equivalent_valuation().gamma()
+            return self.valuation_ctx._vanilla_equivalent_valuation().gamma()
 
         if self._is_european_ki():
             ko_result, van_result = self._solve_european_ki_components()
@@ -2840,7 +2824,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
         if self.valuation_ctx._barrier_triggered_at_inception():
             if spec.action is BarrierAction.OUT:
                 return self._resolved_knock_out_theta()
-            return self._vanilla_equivalent_valuation().theta()
+            return self.valuation_ctx._vanilla_equivalent_valuation().theta()
 
         if self._is_european_ki():
             ko_result, van_result = self._solve_european_ki_components()
@@ -2918,7 +2902,7 @@ class _FDBarrierValuation(_FDGridGreeksMixin):
                 if triggered_value is None:
                     raise ConfigurationError("Resolved knock-out state unexpectedly unavailable")
                 return triggered_value
-            return self._vanilla_equivalent_valuation().present_value()
+            return self.valuation_ctx._vanilla_equivalent_valuation().present_value()
         spec = self._spec
         label = f"PDE barrier {'American' if spec.exercise_type is ExerciseType.AMERICAN else 'European'}"
         with log_timing(logger, f"{label} present_value", self.pde_params.log_timings):

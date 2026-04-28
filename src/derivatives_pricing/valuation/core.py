@@ -32,6 +32,7 @@ from ..stochastic_processes import PathSimulation, GBMProcess
 from ..exceptions import ConfigurationError, UnsupportedFeatureError, ValidationError
 from ..enums import (
     AsianAveraging,
+    BarrierAction,
     BarrierDirection,
     BarrierMonitoring,
     DayCountConvention,
@@ -529,6 +530,20 @@ class OptionValuation:
         if method is not GreekCalculationMethod.NUMERICAL:
             return float(self._impl.delta())
 
+        if isinstance(self._spec, BarrierSpec) and self._barrier_triggered_at_inception():
+            # Bump-and-revalue may cross the trigger boundary and price the
+            # un-triggered contract on the bumped spot — meaningless for an
+            # already-triggered barrier.  Short-circuit:
+            #   - KO triggered → constant-in-spot cashflow → δ = 0.
+            #   - KI triggered → contract IS the underlying vanilla; bump on
+            #     the vanilla equivalent (no state transition).
+            if self._spec.action is BarrierAction.OUT:
+                return 0.0
+            return self._vanilla_equivalent_valuation().delta(
+                epsilon=epsilon,
+                greek_calc_method=GreekCalculationMethod.NUMERICAL,
+            )
+
         if epsilon is None:
             epsilon = self._underlying.initial_value / 100
         if isinstance(self._spec, BarrierSpec):
@@ -586,6 +601,15 @@ class OptionValuation:
             )
         if method is not GreekCalculationMethod.NUMERICAL:
             return float(self._impl.gamma())
+
+        if isinstance(self._spec, BarrierSpec) and self._barrier_triggered_at_inception():
+            # See the corresponding short-circuit in :meth:`delta`.
+            if self._spec.action is BarrierAction.OUT:
+                return 0.0
+            return self._vanilla_equivalent_valuation().gamma(
+                epsilon=epsilon,
+                greek_calc_method=GreekCalculationMethod.NUMERICAL,
+            )
 
         if epsilon is None:
             epsilon = self._underlying.initial_value / 100
@@ -1026,6 +1050,34 @@ class OptionValuation:
         mon_dates = self._barrier_monitoring_dates()
         assert mon_dates is not None
         return any(d == self.pricing_date for d in mon_dates)
+
+    @_memoize_result
+    def _vanilla_equivalent_valuation(self) -> OptionValuation:
+        """Return the vanilla ``OptionValuation`` that a triggered KI collapses to.
+
+        Cached per-instance so repeated greek calls on a triggered KI reuse
+        the same vanilla — the vanilla's own solve cache then survives
+        across delta/gamma/theta and matches the "one solve, three free
+        greeks" cost profile of a non-triggered native greek.
+        """
+        assert isinstance(self._spec, BarrierSpec), (
+            "_vanilla_equivalent_valuation called on non-BarrierSpec valuation."
+        )
+        spec = self._spec
+        vanilla_spec = VanillaSpec(
+            option_type=spec.option_type,
+            exercise_type=spec.exercise_type,
+            strike=spec.strike,
+            maturity=spec.maturity,
+            currency=spec.currency,
+            contract_size=spec.contract_size,
+        )
+        return OptionValuation(
+            underlying=self._underlying,
+            spec=vanilla_spec,
+            pricing_method=self._pricing_method,
+            params=self._params,
+        )
 
     def _apply_control_variate(self, base_pv: float) -> float:
         """Apply European control-variate adjustment to American base PV.

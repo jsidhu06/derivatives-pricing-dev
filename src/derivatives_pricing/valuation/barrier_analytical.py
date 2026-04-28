@@ -476,15 +476,44 @@ class _AnalyticalBarrierValuation:
         ``V`` is the closed-form barrier price; ``Δ`` and ``Γ`` come from
         central-difference bump-and-revalue around the same closed-form
         evaluator (routed through :attr:`valuation_ctx` so repeated calls
-        hit the OV-level cache).  The identity is exact in the
-        continuation region (triggered-at-inception cases already
-        short-circuit in :meth:`present_value`) and delivers better
-        accuracy than a naive forward-difference time bump.
+        hit the OV-level cache).  The identity holds in the continuation
+        region; for inception-triggered KOs we short-circuit to a
+        closed-form θ because the contract is no longer PDE-governed
+        (it's just paid cash, or a deterministic discounted payment).
+        For inception-triggered KIs we delegate to the vanilla equivalent.
 
         Returned per **calendar day**
         """
         ctx = self.valuation_ctx
         underlying = self.underlying
+
+        # ── Inception-triggered short-circuit ─────────────────────────
+        # KO triggered: the contract has collapsed to a deterministic
+        # cashflow and is no longer PDE-governed.  The identity then gives
+        # the wrong answer — e.g. r·V instead of 0 for an AT_HIT rebate
+        # — so we return the closed-form θ directly.
+        # KI triggered: the contract is the underlying vanilla, which DOES
+        # satisfy the BS PDE; the identity would still hold here (with the
+        # vanilla's δ and γ that OV's NUMERICAL short-circuit already
+        # provides).  We delegate to ``vanilla.theta()`` anyway as a
+        # precision upgrade — it returns the analytical θ rather than the
+        # identity evaluated with bumped greeks.
+        if ctx._barrier_triggered_at_inception():
+            spec = self.spec
+            if spec.action is BarrierAction.IN:
+                return float(ctx._vanilla_equivalent_valuation().theta())
+            # KO triggered.
+            if spec.rebate <= 0.0 or spec.rebate_timing is RebateTiming.AT_HIT:
+                # No rebate or rebate paid immediately → pv has no time
+                # evolution → θ = 0.
+                return 0.0
+            # AT_EXPIRY rebate: pv = R · df_r(T), so dpv/dt = +r · pv;
+            # per-day θ = r · pv / 365.
+            T = ctx._maturity_year_fraction()
+            df_r = float(ctx.discount_curve.df(T))
+            pv = float(spec.rebate) * df_r
+            r = -np.log(df_r) / T
+            return float(r * pv / 365.0)
 
         S = float(underlying.initial_value)
         sigma = float(underlying.volatility)
