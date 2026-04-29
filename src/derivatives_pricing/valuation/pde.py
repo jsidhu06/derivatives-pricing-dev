@@ -1852,6 +1852,16 @@ def _fd_barrier_ko_core(
     else:
         payoff = np.maximum(S - strike, 0.0)
 
+    # American exercise intrinsic is the holder's exercise value at any
+    # in-life moment, which is the vanilla payoff — independent of any
+    # KO-zone modification applied to the maturity payoff below.  Under
+    # discrete monitoring the holder can exercise between observations
+    # even when sitting in the KO zone, so the PSOR floor must use the
+    # unmodified vanilla intrinsic.  (For continuous KO the grid is
+    # truncated at the barrier and the KO zone is absent from the grid,
+    # so the same vanilla array is also correct on the alive side.)
+    intrinsic = payoff.copy() if early_exercise else None
+
     # For continuous KO: payoff is zero on the barrier side (enforced
     # by grid truncation since the barrier is at the boundary).
     # For discrete KO: zero out the payoff on the knocked-out side at maturity
@@ -1866,7 +1876,6 @@ def _fd_barrier_ko_core(
                 payoff[S >= barrier] = 0.0
 
     V = payoff.copy()
-    intrinsic = payoff if early_exercise else None
 
     # ── Dividend schedule ─────────────────────────────────────────────
     schedule = dividend_schedule or []
