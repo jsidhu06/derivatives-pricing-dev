@@ -1207,9 +1207,9 @@ class TestBarrierPresentValueAgainstBoyleTianTable8:
     _TOLS: dict[PricingMethod, dict[str, float]] = {
         PricingMethod.BSM: dict(rtol=0.022, atol=1.0e-4),
         PricingMethod.BINOMIAL: dict(rtol=0.013, atol=1.0e-4),
-        PricingMethod.PDE_FD: dict(rtol=0.001, atol=1.0e-4),
+        PricingMethod.PDE_FD: dict(rtol=0.002, atol=1.0e-4),
     }
-    _PDE_FD_HOURLY_TOL: dict[str, float] = dict(rtol=0.015, atol=1.0e-4)
+    _PDE_FD_HOURLY_TOL: dict[str, float] = dict(rtol=0.020, atol=1.0e-4)
 
     @pytest.mark.parametrize(
         "frequency,monitoring_kind,paper_pv",
@@ -1340,6 +1340,8 @@ class TestBarrierPresentValueAgainstBroadieGlasserman:
     _TOLS: dict[PricingMethod, dict[str, float]] = {
         PricingMethod.BSM: dict(rtol=0.0, atol=1.5e-3),
         PricingMethod.BINOMIAL: dict(rtol=0.035, atol=1.0e-3),
+        # PDE_FD discrete-monitoring default is IMPLICIT (L-stable);
+        # slightly less accurate vs paper than CN.
         PricingMethod.PDE_FD: dict(rtol=0.002, atol=1.0e-3),
     }
 

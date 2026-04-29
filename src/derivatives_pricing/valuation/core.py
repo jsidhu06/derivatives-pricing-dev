@@ -959,7 +959,9 @@ class OptionValuation:
                     return BinomialParams(num_steps=num_steps)
                 return BinomialParams()
             if pricing_method is PricingMethod.PDE_FD:
-                return PDEParams.for_barriers() if isinstance(spec, BarrierSpec) else PDEParams()
+                if isinstance(spec, BarrierSpec):
+                    return PDEParams.for_barriers(monitoring=spec.monitoring)
+                return PDEParams()
             return None
 
         if pricing_method is PricingMethod.MONTE_CARLO:
