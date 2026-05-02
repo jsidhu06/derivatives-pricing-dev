@@ -611,7 +611,9 @@ class OptionValuation:
                 greek_calc_method=GreekCalculationMethod.NUMERICAL,
             )
 
-        self._reject_barrier_mc_numerical(method, greek="gamma")
+        self._reject_barrier_numerical(
+            method, greek="gamma", engine_constraint=PricingMethod.MONTE_CARLO
+        )
 
         if epsilon is None:
             epsilon = self._underlying.initial_value / 100
@@ -726,7 +728,7 @@ class OptionValuation:
         if method is not GreekCalculationMethod.NUMERICAL:
             return float(self._impl.theta())
 
-        self._reject_barrier_mc_numerical(
+        self._reject_barrier_numerical(
             method, greek="theta", monitoring_constraint=BarrierMonitoring.DISCRETE
         )
 
@@ -1405,62 +1407,69 @@ class OptionValuation:
             "bump-and-revalue on the full grid."
         )
 
-    # Greek-specific rationales for the MC barrier NUMERICAL block.  Kept
+    # Greek-specific rationales for the barrier NUMERICAL block.  Kept
     # alongside the helper so the "what's blocked and why" is in one
     # discoverable place rather than spread across gamma()/theta().
-    _MC_BARRIER_NUMERICAL_REASON: dict[str, str] = {
+    _BARRIER_NUMERICAL_REASON: dict[str, str] = {
         "gamma": (
             "with practical path counts the central-difference noise "
             "dominates the |Γ| signal and sign flips occur near zero"
         ),
         "theta": (
-            "bump-and-revalue MC theta on discretely-monitored barriers is "
-            "empirically too noisy and inaccurate to be trusted "
-            "(continuous-monitoring MC theta is supported)"
+            "bump-and-revalue theta on discretely-monitored barriers is "
+            "unreliable: bumping the pricing date forces re-resolution of "
+            "the monitoring schedule (a different contract on the bumped "
+            "side)"
         ),
     }
 
-    def _reject_barrier_mc_numerical(
+    def _reject_barrier_numerical(
         self,
         method: GreekCalculationMethod,
         *,
         greek: str,
+        engine_constraint: PricingMethod | None = None,
         monitoring_constraint: BarrierMonitoring | None = None,
     ) -> None:
-        """Block NUMERICAL bump-and-revalue greeks on MC barrier specs that
-        are empirically unreliable.
+        """Block NUMERICAL bump-and-revalue greeks on barrier specs that
+        are empirically or structurally unreliable.
 
-        Two distinct greek failure modes are covered (see
-        ``_MC_BARRIER_NUMERICAL_REASON``):
+        Two distinct greek failure modes are currently covered (see
+        ``_BARRIER_NUMERICAL_REASON``):
 
-        - Gamma (any monitoring): second-derivative MC noise scales as
-          ~stderr/ε² and at practical path counts the noise floor exceeds
-          the |Γ| signal across most of parameter space.
-        - Theta under DISCRETE monitoring: bump-and-revalue MC theta on
-          discretely-monitored barriers is empirically too noisy and
-          inaccurate to be trusted.  Continuous-monitoring MC theta is
-          fine and remains supported — callers requesting the
-          discrete-only block pass
-          ``monitoring_constraint=BarrierMonitoring.DISCRETE``.
+        - Gamma on Monte Carlo barriers (any monitoring): second-derivative
+          MC noise scales as ~stderr/ε² and at practical path counts the
+          noise floor exceeds the |Γ| signal across most of parameter
+          space.  Caller passes
+          ``engine_constraint=PricingMethod.MONTE_CARLO``.
+        - Theta on any discretely-monitored barrier: bumping the pricing
+          date forces re-resolution of the monitoring schedule, so the
+          bumped contract is not the same contract — the resulting theta
+          mixes time decay with a contract-respecification artifact.
+          Affects every engine equally; caller passes
+          ``monitoring_constraint=BarrierMonitoring.DISCRETE``.  (Binomial
+          barrier NUMERICAL greeks are already blocked at a finer grain
+          by ``_reject_barrier_binomial_numerical``.)
 
-        Other greeks (delta, vega, rho) are not blocked.
+        Other greeks (delta, vega, rho) and continuous-monitoring theta
+        are not blocked.
         """
         if method is not GreekCalculationMethod.NUMERICAL:
             return
         if not isinstance(self._spec, BarrierSpec):
             return
-        if self._pricing_method is not PricingMethod.MONTE_CARLO:
+        if engine_constraint is not None and self._pricing_method is not engine_constraint:
             return
         if monitoring_constraint is not None and self._spec.monitoring is not monitoring_constraint:
             return
-        reason = self._MC_BARRIER_NUMERICAL_REASON.get(
+        reason = self._BARRIER_NUMERICAL_REASON.get(
             greek,
             "the bump-and-revalue path is unreliable for this combination",
         )
         raise UnsupportedFeatureError(
-            f"Numerical {greek} is not supported for Monte Carlo barrier "
-            f"valuations: {reason}. Use PricingMethod.PDE_FD or "
-            f"PricingMethod.BINOMIAL for accurate barrier {greek}."
+            f"Numerical {greek} is not supported for this barrier "
+            f"valuation: {reason}. Use PricingMethod.PDE_FD (GRID) or "
+            f"PricingMethod.BINOMIAL (TREE) for accurate barrier {greek}."
         )
 
     def _auto_select_greek_method(
