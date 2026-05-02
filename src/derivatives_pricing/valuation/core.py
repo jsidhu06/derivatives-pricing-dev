@@ -611,6 +611,8 @@ class OptionValuation:
                 greek_calc_method=GreekCalculationMethod.NUMERICAL,
             )
 
+        self._reject_barrier_mc_numerical(method, greek="gamma")
+
         if epsilon is None:
             epsilon = self._underlying.initial_value / 100
         if isinstance(self._spec, BarrierSpec):
@@ -724,8 +726,17 @@ class OptionValuation:
         if method is not GreekCalculationMethod.NUMERICAL:
             return float(self._impl.theta())
 
+        self._reject_barrier_mc_numerical(
+            method, greek="theta", monitoring_constraint=BarrierMonitoring.DISCRETE
+        )
+
         if time_bump_days is None:
-            time_bump_days = 1.0
+            # Barriers use a longer default (7d) — see
+            # ``_BARRIER_THETA_TIME_BUMP_DAYS`` for rationale.  All other
+            # specs keep the historical 1d default.
+            time_bump_days = (
+                self._BARRIER_THETA_TIME_BUMP_DAYS if isinstance(self._spec, BarrierSpec) else 1.0
+            )
         bumped_date = self.pricing_date + dt.timedelta(days=time_bump_days)
         if bumped_date >= self.maturity:
             return 0.0
@@ -1355,9 +1366,9 @@ class OptionValuation:
     ) -> None:
         """Block NUMERICAL bump-and-revalue greeks on binomial barrier specs.
 
-        Bumping spot, volatility or time for a barrier option re-invokes
-        ``_resolve_effective_num_steps`` on each bumped valuation, and the
-        Boyle-Lau barrier-alignment formula
+        For continuous barriers, bumping spot, volatility or time for a
+        barrier option re-invokes ``_resolve_effective_num_steps`` on each
+        bumped valuation, and the Boyle-Lau barrier-alignment formula
         ``candidate = i² σ² T / log(H/S)²`` depends on every one of those
         inputs.  The bumped trees therefore end up with *different* step
         counts from the center tree, so a central difference is comparing
@@ -1365,6 +1376,15 @@ class OptionValuation:
         Rho is exempt because the risk-free rate does not enter the
         Boyle-Lau formula, so rate bumps reuse the same tree
         topology and the finite difference is well-defined.
+
+        For discrete barriers, bumping does not amend _effective_num_steps
+        but empirically, the greeks are noisy. We thus conservatively block
+        NUMERICAL greeks on  barrier-binomial specs (except rho which is
+        empirically stable).
+
+        For delta, gamma, theta, users should use native TREE Greeks
+        For rho, bump and revalue is permitted.
+        For vega, users are advised to switch pricing method to PDE_FD.
         """
         if allow:
             return
@@ -1383,6 +1403,64 @@ class OptionValuation:
             "Use GreekCalculationMethod.TREE for delta/gamma/theta, or "
             "switch to PricingMethod.PDE_FD for vega and for NUMERICAL "
             "bump-and-revalue on the full grid."
+        )
+
+    # Greek-specific rationales for the MC barrier NUMERICAL block.  Kept
+    # alongside the helper so the "what's blocked and why" is in one
+    # discoverable place rather than spread across gamma()/theta().
+    _MC_BARRIER_NUMERICAL_REASON: dict[str, str] = {
+        "gamma": (
+            "with practical path counts the central-difference noise "
+            "dominates the |Γ| signal and sign flips occur near zero"
+        ),
+        "theta": (
+            "bump-and-revalue MC theta on discretely-monitored barriers is "
+            "empirically too noisy and inaccurate to be trusted "
+            "(continuous-monitoring MC theta is supported)"
+        ),
+    }
+
+    def _reject_barrier_mc_numerical(
+        self,
+        method: GreekCalculationMethod,
+        *,
+        greek: str,
+        monitoring_constraint: BarrierMonitoring | None = None,
+    ) -> None:
+        """Block NUMERICAL bump-and-revalue greeks on MC barrier specs that
+        are empirically unreliable.
+
+        Two distinct greek failure modes are covered (see
+        ``_MC_BARRIER_NUMERICAL_REASON``):
+
+        - Gamma (any monitoring): second-derivative MC noise scales as
+          ~stderr/ε² and at practical path counts the noise floor exceeds
+          the |Γ| signal across most of parameter space.
+        - Theta under DISCRETE monitoring: bump-and-revalue MC theta on
+          discretely-monitored barriers is empirically too noisy and
+          inaccurate to be trusted.  Continuous-monitoring MC theta is
+          fine and remains supported — callers requesting the
+          discrete-only block pass
+          ``monitoring_constraint=BarrierMonitoring.DISCRETE``.
+
+        Other greeks (delta, vega, rho) are not blocked.
+        """
+        if method is not GreekCalculationMethod.NUMERICAL:
+            return
+        if not isinstance(self._spec, BarrierSpec):
+            return
+        if self._pricing_method is not PricingMethod.MONTE_CARLO:
+            return
+        if monitoring_constraint is not None and self._spec.monitoring is not monitoring_constraint:
+            return
+        reason = self._MC_BARRIER_NUMERICAL_REASON.get(
+            greek,
+            "the bump-and-revalue path is unreliable for this combination",
+        )
+        raise UnsupportedFeatureError(
+            f"Numerical {greek} is not supported for Monte Carlo barrier "
+            f"valuations: {reason}. Use PricingMethod.PDE_FD or "
+            f"PricingMethod.BINOMIAL for accurate barrier {greek}."
         )
 
     def _auto_select_greek_method(
@@ -1440,6 +1518,14 @@ class OptionValuation:
     # so the bumped spot stays inside the alive region. 0.5 keeps the bump
     # at most halfway to the barrier.
     _BARRIER_BUMP_MAX_FRACTION: float = 0.5
+
+    # Default time-bump (calendar days) for numerical barrier theta.
+    # 1d (the global default) is too small for MC (CRN noise dominates the
+    # finite difference) and gives questionable results for FD/binomial too.
+    # 7d performs well empirically: large enough to dampen MC
+    # noise, small enough to skip few barrier monitoring dates and stay close
+    # to instantaneous theta.
+    _BARRIER_THETA_TIME_BUMP_DAYS: float = 7.0
 
     @staticmethod
     def _validate_bump(
