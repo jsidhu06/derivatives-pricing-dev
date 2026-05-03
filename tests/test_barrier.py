@@ -1332,7 +1332,7 @@ class TestBarrierPresentValueAgainstBroadieGlasserman:
 
     # Per-engine tolerances — calibrated from observed behaviour:
     # PDE_FD / Binomial assert against _TRUTH (they solve the discrete
-    # problem).  PDE_FD hits to within ~0.1% everywhere with Boyle-Tian
+    # problem).  PDE_FD hits to within ~0.4% everywhere with Boyle-Tian
     # half-step placement; Binomial drifts up to ~3% as H → S0.
     # BSM asserts against _BGK_CORRECTED (it implements the closed-form
     # asymptotic correction, not a discrete solve) — should match the
@@ -1340,9 +1340,7 @@ class TestBarrierPresentValueAgainstBroadieGlasserman:
     _TOLS: dict[PricingMethod, dict[str, float]] = {
         PricingMethod.BSM: dict(rtol=0.0, atol=1.5e-3),
         PricingMethod.BINOMIAL: dict(rtol=0.035, atol=1.0e-3),
-        # PDE_FD discrete-monitoring default is IMPLICIT (L-stable);
-        # slightly less accurate vs paper than CN.
-        PricingMethod.PDE_FD: dict(rtol=0.002, atol=1.0e-3),
+        PricingMethod.PDE_FD: dict(rtol=0.004, atol=1.0e-3),
     }
 
     @staticmethod

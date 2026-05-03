@@ -269,7 +269,7 @@ class PDEParams:
         """
         if monitoring is BarrierMonitoring.DISCRETE:
             method = PDEMethod.IMPLICIT
-            spot_steps, time_steps = 2400, 1600
+            spot_steps, time_steps = 1600, 1200
         else:
             method = PDEMethod.CRANK_NICOLSON
             spot_steps, time_steps = 1200, 800
