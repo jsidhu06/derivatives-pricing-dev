@@ -2429,6 +2429,325 @@ class TestBinomialBarrierStencilGuard:
 
 
 # ===========================================================================
+# Inception-triggered short-circuits
+# ===========================================================================
+# Three short-circuits added together to handle the case where a barrier is
+# already triggered at the pricing date:
+#   - ``OptionValuation.delta`` (NUMERICAL branch): bump-and-revalue would
+#     cross the trigger boundary on one side and price the un-triggered
+#     contract.  Short-circuit: KO → 0, KI → vanilla equivalent's delta.
+#   - ``OptionValuation.gamma`` (NUMERICAL branch): same shape as delta.
+#   - ``_AnalyticalBarrierValuation.theta`` (BSM): the BSM PDE identity
+#     ``θ = rV − (r−q)Sδ − ½σ²S²Γ`` doesn't apply to a triggered KO (the
+#     contract is no longer PDE-governed — it's a deterministic cashflow).
+#     Short-circuit returns the closed-form θ for each rebate timing, and
+#     delegates to vanilla.theta() for triggered KIs.
+
+
+class TestInceptionTriggeredGreekShortCircuits:
+    """OV-level NUMERICAL delta/gamma and BSM theta short-circuits for
+    barriers that are already triggered at the pricing date.
+
+    Setup: continuous monitoring with ``barrier == spot`` so the barrier
+    is observably triggered at inception (``_barrier_triggered_at_inception``
+    returns True for both DOWN and UP via the ``spot <=`` / ``>=`` predicate
+    plus continuous-monitoring exemption).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        # spot=100 so barrier=100 triggers at inception (DOWN: spot<=barrier).
+        self.ud = _underlying(spot=100.0)
+        self.epsilon = 1.0  # well below the spot-bump cap; explicit so KI
+        # vanilla-equivalent comparison uses the same bump on both sides.
+
+        # Discount factor used by the BSM AT_EXPIRY rebate calculation.
+        self.T = calculate_year_fraction(PRICING_DATE, MATURITY)
+        self.df_r = float(_market_data().discount_curve.df(self.T))
+        self.r = -np.log(self.df_r) / self.T
+
+    # ── OV.delta NUMERICAL short-circuit ─────────────────────────────
+
+    @pytest.mark.parametrize(
+        "rebate,rebate_timing,expected_pv",
+        [
+            (0.0, RebateTiming.AT_HIT, 0.0),  # no rebate
+            (5.0, RebateTiming.AT_HIT, 5.0),  # paid immediately
+            # AT_EXPIRY pv computed in test body (depends on df_r).
+        ],
+        ids=["no_rebate", "at_hit_rebate"],
+    )
+    def test_delta_numerical_ko_triggered_returns_zero(self, rebate, rebate_timing, expected_pv):
+        """KO triggered at inception: NUMERICAL delta short-circuits to 0
+        (cashflow is constant in spot — no sensitivity)."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+            rebate=rebate,
+            rebate_timing=rebate_timing,
+        )
+        ov = OptionValuation(self.ud, spec, PricingMethod.BSM)
+        # PV sanity (proves the spec is genuinely triggered).
+        assert np.isclose(ov.present_value(), expected_pv, rtol=1e-12, atol=1e-12)
+        delta = ov.delta(
+            epsilon=self.epsilon,
+            greek_calc_method=GreekCalculationMethod.NUMERICAL,
+        )
+        assert delta == 0.0
+
+    def test_delta_numerical_ko_triggered_at_expiry_rebate_returns_zero(self):
+        """KO triggered with AT_EXPIRY rebate: PV = R·df_r(T) (constant in
+        spot), so NUMERICAL delta is still 0."""
+        rebate = 5.0
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            rebate=rebate,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+        )
+        ov = OptionValuation(self.ud, spec, PricingMethod.BSM)
+        expected_pv = rebate * self.df_r
+        assert np.isclose(ov.present_value(), expected_pv, rtol=1e-12)
+        delta = ov.delta(
+            epsilon=self.epsilon,
+            greek_calc_method=GreekCalculationMethod.NUMERICAL,
+        )
+        assert delta == 0.0
+
+    @pytest.mark.parametrize(
+        "pricing_method,vanilla_params",
+        [
+            pytest.param(PricingMethod.BSM, None, id="bsm"),
+            pytest.param(
+                PricingMethod.PDE_FD,
+                PDEParams.for_barriers(monitoring=BarrierMonitoring.CONTINUOUS),
+                id="pde_fd",
+            ),
+        ],
+    )
+    def test_delta_numerical_ki_triggered_matches_vanilla_equivalent(
+        self, pricing_method, vanilla_params
+    ):
+        """KI triggered at inception: NUMERICAL delta delegates to the
+        vanilla equivalent, which is bumped without crossing any trigger
+        boundary.  Compared against an *independently-built* vanilla OV
+        constructed with matching params (so both sides use the same
+        grid for PDE_FD) — should match exactly.
+
+        Parametrized over BSM and PDE_FD: the OV-level short-circuit is
+        engine-independent but the vanilla equivalent's bump-and-revalue
+        path differs per engine, so we exercise both.  Binomial is excluded
+        because ``_reject_barrier_binomial_numerical`` raises before the
+        short-circuit branch can be reached; MC is excluded because it
+        requires a ``GBMProcess`` underlying with different fixture setup.
+        """
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+        )
+        ov_ki = OptionValuation(self.ud, spec, pricing_method)
+        # Independently-built vanilla OV.  ``vanilla_params`` matches the
+        # params the dispatcher resolves for the parent KI valuation so
+        # the parent's internal ``_vanilla_equivalent_valuation`` (which
+        # propagates the parent's params to a vanilla spec) uses the same
+        # grid as this freshly-built OV.  Without this, PDE_FD's vanilla
+        # default (200×200 SPOT) would use a coarser grid than the KI's
+        # barrier-tuned (1200×800 LOG_SPOT) propagated grid, producing
+        # different gammas and a spurious test failure.
+        ov_vanilla = OptionValuation(
+            self.ud,
+            VanillaSpec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=STRIKE,
+                maturity=MATURITY,
+            ),
+            pricing_method,
+            params=vanilla_params,
+        )
+        ki_delta = ov_ki.delta(
+            epsilon=self.epsilon,
+            greek_calc_method=GreekCalculationMethod.NUMERICAL,
+        )
+        van_delta = ov_vanilla.delta(
+            epsilon=self.epsilon,
+            greek_calc_method=GreekCalculationMethod.NUMERICAL,
+        )
+        assert ki_delta == van_delta
+
+    # ── OV.gamma NUMERICAL short-circuit ─────────────────────────────
+
+    def test_gamma_numerical_ko_triggered_returns_zero(self):
+        """KO triggered at inception: NUMERICAL gamma short-circuits to 0."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+        )
+        ov = OptionValuation(self.ud, spec, PricingMethod.BSM)
+        gamma = ov.gamma(
+            epsilon=self.epsilon,
+            greek_calc_method=GreekCalculationMethod.NUMERICAL,
+        )
+        assert gamma == 0.0
+
+    def test_gamma_numerical_ko_triggered_with_rebate_returns_zero(self):
+        """KO triggered with rebate (any timing): NUMERICAL gamma is 0 —
+        the rebate cashflow is constant in spot."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+        )
+        ov = OptionValuation(self.ud, spec, PricingMethod.BSM)
+        gamma = ov.gamma(
+            epsilon=self.epsilon,
+            greek_calc_method=GreekCalculationMethod.NUMERICAL,
+        )
+        assert gamma == 0.0
+
+    @pytest.mark.parametrize(
+        "pricing_method,vanilla_params",
+        [
+            pytest.param(PricingMethod.BSM, None, id="bsm"),
+            pytest.param(
+                PricingMethod.PDE_FD,
+                PDEParams.for_barriers(monitoring=BarrierMonitoring.CONTINUOUS),
+                id="pde_fd",
+            ),
+        ],
+    )
+    def test_gamma_numerical_ki_triggered_matches_vanilla_equivalent(
+        self, pricing_method, vanilla_params
+    ):
+        """KI triggered at inception: NUMERICAL gamma delegates to the
+        vanilla equivalent.  Compared against an independently-built
+        vanilla OV with matching params — should match exactly.
+
+        Parametrized over BSM and PDE_FD only: Binomial barrier NUMERICAL
+        is blocked by ``_reject_barrier_binomial_numerical``; MC barrier
+        gamma is blocked by ``_reject_barrier_numerical``.  See the delta
+        counterpart for why ``vanilla_params`` mirrors the parent's
+        dispatcher-resolved params.
+        """
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+        )
+        ov_ki = OptionValuation(self.ud, spec, pricing_method)
+        ov_vanilla = OptionValuation(
+            self.ud,
+            VanillaSpec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=STRIKE,
+                maturity=MATURITY,
+            ),
+            pricing_method,
+            params=vanilla_params,
+        )
+        ki_gamma = ov_ki.gamma(
+            epsilon=self.epsilon,
+            greek_calc_method=GreekCalculationMethod.NUMERICAL,
+        )
+        van_gamma = ov_vanilla.gamma(
+            epsilon=self.epsilon,
+            greek_calc_method=GreekCalculationMethod.NUMERICAL,
+        )
+        assert ki_gamma == van_gamma
+
+    # ── BSM theta short-circuit (barrier_analytical.py) ──────────────
+
+    def test_bsm_theta_ko_triggered_no_rebate_returns_zero(self):
+        """KO triggered, no rebate: PV = 0 → θ = 0."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+        )
+        ov = OptionValuation(self.ud, spec, PricingMethod.BSM)
+        assert ov.theta() == 0.0
+
+    def test_bsm_theta_ko_triggered_at_hit_rebate_returns_zero(self):
+        """KO triggered, AT_HIT rebate: rebate paid at trigger (already
+        received) → PV is constant in time → θ = 0."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_HIT,
+        )
+        ov = OptionValuation(self.ud, spec, PricingMethod.BSM)
+        assert ov.theta() == 0.0
+
+    def test_bsm_theta_ko_triggered_at_expiry_rebate_returns_carry(self):
+        """KO triggered, AT_EXPIRY rebate: PV = R·df_r(T) grows at rate r
+        with passing time → θ = r·PV / 365 (per-day, library convention)."""
+        rebate = 5.0
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            rebate=rebate,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+        )
+        ov = OptionValuation(self.ud, spec, PricingMethod.BSM)
+        pv = rebate * self.df_r
+        expected_theta = self.r * pv / 365.0
+        assert np.isclose(ov.theta(), expected_theta, rtol=1e-12, atol=1e-15)
+
+    def test_bsm_theta_ki_triggered_matches_vanilla(self):
+        """KI triggered at inception: θ delegates to the vanilla equivalent's
+        analytical θ.  Should match a directly-built BSM vanilla OV's θ
+        exactly (same underlying + same vanilla spec ↔ vanilla equivalent)."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+        )
+        ov_ki = OptionValuation(self.ud, spec, PricingMethod.BSM)
+        ov_vanilla = OptionValuation(
+            self.ud,
+            VanillaSpec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=STRIKE,
+                maturity=MATURITY,
+            ),
+            PricingMethod.BSM,
+        )
+        assert ov_ki.theta() == ov_vanilla.theta()
+
+
+# ===========================================================================
 # Binomial barrier coverage
 # ===========================================================================
 
