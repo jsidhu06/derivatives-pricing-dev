@@ -49,32 +49,6 @@ if TYPE_CHECKING:
 # ── Shared helpers ──────────────────────────────────────────────────
 
 
-def _is_triggered(
-    spot: float,
-    barrier: float,
-    direction: BarrierDirection,
-) -> bool:
-    """Return ``True`` if the barrier is triggered.
-
-    Parameters
-    ----------
-    spot
-        Current spot price.
-    barrier
-        Barrier level.
-    direction
-        UP or DOWN.
-
-    Returns
-    -------
-    bool
-        ``True`` if the barrier is triggered.
-    """
-    if direction is BarrierDirection.UP:
-        return spot >= barrier
-    return spot <= barrier
-
-
 _BG_BETA = 0.5826  # Broadie-Glasserman-Kou constant
 
 
@@ -415,6 +389,58 @@ def _barrier_price_no_rebate(
     return B - D if H <= K else A - C
 
 
+def _deterministic_limit_price(
+    S: float,
+    K: float,
+    H: float,
+    r: float,
+    q: float,
+    T: float,
+    df_r: float,
+    option_type: OptionType,
+    direction: BarrierDirection,
+    action: BarrierAction,
+    rebate: float,
+    rebate_timing: RebateTiming,
+) -> float:
+    """Closed-form barrier price in the sigma -> 0 (deterministic-drift) limit.
+
+    Under GBM with sigma = 0 the spot evolves monotonically from ``S`` to the
+    forward ``S_T = S * exp((r - q) * T)`` and continuous barrier monitoring
+    reduces to checking whether the linear path [S, S_T] crosses the barrier.
+    Caller must have already confirmed the barrier is not triggered at
+    inception (``_barrier_triggered_at_inception`` returned False).
+
+    Notes
+    -----
+    Discrete monitoring collapses to continuous monitoring in this limit
+    because the deterministic path is monotone and the Broadie-Glasserman-Kou
+    shift ``H * exp(beta * sigma * sqrt(dt))`` collapses to ``H``.
+    """
+    S_T = S * np.exp((r - q) * T)
+
+    if direction is BarrierDirection.UP:
+        hit = S_T >= H
+    else:
+        hit = S_T <= H
+
+    if option_type is OptionType.CALL:
+        intrinsic_T = max(S_T - K, 0.0)
+    else:
+        intrinsic_T = max(K - S_T, 0.0)
+    vanilla_pv = df_r * intrinsic_T
+
+    if action is BarrierAction.OUT:
+        if hit:
+            if rebate > 0.0:
+                return rebate if rebate_timing is RebateTiming.AT_HIT else df_r * rebate
+            return 0.0
+        return vanilla_pv
+    if hit:
+        return vanilla_pv
+    return df_r * rebate if rebate > 0.0 else 0.0
+
+
 # ── Engine class ──────────────────────────────────────────────────
 
 
@@ -450,15 +476,44 @@ class _AnalyticalBarrierValuation:
         ``V`` is the closed-form barrier price; ``Δ`` and ``Γ`` come from
         central-difference bump-and-revalue around the same closed-form
         evaluator (routed through :attr:`valuation_ctx` so repeated calls
-        hit the OV-level cache).  The identity is exact in the
-        continuation region (triggered-at-inception cases already
-        short-circuit in :meth:`present_value`) and delivers better
-        accuracy than a naive forward-difference time bump.
+        hit the OV-level cache).  The identity holds in the continuation
+        region; for inception-triggered KOs we short-circuit to a
+        closed-form θ because the contract is no longer PDE-governed
+        (it's just paid cash, or a deterministic discounted payment).
+        For inception-triggered KIs we delegate to the vanilla equivalent.
 
         Returned per **calendar day**
         """
         ctx = self.valuation_ctx
         underlying = self.underlying
+
+        # ── Inception-triggered short-circuit ─────────────────────────
+        # KO triggered: the contract has collapsed to a deterministic
+        # cashflow and is no longer PDE-governed.  The identity then gives
+        # the wrong answer — e.g. r·V instead of 0 for an AT_HIT rebate
+        # — so we return the closed-form θ directly.
+        # KI triggered: the contract is the underlying vanilla, which DOES
+        # satisfy the BS PDE; the identity would still hold here (with the
+        # vanilla's δ and γ that OV's NUMERICAL short-circuit already
+        # provides).  We delegate to ``vanilla.theta()`` anyway as a
+        # precision upgrade — it returns the analytical θ rather than the
+        # identity evaluated with bumped greeks.
+        if ctx._barrier_triggered_at_inception():
+            spec = self.spec
+            if spec.action is BarrierAction.IN:
+                return float(ctx._vanilla_equivalent_valuation().theta())
+            # KO triggered.
+            if spec.rebate <= 0.0 or spec.rebate_timing is RebateTiming.AT_HIT:
+                # No rebate or rebate paid immediately → pv has no time
+                # evolution → θ = 0.
+                return 0.0
+            # AT_EXPIRY rebate: pv = R · df_r(T), so dpv/dt = +r · pv;
+            # per-day θ = r · pv / 365.
+            T = ctx._maturity_year_fraction()
+            df_r = float(ctx.discount_curve.df(T))
+            pv = float(spec.rebate) * df_r
+            r = -np.log(df_r) / T
+            return float(r * pv / 365.0)
 
         S = float(underlying.initial_value)
         sigma = float(underlying.volatility)
@@ -515,20 +570,47 @@ class _AnalyticalBarrierValuation:
             H = _broadie_glasserman_adjustment(H, sigma, T, spec.num_observations, spec.direction)
 
         # ── No-rebate barrier value ──
-        value = _barrier_price_no_rebate(
-            S,
-            K,
-            H,
-            r,
-            q,
-            sigma,
-            T,
-            df_r,
-            df_q,
-            spec.option_type,
-            spec.direction,
-            spec.action,
-        )
+        # The Reiner-Rubinstein formulas contain (H/S)**(2*lambda) with
+        # lambda = (r - q + sigma^2/2)/sigma^2, and d1/x1/y/y1 each divide
+        # by sigma*sqrt(T).  As sigma -> 0 we either divide by zero (when
+        # computing lambda or any of the d/x/y terms) or blow up at
+        # (H/S)**(2*lambda).  Most operations promote to numpy.float64 (via
+        # np.log/np.sqrt) so the failure mode is silent inf/nan +
+        # RuntimeWarning -- np.errstate converts those into
+        # FloatingPointError so we can fall back to the closed-form
+        # deterministic-forward price.  OverflowError / ZeroDivisionError
+        # are caught in case any operation stays in Python-float arithmetic.
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            try:
+                value = _barrier_price_no_rebate(
+                    S,
+                    K,
+                    H,
+                    r,
+                    q,
+                    sigma,
+                    T,
+                    df_r,
+                    df_q,
+                    spec.option_type,
+                    spec.direction,
+                    spec.action,
+                )
+            except (OverflowError, FloatingPointError, ZeroDivisionError):
+                return _deterministic_limit_price(
+                    S,
+                    K,
+                    H,
+                    r,
+                    q,
+                    T,
+                    df_r,
+                    spec.option_type,
+                    spec.direction,
+                    spec.action,
+                    spec.rebate,
+                    spec.rebate_timing,
+                )
 
         # ── Add rebate leg ──
         if spec.rebate > 0.0:

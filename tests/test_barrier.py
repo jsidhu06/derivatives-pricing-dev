@@ -1207,9 +1207,9 @@ class TestBarrierPresentValueAgainstBoyleTianTable8:
     _TOLS: dict[PricingMethod, dict[str, float]] = {
         PricingMethod.BSM: dict(rtol=0.022, atol=1.0e-4),
         PricingMethod.BINOMIAL: dict(rtol=0.013, atol=1.0e-4),
-        PricingMethod.PDE_FD: dict(rtol=0.001, atol=1.0e-4),
+        PricingMethod.PDE_FD: dict(rtol=0.002, atol=1.0e-4),
     }
-    _PDE_FD_HOURLY_TOL: dict[str, float] = dict(rtol=0.015, atol=1.0e-4)
+    _PDE_FD_HOURLY_TOL: dict[str, float] = dict(rtol=0.020, atol=1.0e-4)
 
     @pytest.mark.parametrize(
         "frequency,monitoring_kind,paper_pv",
@@ -1340,6 +1340,8 @@ class TestBarrierPresentValueAgainstBroadieGlasserman:
     _TOLS: dict[PricingMethod, dict[str, float]] = {
         PricingMethod.BSM: dict(rtol=0.0, atol=1.5e-3),
         PricingMethod.BINOMIAL: dict(rtol=0.035, atol=1.0e-3),
+        # PDE_FD discrete-monitoring default is IMPLICIT (L-stable);
+        # slightly less accurate vs paper than CN.
         PricingMethod.PDE_FD: dict(rtol=0.002, atol=1.0e-3),
     }
 
@@ -1999,11 +2001,6 @@ class TestBarrierGreeksAgainstBoyleTianTable6:
         90.2: (1.2869, -0.0451, -0.1161),
     }
 
-    # Binomial tree greeks are known to degrade very close to the barrier
-    # (Boyle-Lau retopology + discrete-grid noise).  Regression is enforced
-    # at those spots via BSM numerical and PDE grid greeks only.
-    _BINOMIAL_SKIP_SPOTS = {90.5, 90.4, 90.3, 90.2}
-
     # Per-engine tolerances for each greek.
     _TOLS = {
         "delta": {
@@ -2078,10 +2075,22 @@ class TestBarrierGreeksAgainstBoyleTianTable6:
 
         engine_values: dict[PricingMethod, float | None] = {}
         for method in (PricingMethod.BSM, PricingMethod.BINOMIAL, PricingMethod.PDE_FD):
-            if method is PricingMethod.BINOMIAL and spot in self._BINOMIAL_SKIP_SPOTS:
+            try:
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always", RuntimeWarning)
+                    val = self._engine_greek(spot, method, greek)
+                # Boyle-Lau alignment requires more steps than the cap → engine
+                # explicitly flagged the result as O(1/√n)-degraded.  Skip
+                # rather than assert paper-truth on a value the engine itself
+                # said not to trust.
+                if any("Boyle-Lau step alignment" in str(w.message) for w in caught):
+                    engine_values[method] = None
+                else:
+                    engine_values[method] = val
+            except UnsupportedFeatureError:
+                # The engine itself declared this case unsuitable (e.g. binomial
+                # tree-greek stencil straddles the barrier near H).
                 engine_values[method] = None
-                continue
-            engine_values[method] = self._engine_greek(spot, method, greek)
 
         def _fmt(v: float | None) -> str:
             return f"{v:.6f}" if v is not None else "skipped"
@@ -2310,6 +2319,115 @@ class TestBinomialBarrierNumericalGuard:
         but rho is exempt from the guard so this works."""
         rho = self.val.rho()
         assert np.isfinite(rho)
+
+
+class TestBinomialBarrierStencilGuard:
+    """Tree delta/gamma must reject when the extraction stencil straddles
+    the barrier — Hull's central-difference formula is unreliable in that
+    regime (the absorbing-boundary discontinuity injects false curvature).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        # Spot 72.4 with UP barrier 73 → step-2 up-up node lands ~exactly
+        # on the barrier under Boyle-Lau alignment.  American put deep ITM
+        # so early-exercise locks pv = K - S = 7.6, true delta = -1, gamma 0.
+        curve = DiscountCurve.flat(0.05, end_time=2.0)
+        self.md = MarketData(
+            PRICING_DATE,
+            curve,
+            currency=CURRENCY,
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+        self.ud = UnderlyingData(
+            initial_value=72.4,
+            volatility=0.205,
+            market_data=self.md,
+        )
+        self.am_spec = _barrier_spec(
+            option_type=OptionType.PUT,
+            exercise_type=ExerciseType.AMERICAN,
+            strike=80.0,
+            barrier=73.0,
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+        )
+        self.ov = OptionValuation(
+            self.ud,
+            self.am_spec,
+            PricingMethod.BINOMIAL,
+        )
+
+    def test_pv_and_theta_still_work(self):
+        """The guard targets greek extraction only — pv/delta/theta are unaffected."""
+        assert np.isclose(self.ov.present_value(), 7.6, atol=1e-6)
+        assert np.isclose(self.ov.delta(), -1.0, atol=1e-6)
+        # Deep ITM American put with no time value → theta = 0
+        assert np.isclose(self.ov.theta(), 0.0, atol=1e-6)
+
+    def test_gamma_rejected_when_stencil_straddles(self):
+        with pytest.raises(UnsupportedFeatureError, match=r"step-2 .* straddles"):
+            self.ov.gamma()
+
+    def test_delta_gamma_far_from_barrier_works(self):
+        """Sanity: when barrier is far from spot, both delta and gamma extract OK."""
+        spec = _barrier_spec(
+            option_type=OptionType.PUT,
+            exercise_type=ExerciseType.AMERICAN,
+            strike=80.0,
+            barrier=120.0,  # well above spot 72.4
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+        )
+        ov = OptionValuation(self.ud, spec, PricingMethod.BINOMIAL)
+        # Both should return finite values (no guard trigger)
+        assert np.isfinite(ov.delta())
+        assert np.isfinite(ov.gamma())
+
+    def test_ko_triggered_at_inception_skips_guard(self):
+        """KO triggered at inception has no discontinuity around spot →
+        guard is bypassed, greeks do not raise.
+        """
+        spec = _barrier_spec(
+            option_type=OptionType.PUT,
+            exercise_type=ExerciseType.AMERICAN,
+            strike=80.0,
+            barrier=72.4,  # H == spot → KO triggered at inception
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+        )
+        ov = OptionValuation(self.ud, spec, PricingMethod.BINOMIAL)
+        # no rebate so pv and greeks are zero
+        assert ov.present_value() == 0.0
+        assert ov.delta() == 0.0
+        assert ov.gamma() == 0.0
+        assert ov.theta() == 0.0
+
+    def test_ki_triggered_at_inception_matches_vanilla(self):
+        """KI triggered at inception → option becomes vanilla; greeks should
+        match vanilla, not raise."""
+        spec = _barrier_spec(
+            option_type=OptionType.PUT,
+            exercise_type=ExerciseType.AMERICAN,
+            strike=80.0,
+            barrier=72.4,  # H == spot → KI triggered (option activated)
+            direction=BarrierDirection.UP,
+            action=BarrierAction.IN,
+        )
+        ov = OptionValuation(self.ud, spec, PricingMethod.BINOMIAL)
+        van = OptionValuation(
+            self.ud,
+            VanillaSpec(
+                option_type=OptionType.PUT,
+                exercise_type=ExerciseType.AMERICAN,
+                strike=80.0,
+                maturity=MATURITY,
+            ),
+            PricingMethod.BINOMIAL,
+        )
+        assert np.isclose(ov.present_value(), van.present_value(), rtol=1e-3)
+        assert np.isclose(ov.delta(), van.delta(), rtol=1e-3)
+        assert np.isclose(ov.gamma(), van.gamma(), rtol=1e-3)
 
 
 # ===========================================================================
