@@ -1395,6 +1395,10 @@ class OptionValuation:
             return
         if self._pricing_method is not PricingMethod.BINOMIAL:
             return
+        # Inception-triggered barriers collapse to a deterministic state
+        # (KO → 0/rebate, KI → vanilla).
+        if self._barrier_triggered_at_inception():
+            return
         raise UnsupportedFeatureError(
             "Binomial NUMERICAL bump-and-revalue greeks are not supported "
             "for barrier options (rho is exempt). Bumping spot, volatility "
