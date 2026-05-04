@@ -21,8 +21,13 @@ class MonteCarloParams:
     Attributes
     ----------
     random_seed:
-        Random seed for reproducibility. If None, uses random state.
-        Default: ``None``.
+        Random seed for reproducibility. The default is fixed (not None) so
+        that bump-and-revalue greeks share common random numbers — without CRN,
+        the sampling noise dominates the central-difference signal at typical path
+        counts (especially for gamma and tight bumps).  Pass ``None``
+        explicitly to use fresh entropy each call (e.g. for portfolio-level
+        risk where you want noise to diversify across positions).
+        Default: ``42``.
     deg:
         Laguerre polynomial degree for Longstaff-Schwartz regression
         (American only). Typical range: 2-3. Default: ``3``.
@@ -55,7 +60,7 @@ class MonteCarloParams:
         Default: ``True``. Only applicable to KO barrier options; ignored otherwise.
     """
 
-    random_seed: int | None = None
+    random_seed: int | None = 42
     deg: int = 3
     ridge_lambda: float = 1e-8
     min_itm: int = 25
