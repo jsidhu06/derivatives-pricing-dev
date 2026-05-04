@@ -39,6 +39,7 @@ from ..enums import (
     OptionType,
     ExerciseType,
     PricingMethod,
+    RebateTiming,
     GreekCalculationMethod,
 )
 from .monte_carlo import (
@@ -711,6 +712,7 @@ class OptionValuation:
             and time_bump_days is None
             and self._pricing_method is PricingMethod.BSM
             and isinstance(self._spec, BarrierSpec)
+            and not self._barrier_triggered_at_inception()
         ):
             return float(self._impl.theta())
 
@@ -726,6 +728,33 @@ class OptionValuation:
             return float(self._impl.theta_lr())
         if method is not GreekCalculationMethod.NUMERICAL:
             return float(self._impl.theta())
+
+        if isinstance(self._spec, BarrierSpec) and self._barrier_triggered_at_inception():
+            # Inception-triggered NUMERICAL short-circuit: triggered barriers collapse
+            # to a deterministic instrument (KO → 0/rebate, KI → underlying
+            # vanilla)
+            spec = self._spec
+            if spec.action is BarrierAction.IN:
+                # KI triggered → option IS the underlying vanilla.
+                return float(
+                    self._vanilla_equivalent_valuation().theta(
+                        time_bump_days=time_bump_days,
+                        greek_calc_method=GreekCalculationMethod.NUMERICAL,
+                    )
+                )
+
+            # KO triggered:
+            if spec.rebate <= 0.0 or spec.rebate_timing is RebateTiming.AT_HIT:
+                # No rebate or rebate paid at the trigger → cashflow is
+                # constant in time from this point → θ = 0.
+                return 0.0
+            # AT_EXPIRY rebate: pv = R · df_r(T), so dpv/dt = +r · pv;
+            # per-day θ = r · pv / 365.
+            T = self._maturity_year_fraction()
+            df_r = float(self.discount_curve.df(T))
+            pv = float(spec.rebate) * df_r
+            r = -np.log(df_r) / T
+            return float(r * pv / 365.0)
 
         self._reject_barrier_numerical(
             method, greek="theta", monitoring_constraint=BarrierMonitoring.DISCRETE
