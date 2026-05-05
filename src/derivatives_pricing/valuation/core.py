@@ -389,9 +389,6 @@ class OptionValuation:
         # Overwritten below with the defensive copy for PathSimulation.
         self._underlying = underlying
 
-        # Defensive copy: PathSimulation carries mutable simulation state
-        # (time_grid, _last_normals) that is written during simulate().
-        # Copying for thread-safety
         if isinstance(underlying, PathSimulation):
             sim_config = underlying._sim_config
 
@@ -423,7 +420,9 @@ class OptionValuation:
                             sim_config,
                             observation_dates=underlying.observation_dates | extra,
                         )
-
+            # Defensive copy: PathSimulation carries mutable simulation state
+            # (time_grid, _last_normals) that is written during simulate().
+            # Copying for thread-safety
             self._underlying = type(underlying)(
                 market_data=underlying.market_data,
                 process_params=underlying._process_params,
@@ -532,12 +531,15 @@ class OptionValuation:
             return float(self._impl.delta())
 
         if isinstance(self._spec, BarrierSpec) and self._barrier_triggered_at_inception():
-            # Bump-and-revalue may cross the trigger boundary and price the
-            # un-triggered contract on the bumped spot — meaningless for an
-            # already-triggered barrier.  Short-circuit:
-            #   - KO triggered → constant-in-spot cashflow → δ = 0.
-            #   - KI triggered → contract IS the underlying vanilla; bump on
-            #     the vanilla equivalent (no state transition).
+            # Inception-triggered short-circuit (NUMERICAL only):
+            # bump-and-revalue would cross the trigger boundary and price
+            # the un-triggered contract on the bumped spot, which is
+            # meaningless for an already-triggered barrier.  Engines handle
+            # TREE/GRID triggered greeks natively, so this branch is only
+            # reached for NUMERICAL.
+            #   • KO triggered → cashflow constant in spot → δ = 0.
+            #   • KI triggered → contract IS the vanilla equivalent; bump
+            #     there (no state transition).
             if self._spec.action is BarrierAction.OUT:
                 return 0.0
             return self._vanilla_equivalent_valuation().delta(
@@ -604,7 +606,10 @@ class OptionValuation:
             return float(self._impl.gamma())
 
         if isinstance(self._spec, BarrierSpec) and self._barrier_triggered_at_inception():
-            # See the corresponding short-circuit in :meth:`delta`.
+            # Inception-triggered short-circuit (NUMERICAL only):
+            #   • KO triggered → cashflow constant in spot → γ = 0.
+            #   • KI triggered → contract IS the vanilla equivalent.
+            # Engines handle TREE/GRID triggered greeks natively.
             if self._spec.action is BarrierAction.OUT:
                 return 0.0
             return self._vanilla_equivalent_valuation().gamma(
@@ -662,6 +667,23 @@ class OptionValuation:
             return float(self._impl.vega_lr())
         if method is not GreekCalculationMethod.NUMERICAL:
             return float(self._impl.vega())
+
+        if isinstance(self._spec, BarrierSpec) and self._barrier_triggered_at_inception():
+            # Inception-triggered short-circuit (NUMERICAL only):
+            #   • KO triggered → cashflow (0 / R / R·df_r) is vol-insensitive
+            #     → ν = 0.
+            #   • KI triggered → contract IS the vanilla equivalent.
+            # The engine path is also correct here (bumping vol doesn't change
+            # the triggered cashflow), but the short-circuit avoids re-pricing
+            # and matches the delta/gamma/theta pattern.
+            if self._spec.action is BarrierAction.OUT:
+                return 0.0
+            return float(
+                self._vanilla_equivalent_valuation().vega(
+                    epsilon=epsilon,
+                    greek_calc_method=GreekCalculationMethod.NUMERICAL,
+                )
+            )
 
         if epsilon is None:
             epsilon = 0.01
@@ -730,26 +752,27 @@ class OptionValuation:
             return float(self._impl.theta())
 
         if isinstance(self._spec, BarrierSpec) and self._barrier_triggered_at_inception():
-            # Inception-triggered NUMERICAL short-circuit: triggered barriers collapse
-            # to a deterministic instrument (KO → 0/rebate, KI → underlying
-            # vanilla)
+            # Inception-triggered short-circuit (NUMERICAL only):
+            #   • KO triggered, no rebate or AT_HIT → cashflow constant in
+            #     time → θ = 0.
+            #   • KO triggered, AT_EXPIRY rebate → pv = R · df_r(T) carries
+            #     at rate r → per-day θ = r · pv / 365 (closed-form).
+            #   • KI triggered → contract IS the vanilla equivalent.
+            # Engines handle TREE/GRID triggered greeks natively.
             spec = self._spec
             if spec.action is BarrierAction.IN:
-                # KI triggered → option IS the underlying vanilla.
+                # Pass NUMERICAL + time_bump_days through (mirroring delta/gamma):
+                # the user explicitly requested bump-and-revalue, so honor that
+                # on the vanilla equivalent.
                 return float(
                     self._vanilla_equivalent_valuation().theta(
                         time_bump_days=time_bump_days,
                         greek_calc_method=GreekCalculationMethod.NUMERICAL,
                     )
                 )
-
             # KO triggered:
             if spec.rebate <= 0.0 or spec.rebate_timing is RebateTiming.AT_HIT:
-                # No rebate or rebate paid at the trigger → cashflow is
-                # constant in time from this point → θ = 0.
                 return 0.0
-            # AT_EXPIRY rebate: pv = R · df_r(T), so dpv/dt = +r · pv;
-            # per-day θ = r · pv / 365.
             T = self._maturity_year_fraction()
             df_r = float(self.discount_curve.df(T))
             pv = float(spec.rebate) * df_r
@@ -825,6 +848,33 @@ class OptionValuation:
             return float(self._impl.rho_lr())
         if method is not GreekCalculationMethod.NUMERICAL:
             return float(self._impl.rho())
+
+        if isinstance(self._spec, BarrierSpec) and self._barrier_triggered_at_inception():
+            # Inception-triggered short-circuit (NUMERICAL only):
+            #   • KO triggered, no rebate or AT_HIT → constant cash → ρ = 0.
+            #   • KO triggered, AT_EXPIRY rebate → pv = R · df_r(T) is rate-
+            #     sensitive only via discounting; central-diff via the disc
+            #     curve (closed-form, mirrors theta).
+            #   • KI triggered → contract IS the vanilla equivalent.
+            # The engine path is also correct here (bumping rate doesn't
+            # change barrier state), but the short-circuit avoids re-pricing.
+            spec = self._spec
+            if spec.action is BarrierAction.IN:
+                return float(
+                    self._vanilla_equivalent_valuation().rho(
+                        rate_bump=rate_bump,
+                        greek_calc_method=GreekCalculationMethod.NUMERICAL,
+                    )
+                )
+            # KO triggered:
+            if spec.rebate <= 0.0 or spec.rebate_timing is RebateTiming.AT_HIT:
+                return 0.0
+            if rate_bump is None:
+                rate_bump = 0.01
+            T = self._maturity_year_fraction()
+            df_up = float(self.discount_curve.bump_parallel_zero_rate(rate_bump / 2).df(T))
+            df_dn = float(self.discount_curve.bump_parallel_zero_rate(-rate_bump / 2).df(T))
+            return float(spec.rebate) * (df_up - df_dn) / rate_bump * 0.01
 
         if rate_bump is None:
             rate_bump = 0.01
