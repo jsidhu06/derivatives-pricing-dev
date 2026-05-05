@@ -202,8 +202,8 @@ class TestPDEParams:
 
     def test_for_barriers_discrete_defaults_to_implicit(self):
         p = PDEParams.for_barriers(monitoring=BarrierMonitoring.DISCRETE)
-        assert p.spot_steps == 2400
-        assert p.time_steps == 1600
+        assert p.spot_steps == 1600
+        assert p.time_steps == 1200
         assert p.space_grid is PDESpaceGrid.LOG_SPOT
         # Discrete monitoring → IMPLICIT (L-stable)
         assert p.method is PDEMethod.IMPLICIT

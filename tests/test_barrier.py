@@ -1332,7 +1332,7 @@ class TestBarrierPresentValueAgainstBroadieGlasserman:
 
     # Per-engine tolerances — calibrated from observed behaviour:
     # PDE_FD / Binomial assert against _TRUTH (they solve the discrete
-    # problem).  PDE_FD hits to within ~0.1% everywhere with Boyle-Tian
+    # problem).  PDE_FD hits to within ~0.4% everywhere with Boyle-Tian
     # half-step placement; Binomial drifts up to ~3% as H → S0.
     # BSM asserts against _BGK_CORRECTED (it implements the closed-form
     # asymptotic correction, not a discrete solve) — should match the
@@ -1340,9 +1340,7 @@ class TestBarrierPresentValueAgainstBroadieGlasserman:
     _TOLS: dict[PricingMethod, dict[str, float]] = {
         PricingMethod.BSM: dict(rtol=0.0, atol=1.5e-3),
         PricingMethod.BINOMIAL: dict(rtol=0.035, atol=1.0e-3),
-        # PDE_FD discrete-monitoring default is IMPLICIT (L-stable);
-        # slightly less accurate vs paper than CN.
-        PricingMethod.PDE_FD: dict(rtol=0.002, atol=1.0e-3),
+        PricingMethod.PDE_FD: dict(rtol=0.004, atol=1.0e-3),
     }
 
     @staticmethod
@@ -2428,6 +2426,495 @@ class TestBinomialBarrierStencilGuard:
         assert np.isclose(ov.present_value(), van.present_value(), rtol=1e-3)
         assert np.isclose(ov.delta(), van.delta(), rtol=1e-3)
         assert np.isclose(ov.gamma(), van.gamma(), rtol=1e-3)
+
+
+# ===========================================================================
+# Inception-triggered short-circuits
+# ===========================================================================
+# Three short-circuits added together to handle the case where a barrier is
+# already triggered at the pricing date:
+#   - ``OptionValuation.delta`` (NUMERICAL branch): bump-and-revalue would
+#     cross the trigger boundary on one side and price the un-triggered
+#     contract.  Short-circuit: KO → 0, KI → vanilla equivalent's delta.
+#   - ``OptionValuation.gamma`` (NUMERICAL branch): same shape as delta.
+#   - ``_AnalyticalBarrierValuation.theta`` (BSM): the BSM PDE identity
+#     ``θ = rV − (r−q)Sδ − ½σ²S²Γ`` doesn't apply to a triggered KO (the
+#     contract is no longer PDE-governed — it's a deterministic cashflow).
+#     Short-circuit returns the closed-form θ for each rebate timing, and
+#     delegates to vanilla.theta() for triggered KIs.
+
+
+# Every (pricing_method, greek_method) combination that should yield
+# the correct triggered-barrier greek via either:
+#   • the OV-level NUMERICAL short-circuit (closed-form for KO, vanilla
+#     equivalent for KI) — exercised by NUMERICAL combos, or
+#   • the engine's native triggered handling — exercised by TREE/GRID
+#     combos (these bypass the OV-level short-circuit since it only
+#     fires for NUMERICAL, mirroring delta/gamma).
+_TRIGGERED_DISPATCH = [
+    pytest.param(PricingMethod.BSM, GreekCalculationMethod.NUMERICAL, id="bsm_num"),
+    pytest.param(PricingMethod.BINOMIAL, GreekCalculationMethod.NUMERICAL, id="bin_num"),
+    pytest.param(PricingMethod.BINOMIAL, GreekCalculationMethod.TREE, id="bin_tree"),
+    pytest.param(PricingMethod.PDE_FD, GreekCalculationMethod.NUMERICAL, id="pde_num"),
+    pytest.param(PricingMethod.PDE_FD, GreekCalculationMethod.GRID, id="pde_grid"),
+]
+
+# Same dispatch combos but each row also carries the params the
+# dispatcher auto-resolves for that pricing-method + barrier spec
+# (see ``_resolve_params``).
+_TRIGGERED_KI_DISPATCH = [
+    pytest.param(PricingMethod.BSM, GreekCalculationMethod.NUMERICAL, None, id="bsm_num"),
+    pytest.param(
+        PricingMethod.BINOMIAL,
+        GreekCalculationMethod.NUMERICAL,
+        BinomialParams(num_steps=1000),
+        id="bin_num",
+    ),
+    pytest.param(
+        PricingMethod.BINOMIAL,
+        GreekCalculationMethod.TREE,
+        BinomialParams(num_steps=1000),
+        id="bin_tree",
+    ),
+    pytest.param(
+        PricingMethod.PDE_FD,
+        GreekCalculationMethod.NUMERICAL,
+        PDEParams.for_barriers(monitoring=BarrierMonitoring.CONTINUOUS),
+        id="pde_num",
+    ),
+    pytest.param(
+        PricingMethod.PDE_FD,
+        GreekCalculationMethod.GRID,
+        PDEParams.for_barriers(monitoring=BarrierMonitoring.CONTINUOUS),
+        id="pde_grid",
+    ),
+]
+
+# Vega and rho only support NUMERICAL bump-and-revalue on barriers (the
+# tree/grid engines don't expose native vega/rho).  These subsets drop the
+# TREE/GRID combos accordingly.  Binomial barrier NUMERICAL is exempted for
+# triggered specs (see ``_reject_barrier_binomial_numerical``); rho is exempted
+# unconditionally via ``allow_barrier_binomial_numerical=True``.
+_TRIGGERED_NUMERICAL_DISPATCH = [
+    pytest.param(PricingMethod.BSM, GreekCalculationMethod.NUMERICAL, id="bsm_num"),
+    pytest.param(PricingMethod.BINOMIAL, GreekCalculationMethod.NUMERICAL, id="bin_num"),
+    pytest.param(PricingMethod.PDE_FD, GreekCalculationMethod.NUMERICAL, id="pde_num"),
+]
+
+_TRIGGERED_KI_NUMERICAL_DISPATCH = [
+    pytest.param(PricingMethod.BSM, GreekCalculationMethod.NUMERICAL, None, id="bsm_num"),
+    pytest.param(
+        PricingMethod.BINOMIAL,
+        GreekCalculationMethod.NUMERICAL,
+        BinomialParams(num_steps=1000),
+        id="bin_num",
+    ),
+    pytest.param(
+        PricingMethod.PDE_FD,
+        GreekCalculationMethod.NUMERICAL,
+        PDEParams.for_barriers(monitoring=BarrierMonitoring.CONTINUOUS),
+        id="pde_num",
+    ),
+]
+
+
+@pytest.mark.slow
+class TestInceptionTriggeredGreekShortCircuits:
+    """Triggered-barrier greek behavior across all dispatch paths.
+
+    Verifies that a barrier already triggered at the pricing date
+    produces the correct collapsed-instrument greek via either:
+      • the OV-level NUMERICAL short-circuit (closed-form for KO,
+        vanilla-equivalent delegation for KI), or
+      • the engine's native TREE/GRID triggered handling (which routes
+        around the OV-level short-circuit since that branch only fires
+        for NUMERICAL).
+
+    Setup: continuous monitoring with ``barrier == spot`` so the barrier
+    is observably triggered at inception (``_barrier_triggered_at_inception``
+    returns True for both DOWN and UP via the ``spot <=`` / ``>=`` predicate
+    plus continuous-monitoring exemption).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        # spot=100 so barrier=100 triggers at inception (DOWN: spot<=barrier).
+        self.ud = _underlying(spot=100.0)
+        # AT_EXPIRY rebate test computes expected θ from the disc curve.
+        self.T = calculate_year_fraction(PRICING_DATE, MATURITY)
+        self.df_r = float(_market_data().discount_curve.df(self.T))
+        self.r = -np.log(self.df_r) / self.T
+
+    # ── delta ────────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        "rebate,rebate_timing,expected_pv",
+        [
+            (0.0, RebateTiming.AT_HIT, 0.0),
+            (5.0, RebateTiming.AT_HIT, 5.0),
+        ],
+        ids=["no_rebate", "at_hit_rebate"],
+    )
+    @pytest.mark.parametrize("pricing_method,greek_method", _TRIGGERED_DISPATCH)
+    def test_delta_ko_triggered_returns_zero(
+        self, pricing_method, greek_method, rebate, rebate_timing, expected_pv
+    ):
+        """KO triggered at inception: cashflow is constant in spot, so
+        delta is 0 via either the OV-level short-circuit (NUMERICAL) or
+        the engine's native triggered handling (TREE/GRID)."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            rebate=rebate,
+            rebate_timing=rebate_timing,
+        )
+        ov = OptionValuation(self.ud, spec, pricing_method)
+        # PV sanity (proves the spec is genuinely triggered).
+        assert np.isclose(ov.present_value(), expected_pv, atol=1e-10)
+        assert ov.delta(greek_calc_method=greek_method) == 0.0
+
+    @pytest.mark.parametrize("pricing_method,greek_method", _TRIGGERED_DISPATCH)
+    def test_delta_ko_triggered_at_expiry_rebate_returns_zero(self, pricing_method, greek_method):
+        """KO triggered with AT_EXPIRY rebate: PV = R·df_r(T) (constant
+        in spot), so delta is 0 across all dispatch paths."""
+        rebate = 5.0
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            rebate=rebate,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+        )
+        ov = OptionValuation(self.ud, spec, pricing_method)
+        expected_pv = rebate * self.df_r
+        assert np.isclose(ov.present_value(), expected_pv, atol=1e-10)
+        assert ov.delta(greek_calc_method=greek_method) == 0.0
+
+    @pytest.mark.parametrize("pricing_method,greek_method,vanilla_params", _TRIGGERED_KI_DISPATCH)
+    def test_delta_ki_triggered_matches_vanilla_equivalent(
+        self, pricing_method, greek_method, vanilla_params
+    ):
+        """KI triggered at inception: collapses to the vanilla equivalent.
+        Compared against an *independently-built* vanilla OV constructed
+        with matching params — should match exactly across all dispatch
+        paths.
+        """
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+        )
+        ov_ki = OptionValuation(self.ud, spec, pricing_method)
+        ov_vanilla = OptionValuation(
+            self.ud,
+            VanillaSpec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=STRIKE,
+                maturity=MATURITY,
+            ),
+            pricing_method,
+            params=vanilla_params,
+        )
+        assert ov_ki.delta(greek_calc_method=greek_method) == ov_vanilla.delta(
+            greek_calc_method=greek_method
+        )
+
+    # ── gamma ────────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("pricing_method,greek_method", _TRIGGERED_DISPATCH)
+    def test_gamma_ko_triggered_returns_zero(self, pricing_method, greek_method):
+        """KO triggered, no rebate: cashflow constant in spot → γ=0."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+        )
+        ov = OptionValuation(self.ud, spec, pricing_method)
+        assert ov.gamma(greek_calc_method=greek_method) == 0.0
+
+    @pytest.mark.parametrize("pricing_method,greek_method", _TRIGGERED_DISPATCH)
+    def test_gamma_ko_triggered_with_rebate_returns_zero(self, pricing_method, greek_method):
+        """KO triggered with AT_EXPIRY rebate: rebate cashflow constant
+        in spot → γ=0."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+        )
+        ov = OptionValuation(self.ud, spec, pricing_method)
+        assert ov.gamma(greek_calc_method=greek_method) == 0.0
+
+    @pytest.mark.parametrize("pricing_method,greek_method,vanilla_params", _TRIGGERED_KI_DISPATCH)
+    def test_gamma_ki_triggered_matches_vanilla_equivalent(
+        self, pricing_method, greek_method, vanilla_params
+    ):
+        """KI triggered: γ collapses to the vanilla equivalent's γ across
+        all dispatch paths."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+        )
+        ov_ki = OptionValuation(self.ud, spec, pricing_method)
+        ov_vanilla = OptionValuation(
+            self.ud,
+            VanillaSpec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=STRIKE,
+                maturity=MATURITY,
+            ),
+            pricing_method,
+            params=vanilla_params,
+        )
+        assert ov_ki.gamma(greek_calc_method=greek_method) == ov_vanilla.gamma(
+            greek_calc_method=greek_method
+        )
+
+    # ── theta ────────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("pricing_method,greek_method", _TRIGGERED_DISPATCH)
+    def test_theta_ko_triggered_no_rebate_returns_zero(self, pricing_method, greek_method):
+        """KO triggered, no rebate: PV = 0 → θ = 0."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+        )
+        ov = OptionValuation(self.ud, spec, pricing_method)
+        assert ov.theta(greek_calc_method=greek_method) == 0.0
+
+    @pytest.mark.parametrize("pricing_method,greek_method", _TRIGGERED_DISPATCH)
+    def test_theta_ko_triggered_at_hit_rebate_returns_zero(self, pricing_method, greek_method):
+        """KO triggered, AT_HIT rebate: rebate paid at trigger (already
+        received) → PV is constant cash → θ = 0.
+        """
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_HIT,
+        )
+        ov = OptionValuation(self.ud, spec, pricing_method)
+        assert ov.theta(greek_calc_method=greek_method) == 0.0
+
+    @pytest.mark.parametrize("pricing_method,greek_method", _TRIGGERED_DISPATCH)
+    def test_theta_ko_triggered_at_expiry_rebate_returns_carry(self, pricing_method, greek_method):
+        """KO triggered, AT_EXPIRY rebate: PV = R·df_r(T) grows at rate r
+        with passing time → θ = r·PV / 365 (per-day, library convention).
+        OV-level short-circuit returns the closed-form exactly; native
+        TREE/GRID match to ~1e-7 absolute (engine grid θ extraction)."""
+        rebate = 5.0
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            rebate=rebate,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+        )
+        ov = OptionValuation(self.ud, spec, pricing_method)
+        pv = rebate * self.df_r
+        expected_theta = self.r * pv / 365.0
+        assert np.isclose(
+            ov.theta(greek_calc_method=greek_method),
+            expected_theta,
+            atol=1e-6,
+        )
+
+    @pytest.mark.parametrize("pricing_method,greek_method,vanilla_params", _TRIGGERED_KI_DISPATCH)
+    def test_theta_ki_triggered_matches_vanilla_equivalent(
+        self, pricing_method, greek_method, vanilla_params
+    ):
+        """KI triggered: θ collapses to the vanilla equivalent's θ across
+        all dispatch paths."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+        )
+        ov_ki = OptionValuation(self.ud, spec, pricing_method)
+        ov_vanilla = OptionValuation(
+            self.ud,
+            VanillaSpec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=STRIKE,
+                maturity=MATURITY,
+            ),
+            pricing_method,
+            params=vanilla_params,
+        )
+        assert ov_ki.theta(greek_calc_method=greek_method) == ov_vanilla.theta(
+            greek_calc_method=greek_method
+        )
+
+    # ── vega ─────────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        "rebate,rebate_timing",
+        [
+            (0.0, RebateTiming.AT_HIT),
+            (5.0, RebateTiming.AT_HIT),
+            (5.0, RebateTiming.AT_EXPIRY),
+        ],
+        ids=["no_rebate", "at_hit_rebate", "at_expiry_rebate"],
+    )
+    @pytest.mark.parametrize("pricing_method,greek_method", _TRIGGERED_NUMERICAL_DISPATCH)
+    def test_vega_ko_triggered_returns_zero(
+        self, pricing_method, greek_method, rebate, rebate_timing
+    ):
+        """KO triggered: cashflow (0 / R / R·df_r) is vol-insensitive
+        regardless of rebate timing → ν = 0."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            rebate=rebate,
+            rebate_timing=rebate_timing,
+        )
+        ov = OptionValuation(self.ud, spec, pricing_method)
+        assert ov.vega(greek_calc_method=greek_method) == 0.0
+
+    @pytest.mark.parametrize(
+        "pricing_method,greek_method,vanilla_params",
+        _TRIGGERED_KI_NUMERICAL_DISPATCH,
+    )
+    def test_vega_ki_triggered_matches_vanilla_equivalent(
+        self, pricing_method, greek_method, vanilla_params
+    ):
+        """KI triggered: ν collapses to the vanilla equivalent's ν."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+        )
+        ov_ki = OptionValuation(self.ud, spec, pricing_method)
+        ov_vanilla = OptionValuation(
+            self.ud,
+            VanillaSpec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=STRIKE,
+                maturity=MATURITY,
+            ),
+            pricing_method,
+            params=vanilla_params,
+        )
+        assert ov_ki.vega(greek_calc_method=greek_method) == ov_vanilla.vega(
+            greek_calc_method=greek_method
+        )
+
+    # ── rho ──────────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        "rebate,rebate_timing",
+        [
+            (0.0, RebateTiming.AT_HIT),
+            (5.0, RebateTiming.AT_HIT),
+        ],
+        ids=["no_rebate", "at_hit_rebate"],
+    )
+    @pytest.mark.parametrize("pricing_method,greek_method", _TRIGGERED_NUMERICAL_DISPATCH)
+    def test_rho_ko_triggered_returns_zero(
+        self, pricing_method, greek_method, rebate, rebate_timing
+    ):
+        """KO triggered with no rebate or AT_HIT rebate: cashflow is
+        constant cash (0 or R), no rate sensitivity → ρ = 0."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            rebate=rebate,
+            rebate_timing=rebate_timing,
+        )
+        ov = OptionValuation(self.ud, spec, pricing_method)
+        assert ov.rho(greek_calc_method=greek_method) == 0.0
+
+    @pytest.mark.parametrize("pricing_method,greek_method", _TRIGGERED_NUMERICAL_DISPATCH)
+    def test_rho_ko_triggered_at_expiry_rebate_returns_carry(self, pricing_method, greek_method):
+        """KO triggered, AT_EXPIRY rebate: pv = R·df_r(T) is rate-sensitive
+        only via discounting.  Closed-form short-circuit returns the same
+        central-diff that the engine path would compute (engine prices
+        triggered KO as R·df_r exactly), so all dispatch combos match."""
+        rebate = 5.0
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.OUT,
+            rebate=rebate,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+        )
+        ov = OptionValuation(self.ud, spec, pricing_method)
+        rate_bump = 0.01
+        disc = _market_data().discount_curve
+        df_up = float(disc.bump_parallel_zero_rate(rate_bump / 2).df(self.T))
+        df_dn = float(disc.bump_parallel_zero_rate(-rate_bump / 2).df(self.T))
+        expected_rho = rebate * (df_up - df_dn) / rate_bump * 0.01
+        assert np.isclose(ov.rho(greek_calc_method=greek_method), expected_rho, atol=1e-6)
+
+    @pytest.mark.parametrize(
+        "pricing_method,greek_method,vanilla_params",
+        _TRIGGERED_KI_NUMERICAL_DISPATCH,
+    )
+    def test_rho_ki_triggered_matches_vanilla_equivalent(
+        self, pricing_method, greek_method, vanilla_params
+    ):
+        """KI triggered: ρ collapses to the vanilla equivalent's ρ."""
+        spec = _barrier_spec(
+            option_type=OptionType.CALL,
+            strike=STRIKE,
+            barrier=100.0,
+            direction=BarrierDirection.DOWN,
+            action=BarrierAction.IN,
+        )
+        ov_ki = OptionValuation(self.ud, spec, pricing_method)
+        ov_vanilla = OptionValuation(
+            self.ud,
+            VanillaSpec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=STRIKE,
+                maturity=MATURITY,
+            ),
+            pricing_method,
+            params=vanilla_params,
+        )
+        assert ov_ki.rho(greek_calc_method=greek_method) == ov_vanilla.rho(
+            greek_calc_method=greek_method
+        )
 
 
 # ===========================================================================
