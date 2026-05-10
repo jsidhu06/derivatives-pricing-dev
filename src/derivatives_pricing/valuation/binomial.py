@@ -990,7 +990,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         optimum_steps = base_steps
         for i in range(1, base_steps):
             candidate = int((i * i * sigma * sigma * ttm) / divisor)
-            if base_steps < candidate:
+            if candidate >= base_steps:
                 if candidate > max_steps:
                     # Boyle-Lau alignment requires a tree with `candidate` time
                     # steps to place a layer of CRR nodes exactly on the barrier
