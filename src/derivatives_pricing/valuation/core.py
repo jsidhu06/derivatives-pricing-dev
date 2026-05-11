@@ -1139,7 +1139,7 @@ class OptionValuation:
             "the dispatcher should route BarrierSpecs to barrier engines only."
         )
         spot = float(self._underlying.initial_value)
-        if not self._spec.is_triggered(spot):
+        if not self._spec.is_spot_past_barrier(spot):
             return False
         if self._spec.monitoring is BarrierMonitoring.CONTINUOUS:
             return True
