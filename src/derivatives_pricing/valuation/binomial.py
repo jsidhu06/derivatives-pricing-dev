@@ -1,7 +1,14 @@
 """Binomial-tree valuation engines (Cox-Ross-Rubinstein).
 
-Implements European and American vanilla option pricing, plus Asian-option
-extensions used by the core dispatcher.
+Implements European and American pricing for:
+
+- vanilla call/put
+- Asian options (Hull-style tree averages or MC sampling on the tree)
+- barrier options (continuous and discrete monitoring, KO and KI, with
+  Boyle-Lau on-node alignment for continuous and a half-step CRR-layer
+  analog for discrete)
+
+Plugged into the registry dispatcher in ``core.py``.
 """
 
 from __future__ import annotations

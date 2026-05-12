@@ -7,6 +7,10 @@ Current scope
 -------------
 PDE via finite differences for European and American options:
 - vanilla call/put and custom payoffs (PayoffSpec)
+- barrier options (BarrierSpec): continuous KO via truncated-grid
+  Dirichlet BC, continuous KI via in-out parity (European) and
+  coupled PDE solver (American), discrete monitoring
+  via full-grid resets at observation dates
 - time stepping: implicit, explicit, or Crank–Nicolson
 - optional Rannacher smoothing for Crank–Nicolson
 - spatial grids: spot or log-spot

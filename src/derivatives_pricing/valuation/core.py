@@ -2,7 +2,7 @@
 
 This module is the central orchestration layer for pricing:
 
-- Spec dataclasses (`VanillaSpec`, `PayoffSpec`, `AsianSpec`)
+- Spec dataclasses (`VanillaSpec`, `PayoffSpec`, `AsianSpec`, `BarrierSpec`)
 - Underlying data container (`UnderlyingData`)
 - Registry-based dispatcher (`OptionValuation`) that maps
     `(PricingMethod, ExerciseType)` to a private implementation engine
