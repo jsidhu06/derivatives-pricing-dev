@@ -1041,12 +1041,15 @@ class OptionValuation:
                 return MonteCarloParams()
             if pricing_method is PricingMethod.BINOMIAL:
                 if isinstance(spec, BarrierSpec):
-                    # Continuous barriers get Boyle-Lau step inflation automatically,
-                    # so 1000 base steps typically suffice.  Discrete barriers have
-                    # no equivalent auto-adjustment (the tree is built exactly at
-                    # the user-specified num_steps), so we default higher to
-                    # accommodate the harder tree/monitoring-date alignment.
-                    num_steps = 1000 if spec.monitoring is BarrierMonitoring.CONTINUOUS else 5000
+                    # Continuous barriers get Boyle-Lau on-node step inflation
+                    # (place a CRR layer ON H); discrete barriers get half-step
+                    # inflation (place H midway between two CRR layers — the
+                    # binomial-tree analog of Cheuk-Vorst 1996 / Boyle-Tian 1998
+                    # for the FD/trinomial setting).  Discrete defaults to 3000
+                    # base steps because CRR's intrinsic O(1/N) finite-step error
+                    # remains visible on small-price reverse-barrier cases (UOC
+                    # tighter, DOP tighter, UIP wider).
+                    num_steps = 1000 if spec.monitoring is BarrierMonitoring.CONTINUOUS else 3000
                     return BinomialParams(num_steps=num_steps)
                 return BinomialParams()
             if pricing_method is PricingMethod.PDE_FD:
@@ -1136,7 +1139,7 @@ class OptionValuation:
             "the dispatcher should route BarrierSpecs to barrier engines only."
         )
         spot = float(self._underlying.initial_value)
-        if not self._spec.is_triggered(spot):
+        if not self._spec.is_spot_past_barrier(spot):
             return False
         if self._spec.monitoring is BarrierMonitoring.CONTINUOUS:
             return True

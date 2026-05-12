@@ -951,9 +951,6 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
 
     def _resolve_effective_num_steps(self) -> int:
         base_steps = int(self.binom_params.num_steps)
-        if self.spec.monitoring is not BarrierMonitoring.CONTINUOUS:
-            return base_steps
-
         spot = float(self.underlying.initial_value)
         barrier = float(self.spec.barrier)
         sigma = float(self.underlying.volatility)
@@ -970,8 +967,7 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         #   - KI: the option becomes vanilla immediately and is priced via
         #     `_solve_backward` (not the barrier-aware solver), so barrier
         #     alignment is irrelevant.
-        # Skip both the inflation and any warning for those cases.
-        if self.spec.is_triggered(spot):
+        if self.valuation_ctx._barrier_triggered_at_inception():
             return base_steps
 
         log_distance = np.log(max(spot, barrier) / min(spot, barrier))
@@ -986,11 +982,20 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         if divisor <= 0.0:
             return base_steps
 
+        # Continuous monitoring: place a CRR layer exactly ON H (Boyle-Lau 1994).
+        # Discrete monitoring: place H midway between two CRR layers — the
+        # binomial probability mass spans half a layer on each side of each
+        # layer's nominal position, so on-H placement biases the effective
+        # kill threshold by -Δ/2.  Half-step placement (analog of Cheuk-Vorst 1996 /
+        # Boyle-Tian 1998 / in the FD setting) gives an unbiased
+        # discrete kill probability.
+        shift = 0.0 if self.spec.monitoring is BarrierMonitoring.CONTINUOUS else 0.5
         max_steps = max(1000, base_steps * 5)
         optimum_steps = base_steps
-        for i in range(1, base_steps):
-            candidate = int((i * i * sigma * sigma * ttm) / divisor)
-            if base_steps < candidate:
+        for i in range(1, base_steps + 1):
+            factor = i - shift  # continuous: 1, 2, 3, ...; discrete: 0.5, 1.5, 2.5, ...
+            candidate = int((factor * factor * sigma * sigma * ttm) / divisor)
+            if candidate >= base_steps:
                 if candidate > max_steps:
                     # Boyle-Lau alignment requires a tree with `candidate` time
                     # steps to place a layer of CRR nodes exactly on the barrier
