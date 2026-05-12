@@ -15,11 +15,8 @@ PDE via finite differences for European and American options:
 Discrete barriers
 -----------------
 Uses Boyle-Tian-inspired half-step barrier placement for discrete
-monitoring.  This tends to improve accuracy when the monitoring interval
-is not too fine relative to the PDE grid time-step.  If monitoring is
-extremely dense relative to the PDE grid, the correction can over-shift;
-in that regime the contract is close to continuously monitored and
-``BarrierMonitoring.CONTINUOUS`` is usually the better model choice.
+monitoring: H is centred halfway between adjacent spatial nodes to
+reduce the leading grid-alignment bias in the barrier reset.
 """
 
 from __future__ import annotations
