@@ -41,7 +41,6 @@ knock-in and knock-out structures, and rebates.
 - **Stochastic processes** — Geometric Brownian Motion, Jump Diffusion (Merton), Square-Root Diffusion (CIR)
 - **Discount curves** — log-linear interpolation on arbitrary term structures; deterministic time-varying forward rate and dividend curves
 - **Discrete dividends** — supported across all pricing methods
-- **Barrier options** — continuous and discrete monitoring, knock-in/knock-out, rebates (at-hit and at-expiry)
 - **Control variates** — European analytical control variates for American pricing variance reduction
 - **Custom payoffs** — user-defined payoff functions via `PayoffSpec`
 
