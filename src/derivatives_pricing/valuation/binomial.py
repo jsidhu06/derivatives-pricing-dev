@@ -958,37 +958,26 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
         if spot <= 0.0 or barrier <= 0.0 or sigma <= 0.0 or ttm <= 0.0:
             return base_steps
 
-        # If the option is already triggered at inception, `present_value()`
-        # will short-circuit through `_inception_short_circuit_value` without
-        # running the barrier tree. Neither Boyle-Lau inflation nor the
-        # cap-bind warning is meaningful in that case:
-        #   - KO: the option is dead at t=0 and PV is a closed-form rebate
-        #     discount; the barrier-aware solver never runs.
-        #   - KI: the option becomes vanilla immediately and is priced via
-        #     `_solve_backward` (not the barrier-aware solver), so barrier
-        #     alignment is irrelevant.
+        # Inception-triggered specs short-circuit upstream in
+        # `_inception_short_circuit_value`; the barrier solver never runs,
+        # alignment is moot.
         if self.valuation_ctx._barrier_triggered_at_inception():
             return base_steps
 
         log_distance = np.log(max(spot, barrier) / min(spot, barrier))
         divisor = log_distance * log_distance
-        # Only bail if log_distance is exactly zero (barrier coincides with
-        # spot — a triggered-at-inception case handled upstream by
-        # `_inception_short_circuit_value`). We must NOT use `np.isclose` here
-        # with its default atol=1e-8 because that would silently disable the
-        # Boyle-Lau step adjustment for all near-spot barriers (any barrier
-        # closer to spot than ~1e-4 in log-space would fall inside the
-        # tolerance), exactly the regime where BL alignment matters most.
+        # Strict `<= 0` (not `np.isclose`): default atol=1e-8 would
+        # silently disable alignment for any barrier within ~1e-4 of spot
+        # in log-space — the regime where alignment matters most.
         if divisor <= 0.0:
             return base_steps
 
-        # Continuous monitoring: place a CRR layer exactly ON H (Boyle-Lau 1994).
-        # Discrete monitoring: place H midway between two CRR layers — the
-        # binomial probability mass spans half a layer on each side of each
-        # layer's nominal position, so on-H placement biases the effective
-        # kill threshold by -Δ/2.  Half-step placement (analog of Cheuk-Vorst 1996 /
-        # Boyle-Tian 1998 / in the FD setting) gives an unbiased
-        # discrete kill probability.
+        # Continuous: place a CRR layer on H (Boyle-Lau 1994, factor = i).
+        # Discrete:   place H midway between two CRR layers (factor = i - 0.5).
+        # Under discrete monitoring, placing H exactly on a CRR layer introduces
+        # a first-order grid-placement bias in the effective kill threshold;
+        # half-step placement is the binomial analog of Cheuk-Vorst 1996 /
+        # Boyle-Tian 1998.
         shift = 0.0 if self.spec.monitoring is BarrierMonitoring.CONTINUOUS else 0.5
         max_steps = max(1000, base_steps * 5)
         optimum_steps = base_steps
@@ -997,14 +986,9 @@ class _BinomialBarrierValuation(_BinomialValuationBase):
             candidate = int((factor * factor * sigma * sigma * ttm) / divisor)
             if candidate >= base_steps:
                 if candidate > max_steps:
-                    # Boyle-Lau alignment requires a tree with `candidate` time
-                    # steps to place a layer of CRR nodes exactly on the barrier
-                    # (typically because the barrier sits very close to spot).
-                    # The `max_steps` cap prevents runaway memory, so the final
-                    # tree will run at `max_steps` without barrier alignment and
-                    # will converge extremely slowly (classic Boyle-Lau bias,
-                    # O(1/√n) with a large constant). Warn the user so they
-                    # know to switch engines.
+                    # Alignment unattainable within memory budget — warn
+                    # and fall back to unaligned at `max_steps` (the warning
+                    # message itself spells out the implications).
                     log_distance_pct = 100.0 * log_distance / max(np.log(spot), 1.0e-12)
                     warnings.warn(
                         (

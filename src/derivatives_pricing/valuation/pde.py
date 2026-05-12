@@ -386,30 +386,25 @@ def _build_log_grid(
     anchor_spot: float | None = None,
     anchor_half_step: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """Build log-spot grid.
+    """Build a log-spot grid.
 
-    For the explicit-family schemes (``EXPLICIT``, ``EXPLICIT_HULL``) the
-    grid construction preserves Hull's heuristic scale
-    ``dz_hull = vol * sqrt(3 * dt)`` when the target log-domain fits within
-    ``spot_steps * dz_hull``. For ``EXPLICIT_HULL`` this is the special
-    spacing that recovers the trinomial-equivalent explicit discretization
-    with up/mid/down probabilities ``1/6, 2/3, 1/6``.
+    ``dz`` selection by scheme:
 
-    For unconditionally stable schemes (``IMPLICIT``, ``CRANK_NICOLSON``)
-    ``spot_steps`` controls the spatial density directly:
-    ``dz = (zmax_target - zmin_target) / spot_steps``.
+    - **Explicit family** (``EXPLICIT``, ``EXPLICIT_HULL``): targets Hull's
+      stability scale ``dz_hull = vol * sqrt(3 * dt)`` — the trinomial-
+      equivalent spacing with up/mid/down probabilities ``1/6, 2/3, 1/6``.
+      Falls back to ``(zmax_target - zmin_target) / spot_steps`` if Hull's
+      grid is too narrow to cover the target span.
+    - **Unconditionally stable** (``IMPLICIT``, ``CRANK_NICOLSON``):
+      ``dz = (zmax_target - zmin_target) / spot_steps`` directly.
 
-    When ``anchor_spot`` is provided, the grid is sized so that the anchor
-    lies exactly on an interior node by default. If ``anchor_half_step`` is
-    true, the anchor instead lies halfway between two adjacent nodes. In both
-    cases the resulting domain is a (possibly slight) superset of
-    ``[zmin_target, zmax_target]``. For CN/IMPLICIT this is achieved by
-    recomputing ``dz`` from the binding half (left or right of the anchor),
-    i.e. the side that requires the larger uniform ``dz`` to keep the anchor
-    on-node or at a cell midpoint while still covering the target domain. The
-    other side can then have up to roughly one cell of slack. For explicit
-    schemes ``dz`` is fixed by Hull's stability heuristic, so the grid is
-    shifted in place while keeping strict cover of the target domain.
+    When ``anchor_spot`` is provided, the grid is sized so the anchor sits
+    exactly on an interior node (or halfway between two nodes when
+    ``anchor_half_step=True``).  The resulting domain is a (possibly slight)
+    superset of ``[zmin_target, zmax_target]``.  CN/IMPLICIT grows ``dz`` on
+    the binding half (the side of the anchor that needs the larger ``dz``
+    to cover its target half); explicit schemes keep ``dz`` fixed by
+    stability and shift the grid in place instead.
     """
     if anchor_half_step and anchor_spot is None:
         raise ValidationError("anchor_half_step requires anchor_spot to be provided")
@@ -460,13 +455,12 @@ def _build_log_grid(
     anchor_offset = 0.5 if anchor_half_step else 0.0
 
     if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
-        # Explicit schemes use Hull's dz_hull heuristic, which leaves
-        # ``grid_width = spot_steps * dz`` strictly larger than the
-        # target span (when not capped). dz is fixed by stability, so
-        # we shift the grid in place while keeping strict cover of
-        # ``[zmin_target, zmax_target]``. If the target span is already
-        # capped exactly by ``spot_steps * dz``, exact anchoring is only
-        # possible when the anchor happens to lie on that fixed grid.
+        # Explicit: ``dz`` is fixed by Hull's stability heuristic, so
+        # shift the grid in place while preserving cover of
+        # ``[zmin_target, zmax_target]``.  If the target span is binding
+        # (already tight to ``spot_steps * dz``), exact anchoring is only
+        # feasible when the anchor lies on the fixed-dz grid — or, when
+        # ``anchor_half_step=True``, halfway between two fixed-dz nodes.
         j_min = max(
             0,
             int(math.ceil((z_anchor - zmin_target) / dz - anchor_offset - 1.0e-12)),
@@ -480,21 +474,18 @@ def _build_log_grid(
         preferred_index = int(round((z_anchor - zmin) / dz - anchor_offset))
         j_anchor = min(max(preferred_index, j_min), j_max)
     else:
-        # CN/IMPLICIT: dz is free, so instead of shifting a fixed-dz
-        # grid (which forces an unsatisfiable strict-cover constraint
-        # when dz exactly tiles the target span), we *grow* dz on the
-        # binding half. Pick the integer node closest to where the
-        # anchor naturally falls, then compute the dz required to cover
-        # the left and right halves separately; whichever side requires
-        # the larger dz is the binding side, and the other side absorbs
-        # the slack. The result is a uniform grid that:
+        # CN/IMPLICIT: ``dz`` is free, so *grow* it on the binding half
+        # rather than shift a fixed-dz grid (which has an unsatisfiable
+        # strict-cover constraint when ``dz`` exactly tiles the target).
+        # Pick the integer node closest to where the anchor falls, then
+        # take the larger of the left/right ``dz`` needed to cover each
+        # half.  The resulting grid:
         #   - places the anchor exactly on an interior node,
         #   - is strictly tight to the target on the binding side,
         #   - has up to one cell of slack outside the target on the
-        #     other side (i.e. a slight superset of the target — never
-        #     under-covers),
-        #   - costs at most ~1/(spot_steps - 1) extra dz vs the bare-
-        #     minimum tile of the target span.
+        #     other side (slight superset — never under-covers),
+        #   - costs at most ~1/(spot_steps - 1) extra ``dz`` vs the
+        #     bare-minimum tile of the target span.
         span = zmax_target - zmin_target
         j_opt = int(round(spot_steps * (z_anchor - zmin_target) / span - anchor_offset))
         j_anchor = max(0 if anchor_half_step else 1, min(spot_steps - 1, j_opt))
@@ -1849,14 +1840,11 @@ def _fd_barrier_ko_core(
     else:
         payoff = np.maximum(S - strike, 0.0)
 
-    # American exercise intrinsic is the holder's exercise value at any
-    # in-life moment, which is the vanilla payoff — independent of any
-    # KO-zone modification applied to the maturity payoff below.  Under
-    # discrete monitoring the holder can exercise between observations
-    # even when sitting in the KO zone, so the PSOR floor must use the
-    # unmodified vanilla intrinsic.  (For continuous KO the grid is
-    # truncated at the barrier and the KO zone is absent from the grid,
-    # so the same vanilla array is also correct on the alive side.)
+    # American intrinsic = vanilla payoff at any in-life moment, regardless of
+    # KO-zone modifications applied at maturity below.  Discrete monitoring
+    # needs this: between obs dates the holder can exercise even sitting in
+    # the KO zone.  (For continuous KO the grid is truncated at the barrier,
+    # so the alive-side array is the only one that exists — same logic holds.)
     intrinsic = payoff.copy() if early_exercise else None
 
     # For continuous KO: payoff is zero on the barrier side (enforced
