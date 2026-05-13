@@ -830,6 +830,8 @@ class TestBarrierRebate:
         )
         assert pv_at_hit > pv_base
         assert pv_at_expiry > pv_base
+        assert pv_at_hit >= pv_at_expiry
+        # AT_HIT rebate should be worth at least as much as AT_EXPIRY rebate (under positive rates)
 
 
 # ===========================================================================
@@ -3691,4 +3693,126 @@ class TestBarrierMCNonBarrierAwareBasis:
         assert pv_naive > 0
         assert np.isclose(pv_naive, pv_aware, rtol=0.05), (
             f"barrier_aware_basis=False ({pv_naive:.4f}) vs True ({pv_aware:.4f})"
+        )
+
+
+class TestBarrierMCAmericanRegressionVsPDE:
+    """Pinned regression checks: American MC barrier PVs vs PDE_FD on the
+    **well-behaved** (non-reverse) cases where MC LSM is expected to
+    track PDE within sampling noise.  Spreads coverage across:
+
+    - continuous monitoring (DOC, UIC)
+    - discrete monitoring via ``num_observations`` (UOP, M=50)
+    - discrete monitoring via explicit ``monitoring_dates`` (DIP, weekly)
+
+    Reverse-barrier American cases (DOP, UOC) have documented LSM
+    downward bias (warning emitted at ``__init__``) and are covered
+    separately in notebooks/scripts at higher path counts.  All four
+    cases here use a fixed seed and a loose ~3% tolerance so they catch
+    real engine regressions without flagging benign seed-noise drift.
+    """
+
+    # 52 weekly observation dates spanning the 1-year contract, used by
+    # the DIP regression below to exercise the explicit-monitoring-dates
+    # code path (separate from the ``num_observations`` code path).
+    _WEEKLY_OBS_DATES = tuple(PRICING_DATE + dt.timedelta(days=7 * (i + 1)) for i in range(52))
+
+    @pytest.mark.parametrize(
+        "option_type,direction,action,barrier,monitoring,num_observations,monitoring_dates,label",
+        [
+            pytest.param(
+                OptionType.CALL,
+                BarrierDirection.DOWN,
+                BarrierAction.OUT,
+                85.0,
+                BarrierMonitoring.CONTINUOUS,
+                None,
+                None,
+                "DOC continuous",
+                id="DOC_American_continuous",
+            ),
+            pytest.param(
+                OptionType.CALL,
+                BarrierDirection.UP,
+                BarrierAction.IN,
+                115.0,
+                BarrierMonitoring.CONTINUOUS,
+                None,
+                None,
+                "UIC continuous",
+                id="UIC_American_continuous",
+            ),
+            pytest.param(
+                OptionType.PUT,
+                BarrierDirection.UP,
+                BarrierAction.OUT,
+                115.0,
+                BarrierMonitoring.DISCRETE,
+                50,
+                None,
+                "UOP discrete M=50",
+                id="UOP_American_discrete_M50",
+            ),
+            pytest.param(
+                OptionType.PUT,
+                BarrierDirection.DOWN,
+                BarrierAction.IN,
+                85.0,
+                BarrierMonitoring.DISCRETE,
+                None,
+                _WEEKLY_OBS_DATES,
+                "DIP discrete weekly",
+                id="DIP_American_discrete_weekly",
+            ),
+        ],
+    )
+    def test_american_mc_tracks_pde_on_regular_cases(
+        self,
+        option_type,
+        direction,
+        action,
+        barrier,
+        monitoring,
+        num_observations,
+        monitoring_dates,
+        label,
+    ):
+        spec = _barrier_spec(
+            option_type=option_type,
+            exercise_type=ExerciseType.AMERICAN,
+            direction=direction,
+            action=action,
+            barrier=barrier,
+            monitoring=monitoring,
+            num_observations=num_observations,
+            monitoring_dates=monitoring_dates,
+        )
+        ud = _underlying()
+        pv_pde = float(OptionValuation(ud, spec, PricingMethod.PDE_FD).present_value())
+
+        gbm = _mc_gbm()
+        pv_mc = float(
+            OptionValuation(
+                gbm,
+                spec,
+                PricingMethod.MONTE_CARLO,
+                params=MonteCarloParams(random_seed=42),
+            ).present_value()
+        )
+
+        logger.info(
+            "%s American: PDE=%.6f MC=%.6f diff=%+.6f (%.2f%%)",
+            label,
+            pv_pde,
+            pv_mc,
+            pv_mc - pv_pde,
+            (pv_mc - pv_pde) / pv_pde * 100,
+        )
+
+        # MC LSM is unbiased on these regular cases; gap should be ~1%
+        # sampling noise at 50k paths / 200 grid steps / seed=42.  3% rtol
+        # absorbs seed wobble without masking a real bias regression.
+        assert np.isclose(pv_mc, pv_pde, rtol=0.03, atol=1.0e-4), (
+            f"{label} American MC PV {pv_mc:.6f} drifted from PDE_FD {pv_pde:.6f} "
+            f"by more than 3% — possible LSM regression."
         )

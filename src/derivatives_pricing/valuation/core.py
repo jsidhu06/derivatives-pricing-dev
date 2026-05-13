@@ -2,7 +2,7 @@
 
 This module is the central orchestration layer for pricing:
 
-- Spec dataclasses (`VanillaSpec`, `PayoffSpec`, `AsianSpec`)
+- Spec dataclasses (`VanillaSpec`, `PayoffSpec`, `AsianSpec`, `BarrierSpec`)
 - Underlying data container (`UnderlyingData`)
 - Registry-based dispatcher (`OptionValuation`) that maps
     `(PricingMethod, ExerciseType)` to a private implementation engine
@@ -531,15 +531,10 @@ class OptionValuation:
             return float(self._impl.delta())
 
         if isinstance(self._spec, BarrierSpec) and self._barrier_triggered_at_inception():
-            # Inception-triggered short-circuit (NUMERICAL only):
-            # bump-and-revalue would cross the trigger boundary and price
-            # the un-triggered contract on the bumped spot, which is
-            # meaningless for an already-triggered barrier.  Engines handle
-            # TREE/GRID triggered greeks natively, so this branch is only
-            # reached for NUMERICAL.
-            #   • KO triggered → cashflow constant in spot → δ = 0.
-            #   • KI triggered → contract IS the vanilla equivalent; bump
-            #     there (no state transition).
+            # Inception-triggered NUMERICAL short-circuit: bumping spot
+            # would cross the trigger boundary and price the un-triggered
+            # contract.  KO → constant cashflow → δ = 0;  KI → delegate
+            # to the vanilla equivalent.
             if self._spec.action is BarrierAction.OUT:
                 return 0.0
             return self._vanilla_equivalent_valuation().delta(
@@ -1041,14 +1036,11 @@ class OptionValuation:
                 return MonteCarloParams()
             if pricing_method is PricingMethod.BINOMIAL:
                 if isinstance(spec, BarrierSpec):
-                    # Continuous barriers get Boyle-Lau on-node step inflation
-                    # (place a CRR layer ON H); discrete barriers get half-step
-                    # inflation (place H midway between two CRR layers — the
-                    # binomial-tree analog of Cheuk-Vorst 1996 / Boyle-Tian 1998
-                    # for the FD/trinomial setting).  Discrete defaults to 3000
-                    # base steps because CRR's intrinsic O(1/N) finite-step error
-                    # remains visible on small-price reverse-barrier cases (UOC
-                    # tighter, DOP tighter, UIP wider).
+                    # Continuous: on-node alignment (Boyle-Lau 1994).  Discrete:
+                    # half-step alignment (binomial analog of Cheuk-Vorst 1996 /
+                    # Boyle-Tian 1998).  Discrete defaults to 3000 base steps to
+                    # keep CRR's O(1/N) finite-step error tight on small-price
+                    # reverse-barrier cases.
                     num_steps = 1000 if spec.monitoring is BarrierMonitoring.CONTINUOUS else 3000
                     return BinomialParams(num_steps=num_steps)
                 return BinomialParams()
@@ -1449,25 +1441,20 @@ class OptionValuation:
     ) -> None:
         """Block NUMERICAL bump-and-revalue greeks on binomial barrier specs.
 
-        For continuous barriers, bumping spot, volatility or time for a
-        barrier option re-invokes ``_resolve_effective_num_steps`` on each
-        bumped valuation, and the Boyle-Lau barrier-alignment formula
-        ``candidate = i² σ² T / log(H/S)²`` depends on every one of those
-        inputs.  The bumped trees therefore end up with *different* step
-        counts from the center tree, so a central difference is comparing
-        two unrelated tree topologies rather than approximating ``∂V/∂x``.
-        Rho is exempt because the risk-free rate does not enter the
-        Boyle-Lau formula, so rate bumps reuse the same tree
-        topology and the finite difference is well-defined.
+        Both continuous (Boyle-Lau 1994 on-node) and discrete (half-step
+        Cheuk-Vorst / Boyle-Tian analog) alignment pick the tree step
+        count from ``candidate ≈ factor² σ² T / log(H/S)²``, which depends
+        on spot, volatility, and time-to-maturity.  Bumping any of those
+        re-resolves alignment, so a central difference compares trees of
+        *different topology* rather than approximating ``∂V/∂x``.
 
-        For discrete barriers, bumping does not amend _effective_num_steps
-        but empirically, the greeks are noisy. We thus conservatively block
-        NUMERICAL greeks on  barrier-binomial specs (except rho which is
-        empirically stable).
+        Rho is exempt — the risk-free rate doesn't enter the alignment
+        formula, so rate bumps reuse the same tree topology and the
+        finite difference is well-defined.
 
-        For delta, gamma, theta, users should use native TREE Greeks
-        For rho, bump and revalue is permitted.
-        For vega, users are advised to switch pricing method to PDE_FD.
+        Guidance: use ``GreekCalculationMethod.TREE`` for Δ/Γ/Θ; switch
+        to ``PricingMethod.PDE_FD`` for vega (and for any NUMERICAL
+        bump-and-revalue, where the grid topology is bump-invariant).
         """
         if allow:
             return
@@ -1516,28 +1503,23 @@ class OptionValuation:
         engine_constraint: PricingMethod | None = None,
         monitoring_constraint: BarrierMonitoring | None = None,
     ) -> None:
-        """Block NUMERICAL bump-and-revalue greeks on barrier specs that
-        are empirically or structurally unreliable.
+        """Block NUMERICAL bump-and-revalue on barrier greek/engine
+        combinations known to be unreliable.
 
-        Two distinct greek failure modes are currently covered (see
-        ``_BARRIER_NUMERICAL_REASON``):
+        Currently:
 
-        - Gamma on Monte Carlo barriers (any monitoring): second-derivative
-          MC noise scales as ~stderr/ε² and at practical path counts the
-          noise floor exceeds the |Γ| signal across most of parameter
-          space.  Caller passes
+        - **Γ on MC barriers** (any monitoring): second-derivative MC
+          noise scales ~ stderr/ε²; at practical path counts the noise
+          floor exceeds the |Γ| signal.  Pass
           ``engine_constraint=PricingMethod.MONTE_CARLO``.
-        - Theta on any discretely-monitored barrier: bumping the pricing
-          date forces re-resolution of the monitoring schedule, so the
-          bumped contract is not the same contract — the resulting theta
-          mixes time decay with a contract-respecification artifact.
-          Affects every engine equally; caller passes
-          ``monitoring_constraint=BarrierMonitoring.DISCRETE``.  (Binomial
-          barrier NUMERICAL greeks are already blocked at a finer grain
-          by ``_reject_barrier_binomial_numerical``.)
+        - **Θ on discretely-monitored barriers** (any engine): bumping
+          the pricing date forces re-resolution of the monitoring
+          schedule, so the bumped contract is a different contract.
+          Pass ``monitoring_constraint=BarrierMonitoring.DISCRETE``.
+          (Binomial barrier NUMERICAL greeks are blocked at a finer
+          grain in ``_reject_barrier_binomial_numerical``.)
 
-        Other greeks (delta, vega, rho) and continuous-monitoring theta
-        are not blocked.
+        Per-greek reasons are kept in ``_BARRIER_NUMERICAL_REASON``.
         """
         if method is not GreekCalculationMethod.NUMERICAL:
             return
@@ -1630,25 +1612,19 @@ class OptionValuation:
     ) -> None:
         """Validate a numerical-greek bump argument against the resolved method.
 
-        Two checks are bundled here so every greek entry point can run a
-        single line:
+        Two checks, bundled so every greek entry point is one line:
 
-        1. The bump must be strictly positive when supplied. Negative
-           bumps are almost certainly user mistakes — central differences
-           are sign-symmetric so a negative spot/vol/rate bump silently
-           gives the same magnitude with confusing semantics, while a
-           negative ``time_bump_days`` flips the forward-difference theta.
-        2. The bump must be compatible with the *resolved* greek method.
-           Passing ``epsilon=...`` together with a method that doesn't use
-           a finite-difference bump (ANALYTICAL / GRID / TREE / PATHWISE
-           where applicable / LR) is a contradiction — the bump would be
-           silently ignored, letting users believe they are controlling
-           it when they aren't.  We therefore require callers to resolve
-           the method first (via ``_resolve_greek_method``) and pass the
-           resolved method here; that way the same rule applies whether
-           the user supplied an explicit method or relied on auto-select.
-           ``extra_allowed_methods`` lets e.g. gamma also accept PATHWISE
-           (which uses a finite-difference epsilon under the hood).
+        1. **Sign**: bump must be strictly positive — negative bumps are
+           silent footguns (sign-symmetric central diff for spot/vol/rate
+           gives the same magnitude; negative ``time_bump_days`` flips
+           the forward-difference theta).
+        2. **Method compatibility**: passing a bump with a non-bumping
+           method (ANALYTICAL / GRID / TREE / LR / PATHWISE where it
+           doesn't use ε) is a contradiction — the bump would be
+           silently ignored.  Callers must pre-resolve via
+           ``_resolve_greek_method`` so this check is invariant to
+           explicit-method vs auto-select.  ``extra_allowed_methods``
+           lets e.g. gamma also accept PATHWISE (which uses ε internally).
         """
         if bump_value is None:
             return

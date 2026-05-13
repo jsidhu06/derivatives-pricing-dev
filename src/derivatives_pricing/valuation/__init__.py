@@ -1,8 +1,9 @@
 """Option valuation and pricing engines.
 
-This module provides a unified interface for pricing vanilla and custom options
-using various methods: Monte Carlo simulation, Binomial trees, Black-Scholes-Merton
-analytical formulas, and PDE finite difference methods.
+This module provides a unified interface for pricing vanilla, custom-payoff,
+Asian, and barrier options using various methods: Monte Carlo simulation,
+Binomial trees, Black-Scholes-Merton analytical formulas, and PDE finite
+difference methods.
 
 Public API
 ----------
@@ -10,6 +11,8 @@ Core classes:
     OptionValuation: Main dispatcher for option pricing
     VanillaSpec: Contract specification for vanilla options
     PayoffSpec: Contract specification for custom payoffs
+    AsianSpec: Contract specification for Asian options
+    BarrierSpec: Contract specification for barrier options
     UnderlyingData: Minimal underlying data container
 
 Parameter classes:
