@@ -531,15 +531,10 @@ class OptionValuation:
             return float(self._impl.delta())
 
         if isinstance(self._spec, BarrierSpec) and self._barrier_triggered_at_inception():
-            # Inception-triggered short-circuit (NUMERICAL only):
-            # bump-and-revalue would cross the trigger boundary and price
-            # the un-triggered contract on the bumped spot, which is
-            # meaningless for an already-triggered barrier.  Engines handle
-            # TREE/GRID triggered greeks natively, so this branch is only
-            # reached for NUMERICAL.
-            #   • KO triggered → cashflow constant in spot → δ = 0.
-            #   • KI triggered → contract IS the vanilla equivalent; bump
-            #     there (no state transition).
+            # Inception-triggered NUMERICAL short-circuit: bumping spot
+            # would cross the trigger boundary and price the un-triggered
+            # contract.  KO → constant cashflow → δ = 0;  KI → delegate
+            # to the vanilla equivalent.
             if self._spec.action is BarrierAction.OUT:
                 return 0.0
             return self._vanilla_equivalent_valuation().delta(
@@ -1041,13 +1036,11 @@ class OptionValuation:
                 return MonteCarloParams()
             if pricing_method is PricingMethod.BINOMIAL:
                 if isinstance(spec, BarrierSpec):
-                    # Continuous barriers get Boyle-Lau on-node step inflation
-                    # (place a CRR layer ON H); discrete barriers get half-step
-                    # inflation (place H midway between two CRR layers — the
-                    # binomial-tree analog of Cheuk-Vorst 1996 / Boyle-Tian 1998
-                    # for the FD/trinomial setting).  Discrete defaults to 3000
-                    # base steps because CRR's intrinsic O(1/N) finite-step error
-                    # remains visible on small-price reverse-barrier cases.
+                    # Continuous: on-node alignment (Boyle-Lau 1994).  Discrete:
+                    # half-step alignment (binomial analog of Cheuk-Vorst 1996 /
+                    # Boyle-Tian 1998).  Discrete defaults to 3000 base steps to
+                    # keep CRR's O(1/N) finite-step error tight on small-price
+                    # reverse-barrier cases.
                     num_steps = 1000 if spec.monitoring is BarrierMonitoring.CONTINUOUS else 3000
                     return BinomialParams(num_steps=num_steps)
                 return BinomialParams()

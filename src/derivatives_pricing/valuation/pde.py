@@ -9,7 +9,7 @@ PDE via finite differences for European and American options:
 - vanilla call/put and custom payoffs (PayoffSpec)
 - barrier options (BarrierSpec): continuous KO via truncated-grid
   Dirichlet BC, continuous KI via in-out parity (European) and
-  coupled PDE solver (American), discrete monitoring
+  two-surface coupled PDE solver (American), discrete monitoring
   via full-grid resets at observation dates
 - time stepping: implicit, explicit, or Crank–Nicolson
 - optional Rannacher smoothing for Crank–Nicolson
@@ -1629,7 +1629,7 @@ class _FDAmericanValuation(_FDValuationBase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Barrier option PDE
+# Barrier option FD
 # ═══════════════════════════════════════════════════════════════════════════
 
 
