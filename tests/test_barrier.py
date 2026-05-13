@@ -830,6 +830,8 @@ class TestBarrierRebate:
         )
         assert pv_at_hit > pv_base
         assert pv_at_expiry > pv_base
+        assert pv_at_hit >= pv_at_expiry
+        # AT_HIT rebate should be worth at least as much as AT_EXPIRY rebate (under positive rates)
 
 
 # ===========================================================================
