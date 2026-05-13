@@ -92,7 +92,7 @@ import derivatives_pricing as dp
 pricing_date = dt.datetime(2025, 1, 1)
 maturity = dt.datetime(2025, 7, 1)
 
-dc = dp.DiscountCurve.flat(rate=0.05, end_time=1.0)
+dc = dp.DiscountCurve.flat(rate=0.05)
 md = dp.MarketData(
     pricing_date=pricing_date,
     discount_curve=dc,
@@ -162,10 +162,6 @@ tests/                        # Test suite
 examples/                     # API usage notebooks
 tutorials/                    # Theory deep-dive notebooks
 ```
-
-## Roadmap
-
-Planned: stochastic volatility models.
 
 Found a bug or have a feature request? [Open an issue](https://github.com/jsidhu06/derivatives-pricing/issues).
 
