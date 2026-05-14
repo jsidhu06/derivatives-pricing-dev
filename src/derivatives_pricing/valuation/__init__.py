@@ -13,6 +13,7 @@ Core classes:
     PayoffSpec: Contract specification for custom payoffs
     AsianSpec: Contract specification for Asian options
     BarrierSpec: Contract specification for barrier options
+    OptionSpec: Type alias — union of the four spec classes above
     UnderlyingData: Minimal underlying data container
 
 Barrier enums:
@@ -39,6 +40,7 @@ from .contracts import (
     PayoffSpec,
     AsianSpec,
     BarrierSpec,
+    OptionSpec,
     WingBoundary,
     PayoffBoundaryModel,
 )
@@ -59,6 +61,7 @@ __all__ = [
     "WingBoundary",
     "AsianSpec",
     "BarrierSpec",
+    "OptionSpec",
     # Barrier enums
     "BarrierDirection",
     "BarrierAction",

@@ -62,7 +62,7 @@ from .barrier_analytical import _AnalyticalBarrierValuation
 from .pde import _FDEuropeanValuation, _FDAmericanValuation, _FDBarrierValuation
 from ..rates import DiscountCurve
 from ..market_environment import MarketData
-from .contracts import AsianSpec, BarrierSpec, PayoffSpec, VanillaSpec
+from .contracts import AsianSpec, BarrierSpec, OptionSpec, PayoffSpec, VanillaSpec
 from .params import BinomialParams, MonteCarloParams, PDEParams, ValuationParams
 
 logger = logging.getLogger(__name__)
@@ -303,10 +303,17 @@ class OptionValuation:
     def __init__(
         self,
         underlying: UnderlyingData | PathSimulation,
-        spec: VanillaSpec | PayoffSpec | AsianSpec | BarrierSpec,
+        spec: OptionSpec,
         pricing_method: PricingMethod,
         params: ValuationParams | None = None,
     ) -> None:
+        # Validate spec type
+        if not isinstance(spec, OptionSpec):
+            raise ConfigurationError(
+                "spec must be a VanillaSpec, PayoffSpec, AsianSpec, or "
+                f"BarrierSpec; got {type(spec).__name__}"
+            )
+
         # --- store private state ---
         self._spec = spec
 
@@ -855,7 +862,7 @@ class OptionValuation:
         return self._underlying
 
     @property
-    def spec(self) -> VanillaSpec | PayoffSpec | AsianSpec | BarrierSpec:
+    def spec(self) -> OptionSpec:
         """Contract specification object for the valued instrument."""
         return self._spec
 
@@ -986,7 +993,7 @@ class OptionValuation:
         *,
         pricing_method: PricingMethod,
         params: ValuationParams | None,
-        spec: VanillaSpec | PayoffSpec | AsianSpec | BarrierSpec,
+        spec: OptionSpec,
     ) -> ValuationParams | None:
         if params is None:
             if pricing_method is PricingMethod.MONTE_CARLO:
@@ -1755,7 +1762,7 @@ class OptionValuation:
         self,
         *,
         underlying,
-        spec: VanillaSpec | PayoffSpec | AsianSpec | BarrierSpec | None = None,
+        spec: OptionSpec | None = None,
     ) -> OptionValuation:
         return OptionValuation(
             underlying=underlying,

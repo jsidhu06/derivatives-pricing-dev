@@ -521,3 +521,9 @@ class BarrierSpec:
         if self.direction is BarrierDirection.UP:
             return spot >= self.barrier
         return spot <= self.barrier
+
+
+# Type alias for any contract spec accepted by ``OptionValuation``.
+# Usable both as an annotation (``spec: OptionSpec``) and at runtime
+# (``isinstance(x, OptionSpec)``)
+OptionSpec = VanillaSpec | PayoffSpec | AsianSpec | BarrierSpec
