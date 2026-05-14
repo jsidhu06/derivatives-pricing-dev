@@ -15,6 +15,12 @@ Core classes:
     BarrierSpec: Contract specification for barrier options
     UnderlyingData: Minimal underlying data container
 
+Barrier enums:
+    BarrierDirection: UP / DOWN
+    BarrierAction: IN / OUT
+    BarrierMonitoring: CONTINUOUS / DISCRETE
+    RebateTiming: AT_HIT / AT_EXPIRY
+
 Parameter classes:
     MonteCarloParams: Configuration for Monte Carlo pricing
     BinomialParams: Configuration for Binomial tree pricing
@@ -22,6 +28,12 @@ Parameter classes:
     ValuationParams: Union type for all parameter classes
 """
 
+from ..enums import (
+    BarrierAction,
+    BarrierDirection,
+    BarrierMonitoring,
+    RebateTiming,
+)
 from .contracts import (
     VanillaSpec,
     PayoffSpec,
@@ -47,6 +59,11 @@ __all__ = [
     "WingBoundary",
     "AsianSpec",
     "BarrierSpec",
+    # Barrier enums
+    "BarrierDirection",
+    "BarrierAction",
+    "BarrierMonitoring",
+    "RebateTiming",
     # Core valuation classes
     "OptionValuation",
     "UnderlyingData",
