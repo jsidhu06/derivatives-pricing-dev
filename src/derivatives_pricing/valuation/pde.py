@@ -2047,15 +2047,14 @@ def _fd_barrier_ko_core(
                 if psor_iters == int(max_iter):
                     psor_not_converged += 1
 
-        # ── Discrete dividend jump ────────────────────────────────────
-        if dividend_map:
-            amount = dividend_map.get(round(tau_curr, 12))
-            if amount is not None:
-                _apply_dividend_jump(V, grid, amount, space_grid=space_grid)
-                if early_exercise:
-                    V[:] = np.maximum(V, intrinsic)
-
         # ── Discrete barrier reset ────────────────────────────────────
+        # Imposed on the ex-div surface at the observation time; the
+        # dividend jump below then carries the knocked-out state back
+        # to the pre-div surface.  Standard market convention is
+        # ex-div first, then monitor — so cum-div spots in (H, H+D]
+        # that fall through the barrier once the cash dividend goes
+        # ex are correctly mapped to the reset value.  Order matches
+        # ``_fd_barrier_ki_core``.
         if monitoring_tau_set is not None:
             tau_key = round(tau_curr, 12)
             if tau_key in monitoring_tau_set:
@@ -2074,6 +2073,14 @@ def _fd_barrier_ko_core(
                     alive = S > barrier if direction is BarrierDirection.DOWN else S < barrier
                     mask = alive & (intrinsic > V)
                     V[mask] = intrinsic[mask]
+
+        # ── Discrete dividend jump ────────────────────────────────────
+        if dividend_map:
+            amount = dividend_map.get(round(tau_curr, 12))
+            if amount is not None:
+                _apply_dividend_jump(V, grid, amount, space_grid=space_grid)
+                if early_exercise:
+                    V[:] = np.maximum(V, intrinsic)
 
     if psor_steps > 0:
         avg_iters = psor_total_iters / psor_steps
