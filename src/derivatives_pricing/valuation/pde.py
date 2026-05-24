@@ -1857,12 +1857,15 @@ def _fd_barrier_ko_core(
     # only if maturity is a monitoring date (which it typically is).
     if not continuous:
         assert monitoring_taus is not None  # validated above
-        # tau=0 is maturity; if it's a monitoring tau, apply the reset
+        # tau=0 is maturity; if it's a monitoring tau, apply the reset.
+        # Rebate-aware: at tau=0 df_tT=1 so both AT_HIT and AT_EXPIRY
+        # rebate timings give the undiscounted rebate as the terminal
+        # value in the KO zone
         if any(abs(tau) < 1e-12 for tau in monitoring_taus):
             if direction is BarrierDirection.DOWN:
-                payoff[S <= barrier] = 0.0
+                payoff[S <= barrier] = rebate
             else:
-                payoff[S >= barrier] = 0.0
+                payoff[S >= barrier] = rebate
 
     V = payoff.copy()
 

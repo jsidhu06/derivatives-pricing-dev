@@ -31,7 +31,7 @@ from derivatives_pricing.market_environment import MarketData
 from derivatives_pricing.rates import DiscountCurve
 from derivatives_pricing.utils import calculate_year_fraction
 from derivatives_pricing.valuation import OptionValuation, UnderlyingData
-from derivatives_pricing.valuation.contracts import BarrierSpec, PayoffSpec
+from derivatives_pricing.valuation.contracts import BarrierSpec, PayoffSpec, VanillaSpec
 from derivatives_pricing.valuation.pde import _FDBarrierValuation, _fd_barrier_ki_core
 from helpers import (
     flat_curve,
@@ -722,6 +722,138 @@ def test_pde_fd_barrier_european_ki_rebate_grid_matches_direct_near_spot():
 
     assert np.allclose(V_parity[window], V_direct_on_parity[window], atol=0.002)
     assert np.allclose(V_parity_prev[window], V_direct_prev_on_parity[window], atol=0.002)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        pytest.param(
+            {
+                "spot": 100.0,
+                "strike": 100.0,
+                "volatility": 0.25,
+                "rate": 0.05,
+                "option_type": OptionType.CALL,
+                "direction": BarrierDirection.DOWN,
+                "barrier": 90.0,
+                "rebate": 4.0,
+                "num_observations": 12,
+            },
+            id="down_out_call_num_observations",
+        ),
+        pytest.param(
+            {
+                "spot": 100.0,
+                "strike": 100.0,
+                "volatility": 0.25,
+                "rate": 0.05,
+                "option_type": OptionType.PUT,
+                "direction": BarrierDirection.UP,
+                "barrier": 110.0,
+                "rebate": 3.0,
+                "monitoring_dates": [dt.datetime(2025, m, 28) for m in range(1, 13)],
+            },
+            id="up_out_put_monitoring_dates",
+        ),
+    ],
+)
+def test_pde_fd_discrete_ko_at_expiry_rebate_matches_direct_ki_parity(scenario: dict):
+    """Discrete KO expiry rebates should satisfy in/out parity with a direct KI solve.
+
+    This specifically exercises the maturity monitoring slice where the KO core
+    resets the knocked-out region. With a non-zero rebate paid at expiry, the
+    contract identity is:
+
+        V_KO + V_KI = V_vanilla + rebate * df(T)
+
+    We price KO through the public PDE path, KI through the direct two-surface
+    core (to avoid the European-KI parity facade being circular), and vanilla
+    with the same PDE engine. Before the maturity-reset fix, the KO leg missed
+    the rebate on the terminal monitored slice and this assertion failed.
+    """
+    curve_r = flat_curve(PRICING_DATE, MATURITY, scenario["rate"])
+    curve_q = flat_curve(PRICING_DATE, MATURITY, 0.01)
+    md = market_data(pricing_date=PRICING_DATE, discount_curve=curve_r)
+    ud = underlying(
+        initial_value=scenario["spot"],
+        volatility=scenario["volatility"],
+        market_data=md,
+        dividend_curve=curve_q,
+    )
+    ko_spec = BarrierSpec(
+        option_type=scenario["option_type"],
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=scenario["strike"],
+        maturity=MATURITY,
+        barrier=scenario["barrier"],
+        direction=scenario["direction"],
+        action=BarrierAction.OUT,
+        monitoring=BarrierMonitoring.DISCRETE,
+        rebate=scenario["rebate"],
+        rebate_timing=RebateTiming.AT_EXPIRY,
+        num_observations=scenario.get("num_observations"),
+        monitoring_dates=scenario.get("monitoring_dates"),
+    )
+    ki_spec = dc_replace(ko_spec, action=BarrierAction.IN)
+    vanilla_spec = VanillaSpec(
+        option_type=scenario["option_type"],
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=scenario["strike"],
+        maturity=MATURITY,
+    )
+    params = PDEParams.for_barriers(monitoring=BarrierMonitoring.DISCRETE)
+
+    ko_price = OptionValuation(ud, ko_spec, PricingMethod.PDE_FD, params=params).present_value()
+    ki_valuation = OptionValuation(ud, ki_spec, PricingMethod.PDE_FD, params=params)
+    ki_direct_price = float(
+        _fd_barrier_ki_core(**_FDBarrierValuation(ki_valuation)._base_solve_args())[0]
+    )
+    vanilla_price = OptionValuation(
+        ud, vanilla_spec, PricingMethod.PDE_FD, params=params
+    ).present_value()
+
+    ttm = calculate_year_fraction(
+        PRICING_DATE,
+        MATURITY,
+        day_count_convention=md.day_count_convention,
+    )
+    rebate_leg = scenario["rebate"] * float(curve_r.df(ttm))
+    ki_ko_sum = ko_price + ki_direct_price
+    vanilla_rebate_sum = vanilla_price + rebate_leg
+    abs_diff = ki_ko_sum - vanilla_rebate_sum
+    rel_diff_pct = 100.0 * abs(abs_diff) / max(abs(vanilla_rebate_sum), 1.0e-12)
+
+    monitoring_label = (
+        f"num_obs={scenario['num_observations']}"
+        if scenario.get("num_observations") is not None
+        else f"monitoring_dates={len(scenario['monitoring_dates'])}"
+    )
+    logger.info(
+        "Discrete KO expiry rebate parity %s/%s K=%g H=%g R=%g %s | "
+        "ko=%.4f ki_direct=%.4f vanilla=%.4f rebate_leg=%.4f | "
+        "ki_ko_sum=%.4f vanilla_rebate_sum=%.4f diff=%.4f rel=%.4f%%",
+        scenario["option_type"].value,
+        scenario["direction"].value,
+        scenario["strike"],
+        scenario["barrier"],
+        scenario["rebate"],
+        monitoring_label,
+        ko_price,
+        ki_direct_price,
+        vanilla_price,
+        rebate_leg,
+        ki_ko_sum,
+        vanilla_rebate_sum,
+        abs_diff,
+        rel_diff_pct,
+    )
+
+    assert np.isclose(
+        ki_ko_sum,
+        vanilla_rebate_sum,
+        rtol=0.003,
+        atol=1e-4,
+    )
 
 
 @pytest.mark.parametrize(
