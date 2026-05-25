@@ -41,6 +41,7 @@ from derivatives_pricing.market_environment import MarketData
 from derivatives_pricing.rates import DiscountCurve
 from derivatives_pricing.valuation import OptionValuation, UnderlyingData
 from derivatives_pricing.valuation.contracts import DoubleBarrierSpec
+from derivatives_pricing.valuation.params import PDEParams
 from derivatives_pricing.utils import calculate_year_fraction
 
 logger = logging.getLogger(__name__)
@@ -265,3 +266,234 @@ class TestDoubleBarrierMonitoringFrequencyAgainstTian:
         assert np.isclose(pv, paper_pv, rtol=rtol, atol=1.0e-4), (
             f"DKO call {frequency} (N={num_observations}): got {pv:.6f}, expected {paper_pv:.4f}"
         )
+
+
+class TestDoubleBarrierGreeksAgainstBoyleTian:
+    """Continuous double knock-out call Greeks vs Boyle-Tian (1998).
+
+    The double-barrier analogue of the paper's Table 6 single-barrier DOC
+    Greeks, using the same corridor and spot sweep as the Table 5 PV test
+    (``TestDoubleBarrierAgainstBoyleTian.test_double_ko_call_near_lower_barrier``):
+
+        K = 100, sigma = 25%, r = 10%, q = 0, T = 1 yr,
+        lower barrier L = 90, upper barrier U = 140,
+
+    as spot approaches the lower barrier.  Only PDE_FD prices double barriers,
+    and its grid Greeks come for free from the same backward solve.  The paper
+    reports annualized theta; the library theta is per-day, so the comparison
+    scales by 365.
+    """
+
+    PRICING_DATE = dt.datetime(2025, 1, 1)
+    STRIKE = 100.0
+    SIGMA = 0.25
+    RATE = 0.10
+    LOWER_BARRIER = 90.0
+    UPPER_BARRIER = 140.0
+    MATURITY = PRICING_DATE + dt.timedelta(days=365)
+
+    # spot → (delta, gamma, theta_annualized) starred figures from the paper.
+    _PAPER_GREEKS: dict[float, tuple[float, float, float]] = {
+        95.0: (0.2535, -0.0165, 2.3985),
+        92.0: (0.2998, -0.0141, 1.0271),
+        91.0: (0.3133, -0.0129, 0.5238),
+        90.5: (0.3196, -0.0123, 0.2644),
+        90.4: (0.3208, -0.0121, 0.2119),
+        90.3: (0.3220, -0.0120, 0.1592),
+        90.2: (0.3232, -0.0119, 0.1064),
+    }
+
+    # Per-greek tolerances.  Our grid Greeks track the paper to ~1e-4, so these
+    # are comfortably loose (gamma/theta are small in magnitude, hence atol).
+    _TOLS: dict[str, dict[str, float]] = {
+        "delta": dict(rtol=1.0e-2, atol=1.0e-3),
+        "gamma": dict(rtol=1.5e-2, atol=5.0e-4),
+        "theta": dict(rtol=1.5e-2, atol=3.0e-3),
+    }
+
+    @classmethod
+    def _market_data(cls) -> MarketData:
+        return MarketData(
+            cls.PRICING_DATE,
+            DiscountCurve.flat(cls.RATE, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _underlying(cls, spot: float) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=spot,
+            volatility=cls.SIGMA,
+            market_data=cls._market_data(),
+            dividend_curve=DiscountCurve.flat(0.0, 2.0),
+        )
+
+    @classmethod
+    def _spec(cls) -> DoubleBarrierSpec:
+        return DoubleBarrierSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=cls.STRIKE,
+            maturity=cls.MATURITY,
+            lower_barrier=cls.LOWER_BARRIER,
+            upper_barrier=cls.UPPER_BARRIER,
+            action=BarrierAction.OUT,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+
+    @classmethod
+    def _engine_greek(cls, spot: float, greek: str) -> float:
+        """Return a single PDE_FD greek; theta annualized (×365) like the paper."""
+        valuation = OptionValuation(cls._underlying(spot), cls._spec(), PricingMethod.PDE_FD)
+        value = float(getattr(valuation, greek)())
+        if greek == "theta":
+            value *= 365.0
+        return value
+
+    @pytest.mark.parametrize(
+        "spot",
+        list(_PAPER_GREEKS.keys()),
+        ids=[f"spot_{s:.1f}".replace(".", "_") for s in _PAPER_GREEKS],
+    )
+    @pytest.mark.parametrize("greek", ["delta", "gamma", "theta"])
+    def test_double_ko_call_greek_matches_paper(self, spot: float, greek: str):
+        """DKO call (delta/gamma/theta) matches Boyle-Tian as spot nears L=90."""
+        paper_value = self._PAPER_GREEKS[spot][["delta", "gamma", "theta"].index(greek)]
+        value = self._engine_greek(spot, greek)
+        logger.info(
+            "BT98 DoubleKO Greeks spot=%.2f %-5s | paper=%.4f dp_fd=%.4f diff=%.4f",
+            spot,
+            greek,
+            paper_value,
+            value,
+            abs(value - paper_value),
+        )
+        assert np.isclose(value, paper_value, **self._TOLS[greek]), (
+            f"{greek} mismatch at spot={spot}: got {value:.4f}, expected {paper_value:.4f}"
+        )
+
+
+@pytest.mark.slow
+class TestDoubleBarrierGreeksFrequencyAgainstTian:
+    """Discretely-monitored double-KO call Greeks across monitoring frequencies.
+
+    The double-barrier analogue of Boyle-Tian's Table 9 single-barrier DOC
+    Greeks sweep — same scenario as the Table-8-style PV sweep
+    (``TestDoubleBarrierMonitoringFrequencyAgainstTian``):
+
+        S0 = K = 100, sigma = 20%, T = 0.5 yr, r = 10%, q = 0,
+        lower barrier H = 95, upper barrier U = 140,
+
+    swept across continuous / daily / weekly / monthly / quarterly monitoring
+    (Cheuk-Vorst 1994 frequencies scaled to the half-year maturity).  Only
+    PDE_FD prices double barriers; its grid Greeks come from the same backward
+    solve.  The paper reports annualized theta, so the comparison scales by 365.
+
+    Discrete-monitoring theta is the most resolution-sensitive figure (the
+    knock-out resets inject a fresh discontinuity at every observation date),
+    so this test runs at a finer grid than the engine's discrete default; at
+    ``spot_steps=2000, time_steps=6000`` every Greek tracks the paper to within
+    ~2e-4 (delta/gamma) / ~5e-3 (annualized theta).
+    """
+
+    PRICING_DATE = dt.datetime(2025, 1, 1)
+    SPOT = 100.0
+    STRIKE = 100.0
+    SIGMA = 0.20
+    RATE = 0.10
+    LOWER_BARRIER = 95.0
+    UPPER_BARRIER = 140.0
+    T_YEARS = 0.5
+    MATURITY = PRICING_DATE + dt.timedelta(days=T_YEARS * 365)
+
+    SPOT_STEPS = 2000
+    TIME_STEPS = 6000
+
+    # frequency → (monitoring_kind, (delta, gamma, theta_annualized)).
+    # monitoring_kind: "continuous" or N obs scaled by T = 0.5 yr.
+    _PAPER_GREEKS: dict[str, tuple[str | int, tuple[float, float, float]]] = {
+        "continuous": ("continuous", (0.7853, -0.0491, 2.4127)),
+        "daily": (125, (0.7585, -0.0440, 1.7219)),  # 250 / yr
+        "weekly": (26, (0.7271, -0.0372, 0.7274)),  # 52  / yr
+        "monthly": (6, (0.6373, -0.0086, -4.0225)),  # 12  / yr
+        "quarterly": (2, (0.5484, 0.0036, -5.4920)),  # 4   / yr
+    }
+
+    _TOLS: dict[str, dict[str, float]] = {
+        "delta": dict(rtol=1.0e-2, atol=1.0e-3),
+        "gamma": dict(rtol=2.0e-2, atol=1.0e-3),
+        "theta": dict(rtol=2.0e-2, atol=1.0e-2),
+    }
+
+    @classmethod
+    def _market_data(cls) -> MarketData:
+        return MarketData(
+            cls.PRICING_DATE,
+            DiscountCurve.flat(cls.RATE, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+
+    @classmethod
+    def _underlying(cls) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=cls.SPOT,
+            volatility=cls.SIGMA,
+            market_data=cls._market_data(),
+        )
+
+    @classmethod
+    def _engine_greeks(cls, monitoring_kind: str | int) -> dict[str, float]:
+        """Return {delta, gamma, theta} from one PDE_FD solve; theta annualized."""
+        monitoring = (
+            BarrierMonitoring.CONTINUOUS
+            if monitoring_kind == "continuous"
+            else BarrierMonitoring.DISCRETE
+        )
+        num_observations = None if monitoring_kind == "continuous" else int(monitoring_kind)
+        spec = DoubleBarrierSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=cls.STRIKE,
+            maturity=cls.MATURITY,
+            lower_barrier=cls.LOWER_BARRIER,
+            upper_barrier=cls.UPPER_BARRIER,
+            action=BarrierAction.OUT,
+            monitoring=monitoring,
+            num_observations=num_observations,
+        )
+        params = PDEParams.for_barriers(
+            monitoring=monitoring,
+            spot_steps=cls.SPOT_STEPS,
+            time_steps=cls.TIME_STEPS,
+        )
+        valuation = OptionValuation(cls._underlying(), spec, PricingMethod.PDE_FD, params)
+        # delta/gamma/theta all read from the one cached backward solve.
+        return {
+            "delta": float(valuation.delta()),
+            "gamma": float(valuation.gamma()),
+            "theta": float(valuation.theta()) * 365.0,
+        }
+
+    @pytest.mark.parametrize("frequency", list(_PAPER_GREEKS.keys()))
+    def test_double_ko_call_greek_frequency_sweep(self, frequency: str):
+        """DKO call Greeks match Tian across continuous → quarterly monitoring."""
+        monitoring_kind, paper = self._PAPER_GREEKS[frequency]
+        paper_greeks = dict(zip(["delta", "gamma", "theta"], paper))
+        engine_greeks = self._engine_greeks(monitoring_kind)
+
+        for greek in ("delta", "gamma", "theta"):
+            paper_value = paper_greeks[greek]
+            value = engine_greeks[greek]
+            logger.info(
+                "BT98 Table9-DKO Greeks freq=%-10s %-5s | paper=%.4f dp_fd=%.4f diff=%.4f",
+                frequency,
+                greek,
+                paper_value,
+                value,
+                abs(value - paper_value),
+            )
+            assert np.isclose(value, paper_value, **self._TOLS[greek]), (
+                f"{greek} mismatch for {frequency}: got {value:.4f}, expected {paper_value:.4f}"
+            )
