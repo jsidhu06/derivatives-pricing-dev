@@ -59,7 +59,12 @@ from .binomial import (
 from .bsm import _BSMEuropeanValuation
 from .asian_analytical import _AnalyticalAsianValuation
 from .barrier_analytical import _AnalyticalBarrierValuation
-from .pde import _FDEuropeanValuation, _FDAmericanValuation, _FDBarrierValuation
+from .pde import (
+    _FDEuropeanValuation,
+    _FDAmericanValuation,
+    _FDBarrierValuation,
+    _FDDoubleBarrierValuation,
+)
 from ..rates import DiscountCurve
 from ..market_environment import MarketData
 from .contracts import (
@@ -69,6 +74,7 @@ from .contracts import (
     OptionSpec,
     PayoffSpec,
     VanillaSpec,
+    _BaseBarrierSpec,
 )
 from .params import BinomialParams, MonteCarloParams, PDEParams, ValuationParams
 
@@ -761,7 +767,9 @@ class OptionValuation:
             # ``_BARRIER_THETA_TIME_BUMP_DAYS`` for rationale.  All other
             # specs keep the historical 1d default.
             time_bump_days = (
-                self._BARRIER_THETA_TIME_BUMP_DAYS if isinstance(self._spec, BarrierSpec) else 1.0
+                self._BARRIER_THETA_TIME_BUMP_DAYS
+                if isinstance(self._spec, _BaseBarrierSpec)
+                else 1.0
             )
         bumped_date = self.pricing_date + dt.timedelta(days=time_bump_days)
         if bumped_date >= self.maturity:
@@ -963,10 +971,13 @@ class OptionValuation:
         spec = self._spec
 
         if isinstance(spec, DoubleBarrierSpec):
-            # Distinct from BarrierSpec, so it would otherwise fall through to
-            # the vanilla registry and silently mis-price.  Pricing support is
-            # added engine-by-engine; until then, fail loudly.
-            raise UnsupportedFeatureError("Double-barrier option pricing is not yet implemented.")
+            # Double-barrier pricing currently lives in the PDE_FD engine only.
+            if self._pricing_method is not PricingMethod.PDE_FD:
+                raise UnsupportedFeatureError(
+                    "Double-barrier option pricing is currently only supported via "
+                    f"PricingMethod.PDE_FD; got {self._pricing_method.name}."
+                )
+            return _FDDoubleBarrierValuation(self)
 
         if isinstance(spec, BarrierSpec):
             impl_cls = _BARRIER_REGISTRY.get((self._pricing_method, spec.exercise_type))
@@ -1020,7 +1031,7 @@ class OptionValuation:
                     return BinomialParams(num_steps=num_steps)
                 return BinomialParams()
             if pricing_method is PricingMethod.PDE_FD:
-                if isinstance(spec, BarrierSpec):
+                if isinstance(spec, _BaseBarrierSpec):
                     return PDEParams.for_barriers(monitoring=spec.monitoring)
                 return PDEParams()
             return None
@@ -1071,7 +1082,7 @@ class OptionValuation:
 
         Returns ``None`` for continuous monitoring (all grid points are used).
         """
-        if not isinstance(self._spec, BarrierSpec):
+        if not isinstance(self._spec, _BaseBarrierSpec):
             raise ConfigurationError("Barrier monitoring schedule requested for non-Barrier spec.")
 
         spec = self._spec
@@ -1101,9 +1112,9 @@ class OptionValuation:
         monitoring only observes the barrier at explicit monitoring dates;
         the pricing date qualifies only if it appears in that schedule.
         """
-        assert isinstance(self._spec, BarrierSpec), (
-            "_barrier_triggered_at_inception called on non-BarrierSpec valuation; "
-            "the dispatcher should route BarrierSpecs to barrier engines only."
+        assert isinstance(self._spec, _BaseBarrierSpec), (
+            "_barrier_triggered_at_inception called on non-barrier valuation; "
+            "the dispatcher should route barrier specs to barrier engines only."
         )
         spot = float(self._underlying.initial_value)
         if not self._spec.is_spot_past_barrier(spot):
@@ -1123,8 +1134,8 @@ class OptionValuation:
         across delta/gamma/theta and matches the "one solve, three free
         greeks" cost profile of a non-triggered native greek.
         """
-        assert isinstance(self._spec, BarrierSpec), (
-            "_vanilla_equivalent_valuation called on non-BarrierSpec valuation."
+        assert isinstance(self._spec, _BaseBarrierSpec), (
+            "_vanilla_equivalent_valuation called on non-barrier valuation."
         )
         spec = self._spec
         vanilla_spec = VanillaSpec(
@@ -1176,7 +1187,9 @@ class OptionValuation:
           gamma, vega) the discounted rebate is insensitive to the bump,
           so 0.
         """
-        if not (isinstance(self._spec, BarrierSpec) and self._barrier_triggered_at_inception()):
+        if not (
+            isinstance(self._spec, _BaseBarrierSpec) and self._barrier_triggered_at_inception()
+        ):
             return None
         spec = self._spec
         if spec.action is BarrierAction.IN:

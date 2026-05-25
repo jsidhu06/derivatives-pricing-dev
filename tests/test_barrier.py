@@ -44,7 +44,11 @@ from derivatives_pricing.stochastic_processes import (
     GBMProcess,
     SimulationConfig,
 )
-from derivatives_pricing.valuation.pde import _build_log_grid, _build_spot_grid
+from derivatives_pricing.valuation.pde import (
+    _build_double_barrier_discrete_grid,
+    _build_log_grid,
+    _build_spot_grid,
+)
 from derivatives_pricing.valuation.params import BinomialParams, MonteCarloParams, PDEParams
 from derivatives_pricing.utils import calculate_year_fraction
 from helpers import flat_curve, PRICING_DATE, MATURITY, CURRENCY, SPOT, STRIKE, RATE, VOL
@@ -343,6 +347,90 @@ class TestDiscreteBarrierPDEGridPlacement:
         dz = np.diff(Z)[0]
         y_d_prime = np.log(barrier) + 0.5 * dz
         assert np.isclose(Z, y_d_prime, atol=1.0e-12).sum() == 1
+
+
+class TestDiscreteDoubleBarrierPDEGridPlacement:
+    """Discrete double-barrier PDE grids place **both** barriers between nodes.
+
+    Boyle-Tian's single-barrier half-step placement fixes one barrier midway
+    between nodes; for two barriers the corridor is made an exact integer
+    multiple of the step (``step = corridor / N``) so that anchoring the lower
+    barrier half-way places the upper barrier half-way automatically.  These
+    tests assert that property holds for both barriers, on a uniform spot grid
+    and a uniform log-spot grid, with no node landing on either barrier.
+    """
+
+    LOWER_BARRIER = 95.0
+    UPPER_BARRIER = 140.0
+
+    @staticmethod
+    def _assert_half_step(grid: np.ndarray, barrier: float, *, log: bool) -> None:
+        """Assert ``barrier`` sits exactly midway between two adjacent nodes."""
+        left_idx = int(np.searchsorted(grid, barrier)) - 1
+        assert 0 <= left_idx < grid.size - 1
+        assert not np.any(np.isclose(grid, barrier, atol=1.0e-12))
+        midpoint = (
+            np.sqrt(grid[left_idx] * grid[left_idx + 1])  # geometric mean (log grid)
+            if log
+            else 0.5 * (grid[left_idx] + grid[left_idx + 1])  # arithmetic mean (spot grid)
+        )
+        assert np.isclose(midpoint, barrier, atol=1.0e-12)
+
+    @pytest.mark.parametrize("method", [PDEMethod.EXPLICIT_HULL, PDEMethod.CRANK_NICOLSON])
+    def test_spot_grid_places_both_barriers_at_half_step(self, method):
+        _, S, dS = _build_double_barrier_discrete_grid(
+            lower_barrier=self.LOWER_BARRIER,
+            upper_barrier=self.UPPER_BARRIER,
+            spot=SPOT,
+            strike=STRIKE,
+            volatility=VOL,
+            time_to_maturity=1.0,
+            smax_mult=4.0,
+            spot_steps=200,
+            time_steps=400,
+            method=method,
+            log=False,
+        )
+
+        # Uniform spacing.
+        assert np.allclose(np.diff(S), dS, atol=1.0e-12)
+        self._assert_half_step(S, self.LOWER_BARRIER, log=False)
+        self._assert_half_step(S, self.UPPER_BARRIER, log=False)
+        # Corridor is an exact integer number of steps.
+        n_corridor = (self.UPPER_BARRIER - self.LOWER_BARRIER) / dS
+        assert np.isclose(n_corridor, round(n_corridor), atol=1.0e-9)
+
+    @pytest.mark.parametrize("method", [PDEMethod.EXPLICIT_HULL, PDEMethod.CRANK_NICOLSON])
+    def test_log_grid_places_both_barriers_at_half_step_in_log_space(self, method):
+        Z, S, dz = _build_double_barrier_discrete_grid(
+            lower_barrier=self.LOWER_BARRIER,
+            upper_barrier=self.UPPER_BARRIER,
+            spot=SPOT,
+            strike=STRIKE,
+            volatility=VOL,
+            time_to_maturity=1.0,
+            smax_mult=4.0,
+            spot_steps=200,
+            time_steps=400,
+            method=method,
+            log=True,
+        )
+
+        # Uniform spacing in log space.
+        assert np.allclose(np.diff(Z), dz, atol=1.0e-12)
+
+        for barrier in (self.LOWER_BARRIER, self.UPPER_BARRIER):
+            # Half-way in spot space (geometric mean) and log space (arithmetic).
+            self._assert_half_step(S, barrier, log=True)
+            left_idx = int(np.searchsorted(S, barrier)) - 1
+            assert np.isclose(0.5 * (Z[left_idx] + Z[left_idx + 1]), np.log(barrier), atol=1.0e-12)
+            # Exactly one node sits a half-step above the barrier in log space.
+            y_prime = np.log(barrier) + 0.5 * dz
+            assert np.isclose(Z, y_prime, atol=1.0e-12).sum() == 1
+
+        # Corridor is an exact integer number of log-steps.
+        n_corridor = (np.log(self.UPPER_BARRIER) - np.log(self.LOWER_BARRIER)) / dz
+        assert np.isclose(n_corridor, round(n_corridor), atol=1.0e-9)
 
 
 # ===========================================================================

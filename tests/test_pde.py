@@ -31,8 +31,18 @@ from derivatives_pricing.market_environment import MarketData
 from derivatives_pricing.rates import DiscountCurve
 from derivatives_pricing.utils import calculate_year_fraction
 from derivatives_pricing.valuation import OptionValuation, UnderlyingData
-from derivatives_pricing.valuation.contracts import BarrierSpec, PayoffSpec, VanillaSpec
-from derivatives_pricing.valuation.pde import _FDBarrierValuation, _fd_barrier_ki_core
+from derivatives_pricing.valuation.contracts import (
+    BarrierSpec,
+    DoubleBarrierSpec,
+    PayoffSpec,
+    VanillaSpec,
+)
+from derivatives_pricing.valuation.pde import (
+    _FDBarrierValuation,
+    _FDDoubleBarrierValuation,
+    _fd_barrier_ki_core,
+    _fd_double_barrier_ki_core,
+)
 from helpers import (
     flat_curve,
     market_data,
@@ -650,13 +660,13 @@ def test_pde_fd_barrier_european_ki_parity_matches_direct(
     direct_price = float(_fd_barrier_ki_core(**impl._base_solve_args())[0])
 
     abs_diff = abs(parity_price - direct_price)
-    rel_diff = abs_diff / max(abs(direct_price), 1e-12)
+    rel_diff = abs_diff / max(abs(direct_price), 1e-12) * 100
     div_label = (
         "continuous_q" if discrete_dividends is None else f"{len(discrete_dividends)}_discrete_divs"
     )
     logger.info(
         "KI parity vs direct [%s/%s K=%g H=%g rebate=%g monitoring=%s divs=%s]: "
-        "parity=%.6f direct=%.6f abs_diff=%.2e rel_diff=%.2e",
+        "parity=%.6f direct=%.6f abs_diff=%.4f rel_diff=%.4f%%",
         option_type.value,
         direction.value,
         strike,
@@ -671,6 +681,203 @@ def test_pde_fd_barrier_european_ki_parity_matches_direct(
     )
 
     assert np.isclose(parity_price, direct_price, rtol=0.003)
+
+
+# Double-barrier continuous-monitoring configs: a continuous dividend yield,
+# and discrete dividends (non-coincident — continuous monitoring has no
+# observation dates to coincide with).  Mirrors _PARITY_MONITORING_CONFIGS
+# but with CONTINUOUS monitoring (double-barrier PDE is continuous-only).
+_DOUBLE_PARITY_DIVIDEND_CONFIGS = [
+    pytest.param(None, id="continuous_yield"),
+    pytest.param(
+        [
+            (dt.datetime(2025, 3, 15), 1.0),
+            (dt.datetime(2025, 6, 15), 1.0),
+            (dt.datetime(2025, 9, 15), 1.0),
+        ],
+        id="discrete_divs",
+    ),
+]
+
+
+@pytest.mark.parametrize("discrete_dividends", _DOUBLE_PARITY_DIVIDEND_CONFIGS)
+@pytest.mark.parametrize(
+    "option_type,strike,lower_barrier,upper_barrier,rebate",
+    [
+        pytest.param(OptionType.CALL, 100.0, 85.0, 120.0, 0.0, id="dki_call"),
+        pytest.param(OptionType.PUT, 100.0, 85.0, 120.0, 0.0, id="dki_put"),
+        pytest.param(OptionType.CALL, 95.0, 82.0, 125.0, 2.0, id="dki_call_rebate"),
+        pytest.param(OptionType.PUT, 105.0, 82.0, 125.0, 2.0, id="dki_put_rebate"),
+    ],
+)
+def test_pde_fd_double_barrier_european_ki_parity_matches_direct(
+    option_type: OptionType,
+    strike: float,
+    lower_barrier: float,
+    upper_barrier: float,
+    rebate: float,
+    discrete_dividends,
+):
+    """European double-KI parity pricing should track the direct two-surface solve.
+
+    The engine routes European double knock-in through in-out parity
+    (``V_DKI = V_vanilla + R·df_T − V_DKO``).  The direct
+    ``_fd_double_barrier_ki_core`` (with ``early_exercise=False``) solves the
+    inactive surface on the corridor coupled to the active vanilla at both
+    barriers.  Both must agree to grid-resolution precision.
+    """
+    curve_r = DiscountCurve.flat(0.05, 2)
+    curve_q = DiscountCurve.flat(0.03, 2) if discrete_dividends is None else None
+    pricing_date = dt.datetime(2025, 1, 1)
+    maturity = dt.datetime(2025, 12, 31)
+
+    md = MarketData(pricing_date, curve_r, currency="USD")
+    ud = UnderlyingData(
+        initial_value=100.0,
+        volatility=0.25,
+        market_data=md,
+        dividend_curve=curve_q,
+        discrete_dividends=discrete_dividends,
+    )
+    spec = DoubleBarrierSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=strike,
+        maturity=maturity,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        action=BarrierAction.IN,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=rebate,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
+    params = PDEParams(
+        spot_steps=600,
+        time_steps=600,
+        method=PDEMethod.CRANK_NICOLSON,
+        space_grid=PDESpaceGrid.LOG_SPOT,
+        rannacher_steps=2,
+    )
+
+    valuation = OptionValuation(ud, spec, PricingMethod.PDE_FD, params=params)
+    impl = _FDDoubleBarrierValuation(valuation)
+
+    parity_price = float(valuation.present_value())
+    direct_price = float(_fd_double_barrier_ki_core(**impl._base_solve_args())[0])
+
+    abs_diff = abs(parity_price - direct_price)
+    rel_diff = abs_diff / max(abs(direct_price), 1e-12) * 100
+    logger.info(
+        "DoubleKI parity vs direct [%s K=%g L=%g U=%g rebate=%g divs=%s]: "
+        "parity=%.6f direct=%.6f abs_diff=%.4f rel_diff=%.4f%%",
+        option_type.value,
+        strike,
+        lower_barrier,
+        upper_barrier,
+        rebate,
+        "discrete" if discrete_dividends is not None else "continuous_q",
+        parity_price,
+        direct_price,
+        abs_diff,
+        rel_diff,
+    )
+
+    assert np.isclose(parity_price, direct_price, rtol=5e-3, atol=5e-3), (
+        f"parity {parity_price:.6f} vs direct {direct_price:.6f}"
+    )
+
+
+@pytest.mark.parametrize("discrete_dividends", _DOUBLE_PARITY_DIVIDEND_CONFIGS)
+@pytest.mark.parametrize(
+    "option_type,strike,lower_barrier,upper_barrier,rebate",
+    [
+        pytest.param(OptionType.CALL, 100.0, 85.0, 120.0, 0.0, id="dki_call"),
+        pytest.param(OptionType.PUT, 100.0, 85.0, 120.0, 0.0, id="dki_put"),
+        pytest.param(OptionType.CALL, 95.0, 82.0, 125.0, 2.0, id="dki_call_rebate"),
+        pytest.param(OptionType.PUT, 105.0, 82.0, 125.0, 2.0, id="dki_put_rebate"),
+    ],
+)
+def test_pde_fd_double_barrier_discrete_european_ki_parity_matches_direct(
+    option_type: OptionType,
+    strike: float,
+    lower_barrier: float,
+    upper_barrier: float,
+    rebate: float,
+    discrete_dividends,
+):
+    """Discrete European double-KI parity should track the direct two-surface solve.
+
+    Discrete-monitoring analogue of
+    ``test_pde_fd_double_barrier_european_ki_parity_matches_direct``.  The
+    engine prices European double knock-in via in-out parity
+    (``V_DKI = V_vanilla + R·df_T − V_DKO``, with the now discrete-aware KO
+    core); the direct ``_fd_double_barrier_ki_core`` (``early_exercise=False``)
+    solves both surfaces on the Boyle-Tian half-step grid and couples the
+    inactive surface to the active one at every monitoring date.  Both must
+    agree to grid-resolution precision.
+    """
+    curve_r = DiscountCurve.flat(0.05, 2)
+    curve_q = DiscountCurve.flat(0.03, 2) if discrete_dividends is None else None
+    pricing_date = dt.datetime(2025, 1, 1)
+    maturity = dt.datetime(2025, 12, 31)
+
+    md = MarketData(pricing_date, curve_r, currency="USD")
+    ud = UnderlyingData(
+        initial_value=100.0,
+        volatility=0.25,
+        market_data=md,
+        dividend_curve=curve_q,
+        discrete_dividends=discrete_dividends,
+    )
+    spec = DoubleBarrierSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=strike,
+        maturity=maturity,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        action=BarrierAction.IN,
+        monitoring=BarrierMonitoring.DISCRETE,
+        num_observations=50,
+        rebate=rebate,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
+    # CN on the half-step discrete grid keeps the KO (parity) and KI (direct)
+    # solves on the same grid family for a clean comparison.
+    params = PDEParams(
+        spot_steps=600,
+        time_steps=1200,
+        method=PDEMethod.CRANK_NICOLSON,
+        space_grid=PDESpaceGrid.LOG_SPOT,
+        rannacher_steps=2,
+    )
+
+    valuation = OptionValuation(ud, spec, PricingMethod.PDE_FD, params=params)
+    impl = _FDDoubleBarrierValuation(valuation)
+
+    parity_price = float(valuation.present_value())
+    direct_price = float(_fd_double_barrier_ki_core(**impl._base_solve_args())[0])
+
+    abs_diff = abs(parity_price - direct_price)
+    rel_diff = abs_diff / max(abs(direct_price), 1e-12) * 100
+    logger.info(
+        "DoubleKI discrete parity vs direct [%s K=%g L=%g U=%g rebate=%g divs=%s]: "
+        "parity=%.6f direct=%.6f abs_diff=%.4f rel_diff=%.4f%%",
+        option_type.value,
+        strike,
+        lower_barrier,
+        upper_barrier,
+        rebate,
+        "discrete" if discrete_dividends is not None else "continuous_q",
+        parity_price,
+        direct_price,
+        abs_diff,
+        rel_diff,
+    )
+
+    assert np.isclose(parity_price, direct_price, rtol=5e-3, atol=5e-3), (
+        f"parity {parity_price:.6f} vs direct {direct_price:.6f}"
+    )
 
 
 def test_pde_fd_barrier_european_ki_rebate_grid_matches_direct_near_spot():
