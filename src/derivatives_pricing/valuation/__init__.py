@@ -40,6 +40,7 @@ from .contracts import (
     PayoffSpec,
     AsianSpec,
     BarrierSpec,
+    DoubleBarrierSpec,
     OptionSpec,
     WingBoundary,
     PayoffBoundaryModel,
@@ -61,6 +62,7 @@ __all__ = [
     "WingBoundary",
     "AsianSpec",
     "BarrierSpec",
+    "DoubleBarrierSpec",
     "OptionSpec",
     # Barrier enums
     "BarrierDirection",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import datetime as dt
@@ -345,62 +346,37 @@ class AsianSpec:
                 raise ValidationError("observed_count must be a positive integer")
 
 
-@dataclass(frozen=True, slots=True)
-class BarrierSpec:
-    """Contract specification for a barrier option.
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _BaseBarrierSpec(ABC):
+    """Private base for barrier specs — shared fields, validation, and contract.
 
-    Barrier options are path-dependent options that are activated (knock-in) or
-    extinguished (knock-out) when the underlying price reaches a barrier level.
+    Holds every field common to single- and double-barrier options and
+    performs the validation/coercion they share (enum type checks, strike
+    and rebate coercion, the knock-in rebate-timing rule, and the monitoring
+    schedule).  Subclasses add their barrier-level fields
+    (``barrier`` / ``direction`` for :class:`BarrierSpec`,
+    ``lower_barrier`` / ``upper_barrier`` for :class:`DoubleBarrierSpec`),
+    call ``_BaseBarrierSpec.__post_init__(self)`` from their own
+    ``__post_init__``, then validate those fields.
 
-    Parameters
-    ----------
-    option_type : OptionType
-        CALL or PUT.
-    exercise_type : ExerciseType
-        Only EUROPEAN is currently supported.
-    strike : float
-        Strike price.
-    maturity : dt.datetime
-        Contract maturity datetime.
-    barrier : float
-        Barrier level that triggers the knock-in or knock-out event.
-    direction : BarrierDirection
-        UP or DOWN — the direction the underlying must move to hit the barrier.
-    action : BarrierAction
-        IN (knock-in) or OUT (knock-out).
-    monitoring : BarrierMonitoring
-        CONTINUOUS (default) or DISCRETE.
-    rebate : float
-        Cash rebate paid to the holder.  For knock-out options the rebate is
-        paid when the barrier is hit (or at expiry, per ``rebate_timing``).
-        For knock-in options the rebate is paid at expiry if the barrier is
-        never hit.  Default 0.0.
-    rebate_timing : RebateTiming
-        AT_HIT (default) or AT_EXPIRY.  Only applicable when ``rebate > 0``
-        and ``action == OUT``.  Knock-in rebates are always paid at expiry.
-    currency : str, optional
-        Currency denomination.
-    contract_size : int | float
-        Contract multiplier (default 100).
-    num_observations : int, optional
-        Number of equally spaced monitoring observations for DISCRETE
-        monitoring.  Generates ``N`` dates at ``t = T/N, 2T/N, ..., T``;
-        the pricing date (``t=0``) is **excluded**, in line with the
-        academic convention used by Broadie-Glasserman-Kou (1997) and
-        Boyle-Tian (1998).  Note this differs from ``AsianSpec``, where
-        ``num_observations`` includes the pricing date as a fixing.  To
-        include the pricing date in a barrier monitoring schedule, pass
-        it explicitly via ``monitoring_dates``.
-    monitoring_dates : Sequence[dt.datetime], optional
-        Explicit monitoring dates for DISCRETE monitoring.
+    Notes
+    -----
+    - ``kw_only=True`` is required: the shared *defaulted* fields below would
+      otherwise precede the subclasses' *required* barrier fields, tripping
+      the "non-default argument follows default argument" rule.  Construction
+      is therefore keyword-only for both subclasses.
+    - Subclasses must call the base initialiser **explicitly**
+      (``_BaseBarrierSpec.__post_init__(self)``) rather than via zero-arg
+      ``super()``.  ``@dataclass(slots=True)`` rebuilds the class object, which
+      detaches the ``__class__`` cell that zero-arg ``super()`` relies on.
+    - ABC + ``is_spot_past_barrier`` as ``@abstractmethod`` keeps the base
+      non-instantiable and forces every concrete spec to define the predicate.
     """
 
     option_type: OptionType
     exercise_type: ExerciseType
     strike: float
     maturity: dt.datetime
-    barrier: float
-    direction: BarrierDirection
     action: BarrierAction
     monitoring: BarrierMonitoring = BarrierMonitoring.CONTINUOUS
     rebate: float = 0.0
@@ -411,29 +387,29 @@ class BarrierSpec:
     monitoring_dates: Sequence[dt.datetime] | None = None
 
     def __post_init__(self) -> None:
-        """Validate barrier option specification."""
+        """Validate and coerce the shared barrier fields.
+
+        Subclasses invoke this explicitly, then validate their own
+        barrier-level fields.
+        """
+        cls_name = type(self).__name__
         validate_naive_datetime(
             self.maturity,
             "maturity",
             type_error_cls=ConfigurationError,
         )
 
-        # --- enum type checks ---
         if not isinstance(self.option_type, OptionType):
             raise ConfigurationError(
                 f"option_type must be OptionType enum, got {type(self.option_type).__name__}"
             )
         if self.option_type not in (OptionType.CALL, OptionType.PUT):
             raise ValidationError(
-                "BarrierSpec.option_type must be OptionType.CALL or OptionType.PUT"
+                f"{cls_name}.option_type must be OptionType.CALL or OptionType.PUT"
             )
         if not isinstance(self.exercise_type, ExerciseType):
             raise ConfigurationError(
                 f"exercise_type must be ExerciseType enum, got {type(self.exercise_type).__name__}"
-            )
-        if not isinstance(self.direction, BarrierDirection):
-            raise ConfigurationError(
-                f"direction must be BarrierDirection enum, got {type(self.direction).__name__}"
             )
         if not isinstance(self.action, BarrierAction):
             raise ConfigurationError(
@@ -451,14 +427,9 @@ class BarrierSpec:
         object.__setattr__(
             self,
             "strike",
-            coerce_positive_float(self.strike, name="BarrierSpec.strike", strict=False),
+            coerce_positive_float(self.strike, name=f"{cls_name}.strike", strict=False),
         )
-        object.__setattr__(
-            self,
-            "barrier",
-            coerce_positive_float(self.barrier, name="BarrierSpec.barrier"),
-        )
-        rebate = coerce_positive_float(self.rebate, name="BarrierSpec.rebate", strict=False)
+        rebate = coerce_positive_float(self.rebate, name=f"{cls_name}.rebate", strict=False)
         object.__setattr__(self, "rebate", rebate)
 
         # Knock-in rebate must be paid at expiry (AT_HIT is contradictory —
@@ -508,6 +479,92 @@ class BarrierSpec:
                     raise ValidationError("monitoring_dates must not extend beyond maturity.")
                 object.__setattr__(self, "monitoring_dates", dates)
 
+    @abstractmethod
+    def is_spot_past_barrier(self, spot: float) -> bool:
+        """Is spot on the dead/active side of the barrier(s)?
+
+        NOT a monitoring-aware "is the option triggered" check: a discretely
+        monitored option can have spot past the barrier at a non-monitoring
+        instant without triggering.
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BarrierSpec(_BaseBarrierSpec):
+    """Contract specification for a single-barrier option.
+
+    Barrier options are path-dependent options that are activated (knock-in) or
+    extinguished (knock-out) when the underlying price reaches a barrier level.
+
+    Shares all non-barrier fields and validation with :class:`_BaseBarrierSpec`.
+    Construction is keyword-only.
+
+    Parameters
+    ----------
+    option_type : OptionType
+        CALL or PUT.
+    exercise_type : ExerciseType
+        EUROPEAN or AMERICAN.
+    strike : float
+        Strike price.
+    maturity : dt.datetime
+        Contract maturity datetime.
+    barrier : float
+        Barrier level that triggers the knock-in or knock-out event.
+    direction : BarrierDirection
+        UP or DOWN — the direction the underlying must move to hit the barrier.
+    action : BarrierAction
+        IN (knock-in) or OUT (knock-out).
+    monitoring : BarrierMonitoring
+        CONTINUOUS (default) or DISCRETE.
+    rebate : float
+        Cash rebate paid to the holder.  For knock-out options the rebate is
+        paid when the barrier is hit (or at expiry, per ``rebate_timing``).
+        For knock-in options the rebate is paid at expiry if the barrier is
+        never hit.  Default 0.0.
+    rebate_timing : RebateTiming
+        AT_HIT (default) or AT_EXPIRY.  Only applicable when ``rebate > 0``
+        and ``action == OUT``.  Knock-in rebates are always paid at expiry.
+    currency : str, optional
+        Currency denomination.
+    contract_size : int | float
+        Contract multiplier (default 100).
+    num_observations : int, optional
+        Number of equally spaced monitoring observations for DISCRETE
+        monitoring.  Generates ``N`` dates at ``t = T/N, 2T/N, ..., T``;
+        the pricing date (``t=0``) is **excluded**, in line with the
+        academic convention used by Broadie-Glasserman-Kou (1997) and
+        Boyle-Tian (1998).  Note this differs from ``AsianSpec``, where
+        ``num_observations`` includes the pricing date as a fixing.  To
+        include the pricing date in a barrier monitoring schedule, pass
+        it explicitly via ``monitoring_dates``.
+    monitoring_dates : Sequence[dt.datetime], optional
+        Explicit monitoring dates for DISCRETE monitoring.
+    """
+
+    barrier: float
+    direction: BarrierDirection
+
+    def __post_init__(self) -> None:
+        """Validate barrier option specification."""
+        # Direction is single-barrier-specific; validate it up front so the
+        # error surfaces before the shared field coercion.
+        if not isinstance(self.direction, BarrierDirection):
+            raise ConfigurationError(
+                f"direction must be BarrierDirection enum, got {type(self.direction).__name__}"
+            )
+
+        # Explicit (not super()): @dataclass(slots=True) rebuilds the class,
+        # detaching the __class__ cell that zero-arg super() relies on.
+        _BaseBarrierSpec.__post_init__(self)
+
+        object.__setattr__(
+            self,
+            "barrier",
+            coerce_positive_float(self.barrier, name="BarrierSpec.barrier"),
+        )
+
     def is_spot_past_barrier(self, spot: float) -> bool:
         """Is spot on the dead/active side of the barrier?
 
@@ -515,15 +572,98 @@ class BarrierSpec:
         barriers return ``True`` when ``spot <= self.barrier``.
 
         Note: this is NOT a monitoring-aware "is the option triggered"
-        check. (i.e. A discrete barrier can have spot past the barrier "
-        "at a non-monitoring date, without triggering the option)."
+        check. (i.e. A discrete barrier can have spot past the barrier
+        at a non-monitoring date, without triggering the option).
         """
         if self.direction is BarrierDirection.UP:
             return spot >= self.barrier
         return spot <= self.barrier
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DoubleBarrierSpec(_BaseBarrierSpec):
+    """Contract specification for a double-barrier option.
+
+    A double-barrier option has a lower and an upper barrier forming a
+    corridor ``(lower_barrier, upper_barrier)``.  A double knock-out is
+    extinguished if *either* barrier is breached; a double knock-in is
+    activated if *either* barrier is breached.  No ``direction`` field is
+    needed — both directions are monitored simultaneously.
+
+    Shares all non-barrier fields and validation with :class:`_BaseBarrierSpec`;
+    differs only in the barrier specification (``lower_barrier`` /
+    ``upper_barrier`` replace the single ``barrier`` / ``direction`` pair).
+    Construction is keyword-only.
+
+    Parameters
+    ----------
+    option_type : OptionType
+        CALL or PUT.
+    exercise_type : ExerciseType
+        EUROPEAN or AMERICAN.
+    strike : float
+        Strike price.
+    maturity : dt.datetime
+        Contract maturity datetime.
+    lower_barrier : float
+        Lower barrier level.  Must be ``> 0`` and ``< upper_barrier``.
+    upper_barrier : float
+        Upper barrier level.  Must be ``> lower_barrier``.
+    action : BarrierAction
+        IN (double knock-in) or OUT (double knock-out).
+    monitoring : BarrierMonitoring
+        CONTINUOUS (default) or DISCRETE.
+    rebate : float
+        Cash rebate paid to the holder.  For knock-out the rebate is paid
+        when either barrier is hit (or at expiry, per ``rebate_timing``).
+        For knock-in the rebate is paid at expiry if neither barrier is ever
+        hit.  Default 0.0.
+    rebate_timing : RebateTiming
+        AT_HIT (default) or AT_EXPIRY.  Only applicable when ``rebate > 0``
+        and ``action == OUT``.  Knock-in rebates are always paid at expiry.
+    currency : str, optional
+        Currency denomination.
+    contract_size : int | float
+        Contract multiplier (default 100).
+    num_observations : int, optional
+        Number of equally spaced monitoring observations for DISCRETE
+        monitoring; the pricing date (``t=0``) is excluded, matching
+        :class:`BarrierSpec`.
+    monitoring_dates : Sequence[dt.datetime], optional
+        Explicit monitoring dates for DISCRETE monitoring.
+    """
+
+    lower_barrier: float
+    upper_barrier: float
+
+    def __post_init__(self) -> None:
+        """Validate double-barrier option specification."""
+        # Explicit (not super()): see _BaseBarrierSpec note on slots + super().
+        _BaseBarrierSpec.__post_init__(self)
+
+        lower = coerce_positive_float(self.lower_barrier, name="DoubleBarrierSpec.lower_barrier")
+        upper = coerce_positive_float(self.upper_barrier, name="DoubleBarrierSpec.upper_barrier")
+        object.__setattr__(self, "lower_barrier", lower)
+        object.__setattr__(self, "upper_barrier", upper)
+        if lower >= upper:
+            raise ValidationError(
+                "DoubleBarrierSpec.lower_barrier must be strictly less than "
+                f"upper_barrier (got lower={lower}, upper={upper})."
+            )
+
+    def is_spot_past_barrier(self, spot: float) -> bool:
+        """Return ``True`` if spot is outside the double-barrier corridor.
+
+        I.e. ``spot <= lower_barrier or spot >= upper_barrier``.  As with
+        :meth:`BarrierSpec.is_spot_past_barrier`, this is NOT a
+        monitoring-aware "is the option triggered" check: a discretely
+        monitored option can have spot outside the corridor at a
+        non-monitoring instant without triggering.
+        """
+        return spot <= self.lower_barrier or spot >= self.upper_barrier
+
+
 # Type alias for any contract spec accepted by ``OptionValuation``.
 # Usable both as an annotation (``spec: OptionSpec``) and at runtime
 # (``isinstance(x, OptionSpec)``)
-OptionSpec = VanillaSpec | PayoffSpec | AsianSpec | BarrierSpec
+OptionSpec = VanillaSpec | PayoffSpec | AsianSpec | BarrierSpec | DoubleBarrierSpec

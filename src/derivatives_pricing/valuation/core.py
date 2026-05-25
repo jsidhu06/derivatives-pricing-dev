@@ -62,7 +62,14 @@ from .barrier_analytical import _AnalyticalBarrierValuation
 from .pde import _FDEuropeanValuation, _FDAmericanValuation, _FDBarrierValuation
 from ..rates import DiscountCurve
 from ..market_environment import MarketData
-from .contracts import AsianSpec, BarrierSpec, OptionSpec, PayoffSpec, VanillaSpec
+from .contracts import (
+    AsianSpec,
+    BarrierSpec,
+    DoubleBarrierSpec,
+    OptionSpec,
+    PayoffSpec,
+    VanillaSpec,
+)
 from .params import BinomialParams, MonteCarloParams, PDEParams, ValuationParams
 
 logger = logging.getLogger(__name__)
@@ -310,8 +317,8 @@ class OptionValuation:
         # Validate spec type
         if not isinstance(spec, OptionSpec):
             raise ConfigurationError(
-                "spec must be a VanillaSpec, PayoffSpec, AsianSpec, or "
-                f"BarrierSpec; got {type(spec).__name__}"
+                "spec must be a VanillaSpec, PayoffSpec, AsianSpec, "
+                f"BarrierSpec, or DoubleBarrierSpec; got {type(spec).__name__}"
             )
 
         # --- store private state ---
@@ -954,6 +961,12 @@ class OptionValuation:
 
     def _build_impl(self):
         spec = self._spec
+
+        if isinstance(spec, DoubleBarrierSpec):
+            # Distinct from BarrierSpec, so it would otherwise fall through to
+            # the vanilla registry and silently mis-price.  Pricing support is
+            # added engine-by-engine; until then, fail loudly.
+            raise UnsupportedFeatureError("Double-barrier option pricing is not yet implemented.")
 
         if isinstance(spec, BarrierSpec):
             impl_cls = _BARRIER_REGISTRY.get((self._pricing_method, spec.exercise_type))
