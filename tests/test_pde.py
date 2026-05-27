@@ -1336,6 +1336,105 @@ def test_pde_fd_barrier_equivalence_american(scenario):
                 assert np.isclose(pv, baseline_by_solver[solver], rtol=0.05)
 
 
+@pytest.mark.slow
+@pytest.mark.parametrize("option_type", [OptionType.CALL, OptionType.PUT], ids=["call", "put"])
+def test_pde_fd_double_barrier_equivalence_american(option_type):
+    """American double knock-out: cross-scheme convergence (no external benchmark).
+
+    Unlike European double barriers (Boyle-Tian / Zvan-Vetzal-Forsyth) and
+    American double knock-in (QuantLib binomial), American double *knock-out*
+    has no usable external reference — QL's binomial is biased low and slow on
+    KO greeks (both barriers truncate the payoff).  So we cross-validate our own
+    FD schemes instead: the CN production default, an IMPLICIT solve, and
+    EXPLICIT_HULL should agree on PV **and** greeks.
+
+    CN and IMPLICIT share the same fine 1200-node corridor grid (only the time
+    scheme differs) so they agree tightly.  EXPLICIT_HULL is stability-capped on
+    the corridor-truncated continuous grid (``dz = corridor/spot_steps`` needs
+    ``λ = dz/(σ√Δt) ≥ 1``), throttling its spatial resolution to
+    ``≈ corridor·√(time_steps)/(σ√T)`` (~105 nodes even at 6000 time steps), so
+    it tracks the CN reference a little less tightly (especially gamma) — but
+    still closely.
+    """
+    spot, strike, sigma, rate, div = 100.0, 100.0, 0.25, 0.05, 0.02
+    lower, upper = 85.0, 120.0
+    ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
+
+    md = MarketData(PRICING_DATE, DiscountCurve.flat(rate), currency="USD")
+    ud = UnderlyingData(
+        initial_value=spot,
+        volatility=sigma,
+        market_data=md,
+        dividend_curve=DiscountCurve.flat(div),
+    )
+    spec = DoubleBarrierSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.AMERICAN,
+        strike=strike,
+        maturity=MATURITY,
+        lower_barrier=lower,
+        upper_barrier=upper,
+        action=BarrierAction.OUT,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+    )
+
+    def greeks(params: PDEParams | None = None) -> dict[str, float]:
+        v = OptionValuation(ud, spec, PricingMethod.PDE_FD, params)
+        return {
+            "pv": float(v.present_value()),
+            "delta": float(v.delta()),
+            "gamma": float(v.gamma()),
+            "theta": float(v.theta()),
+        }
+
+    cn = greeks()  # uses default CN params
+
+    implicit = greeks(
+        PDEParams.for_double_barriers(
+            monitoring=BarrierMonitoring.CONTINUOUS,
+            method=PDEMethod.IMPLICIT,
+            # IMPLICIT is O(Δt) in time vs CN's O(Δt²); a few more steps brings
+            # it closer to CN (GAUSS_SEIDEL PSOR, so kept modest for runtime).
+            time_steps=1600,
+        )
+    )
+    # EXPLICIT_HULL: keep spot_steps one under the corridor stability cap.
+    ex_time_steps = 6000
+    corridor = np.log(upper / lower)
+    ex_spot_steps = int(corridor / (sigma * np.sqrt(ttm / ex_time_steps))) - 1
+    explicit = greeks(
+        PDEParams.for_double_barriers(
+            monitoring=BarrierMonitoring.DISCRETE,  # → EXPLICIT_HULL + INTRINSIC
+            spot_steps=ex_spot_steps,
+            time_steps=ex_time_steps,
+        )
+    )
+
+    for name, g in (("CN", cn), ("IMPLICIT", implicit), ("EXPLICIT_HULL", explicit)):
+        logger.info(
+            "AM DKO %s [%-13s]: pv=%.6f delta=%.6f gamma=%.6f theta=%.6f",
+            option_type.value,
+            name,
+            g["pv"],
+            g["delta"],
+            g["gamma"],
+            g["theta"],
+        )
+
+    # IMPLICIT shares CN's fine spatial grid (only the time scheme differs), so
+    # they agree to ~1e-3 on PV and ~1e-5 on greeks — a tight band.
+    assert np.isclose(implicit["pv"], cn["pv"], rtol=2e-3, atol=5e-4)
+    assert np.isclose(implicit["delta"], cn["delta"], rtol=5e-3, atol=5e-4)
+    assert np.isclose(implicit["gamma"], cn["gamma"], rtol=2e-2, atol=5e-4)
+    assert np.isclose(implicit["theta"], cn["theta"], rtol=2e-2, atol=5e-4)
+    # EXPLICIT_HULL is spatially throttled by stability (~105 corridor nodes vs
+    # CN's 1200), so it tracks a touch less tightly (~0.07% PV) but still close.
+    assert np.isclose(explicit["pv"], cn["pv"], rtol=2e-3, atol=1e-3)
+    assert np.isclose(explicit["delta"], cn["delta"], rtol=1e-2, atol=1e-3)
+    assert np.isclose(explicit["gamma"], cn["gamma"], rtol=5e-2, atol=1e-3)
+    assert np.isclose(explicit["theta"], cn["theta"], rtol=3e-2, atol=1e-3)
+
+
 def test_european_knock_in_grid_gamma_uses_native_surface_parity():
     """European KI grid gamma should follow vanilla-minus-KO parity."""
     r_curve = DiscountCurve.flat(0.05, end_time=1.0)
