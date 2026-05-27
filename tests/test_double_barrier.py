@@ -493,3 +493,100 @@ class TestDoubleBarrierGreeksFrequencyAgainstTian:
             assert np.isclose(value, paper_value, **self._TOLS[greek]), (
                 f"{greek} mismatch for {frequency}: got {value:.4f}, expected {paper_value:.4f}"
             )
+
+
+class TestDoubleBarrierDiscreteDividendAgainstZvan:
+    """European double-KO call with a discrete dividend vs Zvan-Vetzal-Forsyth.
+
+    Setup: S0 = K = 100, sigma = 20%, T = 0.5 yr, r = 10%, q = 0, L = 95,
+    U = 125, plus a single $2 cash dividend at T-t = 0.25 (calendar t = 0.25y).
+    The paper tabulates the European double-KO across monitoring frequencies;
+    weekly uses 25 observations (a week = 5 days of a 250-day year, so
+    T = 0.5y gives 25 weeks).
+
+    Reference PVs (2dp): continuous 1.92, daily 2.32, weekly 2.80.
+    """
+
+    PRICING_DATE = dt.datetime(2025, 1, 1)
+    SPOT = 100.0
+    STRIKE = 100.0
+    SIGMA = 0.20
+    RATE = 0.10
+    LOWER_BARRIER = 95.0
+    UPPER_BARRIER = 125.0
+    T_YEARS = 0.5
+    MATURITY = PRICING_DATE + dt.timedelta(days=T_YEARS * 365)
+    DIV_AMOUNT = 2.0
+    DIV_DATE = PRICING_DATE + dt.timedelta(days=0.25 * 365)  # T-t = 0.25
+
+    assert calculate_year_fraction(PRICING_DATE, MATURITY, DayCountConvention.ACT_365F) == 0.5, (
+        "Paper maturity should be exactly 0.5 years under ACT/365F"
+    )
+    assert calculate_year_fraction(PRICING_DATE, DIV_DATE, DayCountConvention.ACT_365F) == 0.25, (
+        "Dividend should fall at exactly t = 0.25 years (T-t = 0.25)"
+    )
+
+    @classmethod
+    def _underlying(cls) -> UnderlyingData:
+        market = MarketData(
+            cls.PRICING_DATE,
+            DiscountCurve.flat(cls.RATE, 2.0),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+        return UnderlyingData(
+            initial_value=cls.SPOT,
+            volatility=cls.SIGMA,
+            market_data=market,
+            dividend_curve=None,  # the $2 cash dividend is the only payout
+            discrete_dividends=[(cls.DIV_DATE, cls.DIV_AMOUNT)],
+        )
+
+    @classmethod
+    def _double_ko_call_pv(
+        cls, monitoring: BarrierMonitoring, num_observations: int | None = None
+    ) -> float:
+        spec = DoubleBarrierSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=cls.STRIKE,
+            maturity=cls.MATURITY,
+            lower_barrier=cls.LOWER_BARRIER,
+            upper_barrier=cls.UPPER_BARRIER,
+            action=BarrierAction.OUT,
+            monitoring=monitoring,
+            num_observations=num_observations,
+        )
+        valuation = OptionValuation(cls._underlying(), spec, PricingMethod.PDE_FD)
+        return float(valuation.present_value())
+
+    @pytest.mark.parametrize(
+        "frequency,num_observations,paper_pv",
+        [
+            pytest.param("continuous", None, 1.92, id="continuous"),
+            pytest.param("daily", 125, 2.32, id="daily"),
+            pytest.param("weekly", 25, 2.80, id="weekly"),
+        ],
+    )
+    def test_discrete_dividend_double_ko_call_matches_paper(
+        self, frequency: str, num_observations: int | None, paper_pv: float
+    ):
+        """European DKO call with a $2 discrete dividend matches Zvan-Vetzal-Forsyth."""
+        monitoring = (
+            BarrierMonitoring.CONTINUOUS if num_observations is None else BarrierMonitoring.DISCRETE
+        )
+        pv = self._double_ko_call_pv(monitoring, num_observations)
+        logger.info(
+            "ZVF discrete-div DKO freq=%-10s N=%-4s | paper=%.4f dp_fd=%.4f diff=%.4f rel=%.4f%%",
+            frequency,
+            "—" if num_observations is None else num_observations,
+            paper_pv,
+            pv,
+            abs(pv - paper_pv),
+            abs(pv - paper_pv) / paper_pv * 100,
+        )
+        # atol floor (~6e-3) absorbs the paper's 2dp rounding (±0.005); rtol
+        # (0.3%) scales the model residual with the option value.
+        assert np.isclose(pv, paper_pv, rtol=3e-3, atol=6e-3), (
+            f"discrete-div DKO call {frequency}: got {pv:.6f}, expected {paper_pv:.4f}"
+        )

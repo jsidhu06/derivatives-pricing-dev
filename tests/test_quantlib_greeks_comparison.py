@@ -39,6 +39,7 @@ from helpers import (
 from derivatives_pricing.valuation import (
     AsianSpec,
     BarrierSpec,
+    DoubleBarrierSpec,
     VanillaSpec,
     OptionValuation,
     UnderlyingData,
@@ -1544,6 +1545,293 @@ def test_american_barrier_greeks_vs_quantlib(
         rhs_name="QL_BN",
         skip_missing_rhs=True,
         atol=5e-3,
+        logger=None,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Double-barrier Greeks: DP PDE vs QuantLib binomial CRR double-barrier
+# ═══════════════════════════════════════════════════════════════════════
+# QL's AnalyticDoubleBarrierEngine exposes no greeks (delta/gamma/theta all
+# raise), and DP has no analytic/MC/binomial double-barrier engine, so the only
+# greek-bearing reference is QL's BinomialCRRDoubleBarrierEngine — used for both
+# European and American here.  European exercise lets the lattice converge fast
+# (5k steps → greeks agree to ~1e-4); American KO is biased/slow (both barriers
+# truncate the payoff) so it runs at 20k steps, while American KI (smooth post-
+# knock-in vanilla) is fine at 5k.
+
+_QL_DOUBLE_BARRIER_TYPE = {
+    BarrierAction.OUT: ql.DoubleBarrier.KnockOut,
+    BarrierAction.IN: ql.DoubleBarrier.KnockIn,
+}
+
+
+def _dp_double_barrier_greeks(
+    *,
+    exercise_type: ExerciseType,
+    action: BarrierAction,
+    option_type: OptionType,
+    strike: float,
+    lower_barrier: float,
+    upper_barrier: float,
+    r_curve: DiscountCurve | None = None,
+    q_curve: DiscountCurve | None = None,
+    greeks: tuple[str, ...] = _QL_BARRIER_COMPARABLE_GREEKS,
+) -> dict[str, float]:
+    """Compute double-barrier Greeks via DP PDE_FD (the only DP double engine)."""
+    ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
+    rc = r_curve if r_curve is not None else DiscountCurve.flat(_BARRIER_RATE, end_time=ttm)
+    qc = q_curve if q_curve is not None else DiscountCurve.flat(_BARRIER_DIV, end_time=ttm)
+    md = MarketData(PRICING_DATE, rc, currency=CURRENCY)
+    ud = UnderlyingData(
+        initial_value=_BARRIER_SPOT,
+        volatility=_BARRIER_VOL,
+        market_data=md,
+        dividend_curve=qc,
+    )
+    spec = DoubleBarrierSpec(
+        option_type=option_type,
+        exercise_type=exercise_type,
+        strike=strike,
+        maturity=MATURITY,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        action=action,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+    )
+    ov = OptionValuation(ud, spec, PricingMethod.PDE_FD)
+    return _dp_barrier_greeks_from_valuation(ov, greeks=greeks)
+
+
+def _ql_double_barrier_option(
+    *,
+    exercise_type: ExerciseType,
+    action: BarrierAction,
+    option_type: OptionType,
+    strike: float,
+    lower_barrier: float,
+    upper_barrier: float,
+    binom_steps: int,
+    r_curve: DiscountCurve | None = None,
+    q_curve: DiscountCurve | None = None,
+) -> "ql_typing.DoubleBarrierOption":
+    """Build a QL double-barrier option on the binomial CRR engine (greeks-bearing)."""
+    eval_date = ql.Date(PRICING_DATE.day, PRICING_DATE.month, PRICING_DATE.year)
+    ql.Settings.instance().evaluationDate = eval_date
+    ql_dc = ql.Actual365Fixed()
+    maturity_ql = ql.Date(MATURITY.day, MATURITY.month, MATURITY.year)
+    ql_type = ql.Option.Put if option_type is OptionType.PUT else ql.Option.Call
+    rf = (
+        _ql_curve_handle_from_discount_curve(r_curve, eval_date=eval_date)
+        if r_curve is not None
+        else ql.YieldTermStructureHandle(ql.FlatForward(eval_date, _BARRIER_RATE, ql_dc))
+    )
+    dv = (
+        _ql_curve_handle_from_discount_curve(q_curve, eval_date=eval_date)
+        if q_curve is not None
+        else ql.YieldTermStructureHandle(ql.FlatForward(eval_date, _BARRIER_DIV, ql_dc))
+    )
+    vl = ql.BlackVolTermStructureHandle(
+        ql.BlackConstantVol(eval_date, ql.TARGET(), _BARRIER_VOL, ql_dc)
+    )
+    pr = ql.BlackScholesMertonProcess(ql.QuoteHandle(ql.SimpleQuote(_BARRIER_SPOT)), dv, rf, vl)
+    payoff = ql.PlainVanillaPayoff(ql_type, strike)
+    if exercise_type is ExerciseType.AMERICAN:
+        exercise = ql.AmericanExercise(eval_date, maturity_ql)
+    else:
+        exercise = ql.EuropeanExercise(maturity_ql)
+    opt = ql.DoubleBarrierOption(
+        _QL_DOUBLE_BARRIER_TYPE[action], lower_barrier, upper_barrier, 0.0, payoff, exercise
+    )
+    opt.setPricingEngine(ql.BinomialCRRDoubleBarrierEngine(pr, binom_steps))
+    return opt
+
+
+_DOUBLE_BARRIER_GREEK_SCENARIOS = [
+    # Flat curves
+    pytest.param(
+        BarrierAction.OUT, OptionType.CALL, 100.0, 85.0, 120.0, None, None, id="dko_call_flat"
+    ),
+    pytest.param(
+        BarrierAction.OUT, OptionType.PUT, 100.0, 85.0, 120.0, None, None, id="dko_put_flat"
+    ),
+    pytest.param(
+        BarrierAction.IN, OptionType.CALL, 105.0, 80.0, 120.0, None, None, id="dki_call_flat"
+    ),
+    pytest.param(
+        BarrierAction.IN, OptionType.PUT, 100.0, 85.0, 120.0, None, None, id="dki_put_flat"
+    ),
+    # Non-flat curves (QL binomial threads the term structure, like our PDE)
+    pytest.param(
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        125.0,
+        *_barrier_nonflat_curves(),
+        id="dko_call_nonflat",
+    ),
+    pytest.param(
+        BarrierAction.IN,
+        OptionType.PUT,
+        100.0,
+        82.0,
+        125.0,
+        *_barrier_nonflat_curves(),
+        id="dki_put_nonflat",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "action,option_type,strike,lower_barrier,upper_barrier,r_curve,q_curve",
+    _DOUBLE_BARRIER_GREEK_SCENARIOS,
+)
+def test_double_barrier_greeks_european_vs_quantlib(
+    action, option_type, strike, lower_barrier, upper_barrier, r_curve, q_curve
+):
+    """European double-barrier Greeks: DP PDE_FD vs QL binomial CRR (native greeks).
+
+    European exercise → the lattice converges fast, so a 5k-step tree matches
+    our PDE grid greeks to ~1e-4.  QL binomial threads the term structure, so
+    the non-flat scenarios are a native comparison (no flat-equivalent gap).
+    """
+    dp_pde = _dp_double_barrier_greeks(
+        exercise_type=ExerciseType.EUROPEAN,
+        action=action,
+        option_type=option_type,
+        strike=strike,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        r_curve=r_curve,
+        q_curve=q_curve,
+    )
+    ql_ref = _ql_scaled_greeks(
+        _ql_double_barrier_option(
+            exercise_type=ExerciseType.EUROPEAN,
+            action=action,
+            option_type=option_type,
+            strike=strike,
+            lower_barrier=lower_barrier,
+            upper_barrier=upper_barrier,
+            binom_steps=5_000,
+            r_curve=r_curve,
+            q_curve=q_curve,
+        ),
+        allow_missing=True,
+    )
+
+    for greek in ("delta", "gamma", "theta"):
+        logger.info(
+            "European double-barrier %s %s %s K=%.0f L=%.0f U=%.0f | DP_PDE=%s QL_BN=%s",
+            action.value,
+            option_type.value,
+            greek,
+            strike,
+            lower_barrier,
+            upper_barrier,
+            _fmt_greek_value(dp_pde[greek]),
+            _fmt_greek_value(ql_ref[greek]),
+        )
+
+    # Flat curves: both engines converge to the same constant-rate greeks, so
+    # agreement is ~1e-5 — a tight band.  Non-flat: QL bakes the term structure
+    # into the CRR tree while our PDE uses per-step forward rates; the small
+    # residual is absolute on these near-zero greeks, so it keeps a wider
+    # absolute band (the rtols don't bind there).
+    if r_curve is None:
+        tols = {"delta": 5e-3, "gamma": 1e-2, "theta": 1e-2}
+        atol = 2e-4
+    else:
+        tols = {"delta": 1e-2, "gamma": 2e-2, "theta": 2e-2}
+        atol = 3e-3
+    assert_greeks_close(
+        lhs=dp_pde,
+        rhs=ql_ref,
+        tols=tols,
+        log_prefix=(
+            f"DoubleBarrier EU PDE {action.value} {option_type.value} "
+            f"K={strike:.0f} L={lower_barrier:.0f} U={upper_barrier:.0f}"
+        ),
+        lhs_name="DP_PDE",
+        rhs_name="QL_BN",
+        skip_missing_rhs=True,
+        atol=atol,
+        logger=None,
+    )
+
+
+# American double knock-IN only.  We deliberately exclude American KO here because
+# of limitations of the binomial CRR double-barrier engine when a barrier truncates
+# the payoff profile. American KO *PV* is still cross-checked, with a wide(r) band,
+#  in test_quantlib_comparison.py.)  KI has a smooth post-knock-in vanilla-American
+# surface, so the lattice converges fast and is a clean reference.
+_DOUBLE_BARRIER_AMERICAN_GREEK_SCENARIOS = [
+    pytest.param(OptionType.CALL, 100.0, 90.0, 130.0, id="am_dki_call"),
+    pytest.param(OptionType.PUT, 95.0, 80.0, 125.0, id="am_dki_put"),
+]
+
+
+@pytest.mark.parametrize(
+    "option_type,strike,lower_barrier,upper_barrier",
+    _DOUBLE_BARRIER_AMERICAN_GREEK_SCENARIOS,
+)
+def test_double_barrier_greeks_american_ki_vs_quantlib(
+    option_type, strike, lower_barrier, upper_barrier
+):
+    """American double knock-IN Greeks: DP PDE_FD vs QL binomial CRR (native greeks).
+
+    Flat curves only (QL's American double-barrier support is binomial).  The
+    post-knock-in surface is a smooth vanilla American, so the 5k-step lattice
+    converges fast and matches our PDE grid greeks near-exactly (~1e-5).  KO is
+    excluded — see the note above the scenario list.
+    """
+    dp_pde = _dp_double_barrier_greeks(
+        exercise_type=ExerciseType.AMERICAN,
+        action=BarrierAction.IN,
+        option_type=option_type,
+        strike=strike,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+    )
+    ql_ref = _ql_scaled_greeks(
+        _ql_double_barrier_option(
+            exercise_type=ExerciseType.AMERICAN,
+            action=BarrierAction.IN,
+            option_type=option_type,
+            strike=strike,
+            lower_barrier=lower_barrier,
+            upper_barrier=upper_barrier,
+            binom_steps=5_000,
+        ),
+        allow_missing=True,
+    )
+
+    for greek in ("delta", "gamma", "theta"):
+        logger.info(
+            "American double-KI %s %s K=%.0f L=%.0f U=%.0f | DP_PDE=%s QL_BN=%s",
+            option_type.value,
+            greek,
+            strike,
+            lower_barrier,
+            upper_barrier,
+            _fmt_greek_value(dp_pde[greek]),
+            _fmt_greek_value(ql_ref[greek]),
+        )
+
+    # KI is near-exact at 5k steps (~1e-5), so a tight band is justified.
+    assert_greeks_close(
+        lhs=dp_pde,
+        rhs=ql_ref,
+        tols={"delta": 1e-3, "gamma": 2e-3, "theta": 2e-3},
+        log_prefix=(
+            f"DoubleBarrier AM-KI PDE {option_type.value} "
+            f"K={strike:.0f} L={lower_barrier:.0f} U={upper_barrier:.0f}"
+        ),
+        lhs_name="DP_PDE",
+        rhs_name="QL_BN",
+        skip_missing_rhs=True,
+        atol=5e-4,
         logger=None,
     )
 

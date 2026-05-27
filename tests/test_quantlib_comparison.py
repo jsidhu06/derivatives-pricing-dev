@@ -2090,6 +2090,8 @@ def _dp_double_barrier_pde_price(
     lower_barrier: float,
     upper_barrier: float,
     exercise_type: ExerciseType = ExerciseType.EUROPEAN,
+    rebate: float = 0.0,
+    rebate_timing: RebateTiming = RebateTiming.AT_EXPIRY,
     r_curve: DiscountCurve | None = None,
     q_curve: DiscountCurve | None = None,
 ) -> float:
@@ -2103,6 +2105,8 @@ def _dp_double_barrier_pde_price(
         upper_barrier=upper_barrier,
         action=action,
         monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
     )
     return _dp_price(ud, spec, PricingMethod.PDE_FD)
 
@@ -2850,16 +2854,24 @@ def test_barrier_american_ki_vs_quantlib(
 # smooth post-knock-in vanilla American, so QL converges to <0.05% by ~5k steps.
 
 
-def _ql_double_barrier_american_price(
+def _ql_double_barrier_binomial_price(
     *,
     action: BarrierAction,
     option_type: OptionType,
     strike: float,
     lower_barrier: float,
     upper_barrier: float,
+    exercise_type: ExerciseType,
+    rebate: float = 0.0,
     binom_steps: int,
 ) -> float:
-    """American double barrier via QL BinomialCRRDoubleBarrierEngine (flat curves)."""
+    """Double barrier via QL BinomialCRRDoubleBarrierEngine (flat curves).
+
+    Unlike ``AnalyticDoubleBarrierEngine`` (which silently ignores the rebate),
+    the binomial engine honours it — KO pays at hit, KI pays at expiry — which
+    matches our ``RebateTiming.AT_HIT`` (KO) / ``AT_EXPIRY`` (KI) conventions.
+    Also the only QL double-barrier engine supporting American exercise.
+    """
     eval_date = ql.Date(PRICING_DATE.day, PRICING_DATE.month, PRICING_DATE.year)
     ql.Settings.instance().evaluationDate = eval_date
     ql_dc = ql.Actual365Fixed()
@@ -2874,9 +2886,12 @@ def _ql_double_barrier_american_price(
     ql_type = ql.Option.Put if option_type is OptionType.PUT else ql.Option.Call
     payoff = ql.PlainVanillaPayoff(ql_type, strike)
     ql_maturity = ql.Date(_BARRIER_MATURITY.day, _BARRIER_MATURITY.month, _BARRIER_MATURITY.year)
-    exercise = ql.AmericanExercise(eval_date, ql_maturity)
+    if exercise_type is ExerciseType.AMERICAN:
+        exercise = ql.AmericanExercise(eval_date, ql_maturity)
+    else:
+        exercise = ql.EuropeanExercise(ql_maturity)
     opt = ql.DoubleBarrierOption(
-        _QL_DOUBLE_BARRIER_TYPE[action], lower_barrier, upper_barrier, 0.0, payoff, exercise
+        _QL_DOUBLE_BARRIER_TYPE[action], lower_barrier, upper_barrier, rebate, payoff, exercise
     )
     opt.setPricingEngine(ql.BinomialCRRDoubleBarrierEngine(proc, binom_steps))
     return opt.NPV()
@@ -2910,12 +2925,13 @@ def test_double_barrier_american_ko_vs_quantlib(option_type, strike, lower_barri
         upper_barrier=upper_barrier,
         exercise_type=ExerciseType.AMERICAN,
     )
-    ql_bn = _ql_double_barrier_american_price(
+    ql_bn = _ql_double_barrier_binomial_price(
         action=BarrierAction.OUT,
         option_type=option_type,
         strike=strike,
         lower_barrier=lower_barrier,
         upper_barrier=upper_barrier,
+        exercise_type=ExerciseType.AMERICAN,
         binom_steps=20_000,
     )
     logger.info(
@@ -2960,12 +2976,13 @@ def test_double_barrier_american_ki_vs_quantlib(option_type, strike, lower_barri
         upper_barrier=upper_barrier,
         exercise_type=ExerciseType.AMERICAN,
     )
-    ql_bn = _ql_double_barrier_american_price(
+    ql_bn = _ql_double_barrier_binomial_price(
         action=BarrierAction.IN,
         option_type=option_type,
         strike=strike,
         lower_barrier=lower_barrier,
         upper_barrier=upper_barrier,
+        exercise_type=ExerciseType.AMERICAN,
         binom_steps=5_000,
     )
     logger.info(
@@ -2979,6 +2996,113 @@ def test_double_barrier_american_ki_vs_quantlib(option_type, strike, lower_barri
         abs(dp_pde - ql_bn) / dp_pde * 100.0,
     )
     assert np.isclose(dp_pde, ql_bn, rtol=5e-3, atol=1e-3), (
+        f"DP_PDE {dp_pde:.6f} vs QL_BN {ql_bn:.6f}"
+    )
+
+
+# ── European double barrier rebates: DP PDE vs QL binomial CRR ────────────
+# NOTE: QuantLib's AnalyticDoubleBarrierEngine silently *ignores* the rebate
+# argument (rebate=0 and rebate=3 return identical NPVs), so — unlike the
+# single-barrier rebate test, which uses the analytic engine — the
+# QL reference here is the binomial CRR double-barrier engine, which honours
+# the rebate.  Its convention matches ours: KO pays at hit, KI pays at expiry,
+# so we pair AT_HIT with KO and AT_EXPIRY with KI.  European exercise lets the
+# lattice converge fast, so a 5k-step tree agrees to <0.02%.
+
+_DOUBLE_BARRIER_REBATE_SCENARIOS = [
+    # KO → rebate paid AT_HIT
+    pytest.param(
+        BarrierAction.OUT,
+        OptionType.CALL,
+        100.0,
+        90.0,
+        120.0,
+        3.0,
+        RebateTiming.AT_HIT,
+        id="dko_call_rebate_hit",
+    ),
+    pytest.param(
+        BarrierAction.OUT,
+        OptionType.PUT,
+        100.0,
+        85.0,
+        120.0,
+        3.0,
+        RebateTiming.AT_HIT,
+        id="dko_put_rebate_hit",
+    ),
+    # KI → rebate paid AT_EXPIRY (if never knocked in)
+    pytest.param(
+        BarrierAction.IN,
+        OptionType.CALL,
+        100.0,
+        85.0,
+        120.0,
+        3.0,
+        RebateTiming.AT_EXPIRY,
+        id="dki_call_rebate_expiry",
+    ),
+    pytest.param(
+        BarrierAction.IN,
+        OptionType.PUT,
+        95.0,
+        82.0,
+        125.0,
+        2.0,
+        RebateTiming.AT_EXPIRY,
+        id="dki_put_rebate_expiry",
+    ),
+]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "action,option_type,strike,lower_barrier,upper_barrier,rebate,rebate_timing",
+    _DOUBLE_BARRIER_REBATE_SCENARIOS,
+)
+def test_double_barrier_rebate_european_vs_quantlib(
+    action, option_type, strike, lower_barrier, upper_barrier, rebate, rebate_timing
+):
+    """European double-barrier rebate (continuous): DP PDE_FD vs QL binomial CRR.
+
+    QL's analytic double-barrier engine ignores rebates, so we compare against
+    the binomial CRR engine (which honours them, with KO-at-hit / KI-at-expiry
+    matching our conventions).  dp PDE has no MC/binomial double-barrier support
+    to cross-check against, so PDE_FD vs QL binomial is the sole comparison.
+    """
+    dp_pde = _dp_double_barrier_pde_price(
+        action=action,
+        option_type=option_type,
+        strike=strike,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        exercise_type=ExerciseType.EUROPEAN,
+        rebate=rebate,
+        rebate_timing=rebate_timing,
+    )
+    ql_bn = _ql_double_barrier_binomial_price(
+        action=action,
+        option_type=option_type,
+        strike=strike,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        exercise_type=ExerciseType.EUROPEAN,
+        rebate=rebate,
+        binom_steps=5_000,
+    )
+    logger.info(
+        "DoubleBarrier rebate %s %s K=%.0f L=%.0f U=%.0f R=%.1f %s | DP_PDE=%.6f QL_BN=%.6f",
+        action.value,
+        option_type.value,
+        strike,
+        lower_barrier,
+        upper_barrier,
+        rebate,
+        rebate_timing.value,
+        dp_pde,
+        ql_bn,
+    )
+    assert np.isclose(dp_pde, ql_bn, rtol=3e-3, atol=1e-3), (
         f"DP_PDE {dp_pde:.6f} vs QL_BN {ql_bn:.6f}"
     )
 
