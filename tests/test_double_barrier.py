@@ -41,7 +41,6 @@ from derivatives_pricing.market_environment import MarketData
 from derivatives_pricing.rates import DiscountCurve
 from derivatives_pricing.valuation import OptionValuation, UnderlyingData
 from derivatives_pricing.valuation.contracts import DoubleBarrierSpec
-from derivatives_pricing.valuation.params import PDEParams
 from derivatives_pricing.utils import calculate_year_fraction
 
 logger = logging.getLogger(__name__)
@@ -390,11 +389,14 @@ class TestDoubleBarrierGreeksFrequencyAgainstTian:
     PDE_FD prices double barriers; its grid Greeks come from the same backward
     solve.  The paper reports annualized theta, so the comparison scales by 365.
 
-    Discrete-monitoring theta is the most resolution-sensitive figure (the
-    knock-out resets inject a fresh discontinuity at every observation date),
-    so this test runs at a finer grid than the engine's discrete default; at
-    ``spot_steps=2000, time_steps=6000`` every Greek tracks the paper to within
-    ~2e-4 (delta/gamma) / ~5e-3 (annualized theta).
+    No params are passed: the test relies on the engine's **default** params
+    for double barriers (``PDEParams.for_double_barriers``), which lifts the
+    discrete grid to ``spot_steps=2000, time_steps=6000``.  This doubles as a
+    check that the default delivers paper-grade greeks without the caller
+    tuning the grid — discrete-monitoring theta is the most resolution-
+    sensitive figure (the knock-out resets inject a fresh discontinuity at
+    every observation date), and on the default every Greek tracks the paper to
+    within ~2e-4 (delta/gamma) / ~5e-3 (annualized theta).
     """
 
     PRICING_DATE = dt.datetime(2025, 1, 1)
@@ -406,9 +408,6 @@ class TestDoubleBarrierGreeksFrequencyAgainstTian:
     UPPER_BARRIER = 140.0
     T_YEARS = 0.5
     MATURITY = PRICING_DATE + dt.timedelta(days=T_YEARS * 365)
-
-    SPOT_STEPS = 2000
-    TIME_STEPS = 6000
 
     # frequency → (monitoring_kind, (delta, gamma, theta_annualized)).
     # monitoring_kind: "continuous" or N obs scaled by T = 0.5 yr.
@@ -463,12 +462,9 @@ class TestDoubleBarrierGreeksFrequencyAgainstTian:
             monitoring=monitoring,
             num_observations=num_observations,
         )
-        params = PDEParams.for_barriers(
-            monitoring=monitoring,
-            spot_steps=cls.SPOT_STEPS,
-            time_steps=cls.TIME_STEPS,
-        )
-        valuation = OptionValuation(cls._underlying(), spec, PricingMethod.PDE_FD, params)
+        # No explicit params → engine resolves PDEParams.for_double_barriers,
+        # i.e. the production default for double-barrier discrete monitoring.
+        valuation = OptionValuation(cls._underlying(), spec, PricingMethod.PDE_FD)
         # delta/gamma/theta all read from the one cached backward solve.
         return {
             "delta": float(valuation.delta()),

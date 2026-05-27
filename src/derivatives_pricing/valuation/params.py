@@ -296,6 +296,41 @@ class PDEParams:
 
         return dc_replace(defaults, **overrides) if overrides else defaults
 
+    @classmethod
+    def for_double_barriers(
+        cls,
+        *,
+        monitoring: BarrierMonitoring,
+        **overrides: Any,
+    ) -> PDEParams:
+        """Create PDE params tuned for *double*-barrier pricing.
+
+        Same scheme selection as :meth:`for_barriers` (CRANK_NICOLSON for
+        continuous, EXPLICIT_HULL for discrete), but with a finer default grid
+        for **discrete** monitoring.  A discretely-monitored double barrier
+        injects a knock-out reset at *both* barriers on every observation date,
+        so the value surface carries fresh discontinuities at each end of the
+        corridor; theta in particular needs more spatial/temporal resolution
+        than the single-barrier discrete default to settle.  ``spot_steps`` and
+        ``time_steps`` are therefore lifted (1200x3000 -> 2000x6000), which on
+        the ``EXPLICIT_HULL`` scheme is still cheap (a single vectorised
+        matrix-vector multiply per step, no PSOR iteration).
+
+        For **continuous** monitoring the corridor-truncated Crank-Nicolson grid
+        already resolves PVs and greeks to ~1e-4 on the ``for_barriers``
+        defaults (all ``spot_steps`` sit inside the corridor), so this method
+        deliberately falls through to identical params there.
+
+        Any keyword accepted by the constructor overrides the chosen defaults.
+        """
+        richer = (
+            dict(spot_steps=2000, time_steps=6000)
+            if monitoring is BarrierMonitoring.DISCRETE
+            else {}
+        )
+        merged = {**richer, **overrides}  # explicit overrides win over the bump
+        return cls.for_barriers(monitoring=monitoring, **merged)
+
     def __post_init__(self) -> None:
         for name in ("spot_steps", "time_steps", "max_iter", "rannacher_steps"):
             if type(getattr(self, name)) is not int:

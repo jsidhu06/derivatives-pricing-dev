@@ -1031,6 +1031,10 @@ class OptionValuation:
                     return BinomialParams(num_steps=num_steps)
                 return BinomialParams()
             if pricing_method is PricingMethod.PDE_FD:
+                # DoubleBarrierSpec subclasses _BaseBarrierSpec, so check it
+                # first — discrete double barriers want a finer default grid.
+                if isinstance(spec, DoubleBarrierSpec):
+                    return PDEParams.for_double_barriers(monitoring=spec.monitoring)
                 if isinstance(spec, _BaseBarrierSpec):
                     return PDEParams.for_barriers(monitoring=spec.monitoring)
                 return PDEParams()
