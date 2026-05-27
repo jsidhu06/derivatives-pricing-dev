@@ -3864,6 +3864,17 @@ class _FDDoubleBarrierValuation(_FDGridGreeksMixin):
         self.pde_params = valuation_ctx.params
         self._solve_result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float] | None = None
         self._solve_lock = threading.RLock()
+        # Cached (double-KO, vanilla) component solves for European DKI parity.
+        # Greeks read each surface natively (V_van greek − V_KO greek) so they
+        # are not corrupted by interpolating one surface onto the other's grid.
+        self._dki_components_result: (
+            tuple[
+                tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+                tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+            ]
+            | None
+        ) = None
+        self._dki_components_lock = threading.RLock()
 
     def _is_european_ki(self) -> bool:
         spec = self._spec
@@ -3959,6 +3970,68 @@ class _FDDoubleBarrierValuation(_FDGridGreeksMixin):
         )
         return ko_result, van_result
 
+    def _european_dki_components(
+        self,
+    ) -> tuple[
+        tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+        tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+    ]:
+        """Memoised (double-KO, vanilla) solves for European DKI parity.
+
+        Shared by ``_compute_solve`` (PV) and the native-surface greek
+        overrides, so the two component solves run once per instance.
+        """
+        if self._dki_components_result is not None:
+            return self._dki_components_result
+        with self._dki_components_lock:
+            if self._dki_components_result is not None:
+                return self._dki_components_result
+            self._dki_components_result = self._compute_european_dki_components()
+            return self._dki_components_result
+
+    @staticmethod
+    def _grid_delta_from_result(
+        result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+        spot: float,
+    ) -> float:
+        _, S, V, _, _ = result
+        j = _FDGridGreeksMixin._spot_grid_index(S, spot)
+        return _FDGridGreeksMixin._grid_delta_at_spot(S, V, j, spot)
+
+    @staticmethod
+    def _grid_gamma_from_result(
+        result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+        spot: float,
+    ) -> float:
+        _, S, V, _, _ = result
+        j = _FDGridGreeksMixin._spot_grid_index(S, spot)
+        return _FDGridGreeksMixin._grid_gamma_safe(S, V, j, spot)
+
+    def _grid_theta_from_result(
+        self,
+        result: tuple[float, np.ndarray, np.ndarray, np.ndarray, float],
+        spot: float,
+    ) -> float:
+        _, S, V, _, last_dtau = result
+        if last_dtau <= 0.0:
+            return 0.0
+        j = _FDGridGreeksMixin._spot_grid_index(S, spot)
+        return self._grid_theta_bs_identity(S, V, j, spot, last_dtau)
+
+    def _discounted_rebate_theta(self, last_dtau: float) -> float:
+        """Per-day theta of the AT_EXPIRY rebate leg ``R·df(0,T)`` (0 otherwise)."""
+        if (
+            self._spec.rebate <= 0.0
+            or self._spec.rebate_timing is not RebateTiming.AT_EXPIRY
+            or last_dtau <= 0.0
+        ):
+            return 0.0
+        ttm = self.valuation_ctx._maturity_year_fraction()
+        dc = self.valuation_ctx.discount_curve
+        current = float(self._spec.rebate) * float(dc.df(ttm))
+        previous = float(self._spec.rebate) * float(dc.df(max(ttm - last_dtau, 0.0)))
+        return float((previous - current) / last_dtau / 365.0)
+
     def _compute_solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         spec = self._spec
         if spec.action is BarrierAction.OUT:
@@ -3970,7 +4043,7 @@ class _FDDoubleBarrierValuation(_FDGridGreeksMixin):
             return _fd_double_barrier_ki_core(**self._base_solve_args())
 
         # European double knock-in via parity: V_DKI = V_vanilla + R·df_T - V_DKO.
-        ko_result, van_result = self._compute_european_dki_components()
+        ko_result, van_result = self._european_dki_components()
         ko_price, S_ko, V_ko, V_ko_prev, last_dtau_ko = ko_result
         van_price, S_van, V_van, V_van_prev, _ = van_result
 
@@ -4011,6 +4084,17 @@ class _FDDoubleBarrierValuation(_FDGridGreeksMixin):
             if self._spec.action is BarrierAction.IN:
                 return self.valuation_ctx._vanilla_equivalent_valuation().delta()
             return 0.0
+
+        if self._is_european_ki():
+            # Native-surface parity: differentiate each surface on its own grid
+            # (V_van − V_DKO), avoiding the curvature loss of interpolating one
+            # onto the other's grid.
+            ko_result, van_result = self._european_dki_components()
+            spot = float(self.underlying.initial_value)
+            return self._grid_delta_from_result(van_result, spot) - self._grid_delta_from_result(
+                ko_result, spot
+            )
+
         return super().delta()
 
     def gamma(self) -> float:
@@ -4018,6 +4102,14 @@ class _FDDoubleBarrierValuation(_FDGridGreeksMixin):
             if self._spec.action is BarrierAction.IN:
                 return self.valuation_ctx._vanilla_equivalent_valuation().gamma()
             return 0.0
+
+        if self._is_european_ki():
+            ko_result, van_result = self._european_dki_components()
+            spot = float(self.underlying.initial_value)
+            return self._grid_gamma_from_result(van_result, spot) - self._grid_gamma_from_result(
+                ko_result, spot
+            )
+
         return super().gamma()
 
     def theta(self) -> float:
@@ -4035,6 +4127,16 @@ class _FDDoubleBarrierValuation(_FDGridGreeksMixin):
                 previous = float(self._spec.rebate) * float(dc.df(max(ttm - last_dtau, 0.0)))
                 return float((previous - current) / last_dtau / 365.0)
             return 0.0
+
+        if self._is_european_ki():
+            # V_DKI theta = V_van theta + rebate-leg theta − V_DKO theta.
+            ko_result, van_result = self._european_dki_components()
+            spot = float(self.underlying.initial_value)
+            van_theta = self._grid_theta_from_result(van_result, spot)
+            ko_theta = self._grid_theta_from_result(ko_result, spot)
+            rebate_theta = self._discounted_rebate_theta(ko_result[-1])
+            return van_theta + rebate_theta - ko_theta
+
         return super().theta()
 
     def _last_dtau(self) -> float:

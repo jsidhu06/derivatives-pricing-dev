@@ -1184,6 +1184,110 @@ def test_pde_fd_barrier_european_ki_facade_vs_direct_core_greeks(
     assert np.isclose(facade_theta, direct_theta, rtol=0.01, atol=1e-3)
 
 
+@pytest.mark.parametrize(
+    "option_type,spot,strike,lower_barrier,upper_barrier,rebate",
+    [
+        pytest.param(OptionType.CALL, 100.0, 100.0, 85.0, 120.0, 0.0, id="dki_call_no_rebate"),
+        pytest.param(OptionType.PUT, 100.0, 100.0, 85.0, 120.0, 0.0, id="dki_put_no_rebate"),
+        pytest.param(OptionType.CALL, 100.0, 95.0, 82.0, 125.0, 2.0, id="dki_call_rebate"),
+        pytest.param(OptionType.PUT, 100.0, 105.0, 82.0, 125.0, 2.0, id="dki_put_rebate"),
+    ],
+)
+def test_pde_fd_double_barrier_european_ki_facade_vs_direct_core_greeks(
+    option_type: OptionType,
+    spot: float,
+    strike: float,
+    lower_barrier: float,
+    upper_barrier: float,
+    rebate: float,
+):
+    """European double-KI facade (parity) and direct two-surface core agree on PV + greeks.
+
+    The double-barrier analogue of
+    ``test_pde_fd_barrier_european_ki_facade_vs_direct_core_greeks``.  The
+    facade path prices European double knock-in via in-out parity
+    (``V_DKI = V_vanilla + R·df_T − V_DKO``) and reads grid greeks off the
+    reconstructed KI surface on the KO corridor grid.  The direct path calls
+    ``_fd_double_barrier_ki_core(early_exercise=False)`` — the same two-surface
+    coupled solver used for American double-KI, with exercise disabled — and
+    reads grid greeks off its (full-domain) grid.  Both solve the same problem
+    via different numerics, so PV and grid greeks should agree to within
+    grid-refinement error.
+    """
+    curve_r = DiscountCurve.flat(0.05, 2)
+    curve_q = DiscountCurve.flat(0.02, 2)
+    pricing_date = dt.datetime(2025, 1, 1)
+    maturity = dt.datetime(2025, 12, 31)
+
+    md = MarketData(pricing_date, curve_r, currency="USD")
+    ud = UnderlyingData(
+        initial_value=spot,
+        volatility=0.25,
+        market_data=md,
+        dividend_curve=curve_q,
+    )
+    spec = DoubleBarrierSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=strike,
+        maturity=maturity,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        action=BarrierAction.IN,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+        rebate=rebate,
+        rebate_timing=RebateTiming.AT_EXPIRY,
+    )
+    params = PDEParams(
+        spot_steps=800,
+        time_steps=800,
+        method=PDEMethod.CRANK_NICOLSON,
+        space_grid=PDESpaceGrid.LOG_SPOT,
+        rannacher_steps=2,
+    )
+
+    # Facade (parity) path.
+    valuation = OptionValuation(ud, spec, PricingMethod.PDE_FD, params=params)
+    facade_pv = valuation.present_value()
+    facade_delta = valuation.delta()
+    facade_gamma = valuation.gamma()
+    facade_theta = valuation.theta()
+
+    # Direct two-surface core path (early_exercise=False).
+    impl = _FDDoubleBarrierValuation(valuation)
+    direct_result = _fd_double_barrier_ki_core(**impl._base_solve_args())
+    _, S, V, _, last_dtau = direct_result
+    direct_pv = float(direct_result[0])
+    j = impl._spot_grid_index(S, spot)
+    direct_delta = impl._grid_delta_at_spot(S, V, j, spot)
+    direct_gamma = impl._grid_gamma_safe(S, V, j, spot)
+    direct_theta = impl._grid_theta_bs_identity(S, V, j, spot, last_dtau)
+
+    logger.info(
+        "DoubleKI facade-vs-direct [%s K=%g L=%g U=%g rebate=%g]: "
+        "PV parity=%.6f direct=%.6f | Δ parity=%.6f direct=%.6f | "
+        "Γ parity=%.6f direct=%.6f | Θ parity=%.6f direct=%.6f",
+        option_type.value,
+        strike,
+        lower_barrier,
+        upper_barrier,
+        rebate,
+        facade_pv,
+        direct_pv,
+        facade_delta,
+        direct_delta,
+        facade_gamma,
+        direct_gamma,
+        facade_theta,
+        direct_theta,
+    )
+
+    assert np.isclose(facade_pv, direct_pv, rtol=0.005, atol=1e-3)
+    assert np.isclose(facade_delta, direct_delta, rtol=0.01, atol=1e-3)
+    assert np.isclose(facade_gamma, direct_gamma, rtol=0.02, atol=1e-3)
+    assert np.isclose(facade_theta, direct_theta, rtol=0.02, atol=1e-3)
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize("scenario", _AMERICAN_BARRIER_SCENARIOS)
 def test_pde_fd_barrier_equivalence_american(scenario):

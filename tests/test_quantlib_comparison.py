@@ -2089,13 +2089,14 @@ def _dp_double_barrier_pde_price(
     strike: float,
     lower_barrier: float,
     upper_barrier: float,
+    exercise_type: ExerciseType = ExerciseType.EUROPEAN,
     r_curve: DiscountCurve | None = None,
     q_curve: DiscountCurve | None = None,
 ) -> float:
     ud = _barrier_underlying_data(r_curve=r_curve, q_curve=q_curve)
     spec = DoubleBarrierSpec(
         option_type=option_type,
-        exercise_type=ExerciseType.EUROPEAN,
+        exercise_type=exercise_type,
         strike=strike,
         maturity=_BARRIER_MATURITY,
         lower_barrier=lower_barrier,
@@ -2835,6 +2836,151 @@ def test_barrier_american_ki_vs_quantlib(
     )
     assert np.isclose(dp_bn, ql_bn, rtol=3e-3, atol=1e-3), f"DP_BN {dp_bn:.6f} vs QL_BN {ql_bn:.6f}"
     assert np.isclose(dp_mc, ql_bn, rtol=0.02, atol=2e-3), f"DP_MC {dp_mc:.6f} vs QL_BN {ql_bn:.6f}"
+
+
+# ── American double barrier: DP PDE (corridor / two-surface) vs QL BinomialCRR ──
+# QuantLib has no FD double-barrier engine (and its FD *single*-barrier engine
+# does not support American exercise either), and dp has no MC/binomial double-
+# barrier support, so the only cross-engine reference for American double
+# barriers is QL's binomial CRR double-barrier lattice.
+#
+# Step counts differ by action: an American double-KO has both barriers
+# truncating the payoff, so QL's lattice is biased low and converges slowly
+# (needs ~20k steps to get within ~1%); an American double-KI is dominated by a
+# smooth post-knock-in vanilla American, so QL converges to <0.05% by ~5k steps.
+
+
+def _ql_double_barrier_american_price(
+    *,
+    action: BarrierAction,
+    option_type: OptionType,
+    strike: float,
+    lower_barrier: float,
+    upper_barrier: float,
+    binom_steps: int,
+) -> float:
+    """American double barrier via QL BinomialCRRDoubleBarrierEngine (flat curves)."""
+    eval_date = ql.Date(PRICING_DATE.day, PRICING_DATE.month, PRICING_DATE.year)
+    ql.Settings.instance().evaluationDate = eval_date
+    ql_dc = ql.Actual365Fixed()
+    spot_h = ql.QuoteHandle(ql.SimpleQuote(_BARRIER_SPOT))
+    rf_h = ql.YieldTermStructureHandle(ql.FlatForward(eval_date, _BARRIER_RATE, ql_dc))
+    div_h = ql.YieldTermStructureHandle(ql.FlatForward(eval_date, _BARRIER_DIV, ql_dc))
+    vol_h = ql.BlackVolTermStructureHandle(
+        ql.BlackConstantVol(eval_date, ql.TARGET(), _BARRIER_VOL, ql_dc)
+    )
+    proc = ql.BlackScholesMertonProcess(spot_h, div_h, rf_h, vol_h)
+
+    ql_type = ql.Option.Put if option_type is OptionType.PUT else ql.Option.Call
+    payoff = ql.PlainVanillaPayoff(ql_type, strike)
+    ql_maturity = ql.Date(_BARRIER_MATURITY.day, _BARRIER_MATURITY.month, _BARRIER_MATURITY.year)
+    exercise = ql.AmericanExercise(eval_date, ql_maturity)
+    opt = ql.DoubleBarrierOption(
+        _QL_DOUBLE_BARRIER_TYPE[action], lower_barrier, upper_barrier, 0.0, payoff, exercise
+    )
+    opt.setPricingEngine(ql.BinomialCRRDoubleBarrierEngine(proc, binom_steps))
+    return opt.NPV()
+
+
+_DOUBLE_BARRIER_AMERICAN_KO_SCENARIOS = [
+    pytest.param(OptionType.CALL, 100.0, 85.0, 120.0, id="am_dko_call"),
+    pytest.param(OptionType.PUT, 100.0, 85.0, 120.0, id="am_dko_put"),
+    pytest.param(OptionType.CALL, 100.0, 90.0, 130.0, id="am_dko_call_wide"),
+    pytest.param(OptionType.PUT, 95.0, 82.0, 125.0, id="am_dko_put_otm"),
+]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "option_type,strike,lower_barrier,upper_barrier",
+    _DOUBLE_BARRIER_AMERICAN_KO_SCENARIOS,
+)
+def test_double_barrier_american_ko_vs_quantlib(option_type, strike, lower_barrier, upper_barrier):
+    """American double knock-out (continuous): DP PDE_FD vs QL binomial CRR.
+
+    Both double barriers truncate the payoff, so the QL lattice is biased low
+    and converges slowly; we run it at 20k steps and allow a 2% band (same
+    regime as the single-barrier ``test_barrier_american_ko_vs_quantlib``).
+    """
+    dp_pde = _dp_double_barrier_pde_price(
+        action=BarrierAction.OUT,
+        option_type=option_type,
+        strike=strike,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        exercise_type=ExerciseType.AMERICAN,
+    )
+    ql_bn = _ql_double_barrier_american_price(
+        action=BarrierAction.OUT,
+        option_type=option_type,
+        strike=strike,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        binom_steps=20_000,
+    )
+    logger.info(
+        "American DKO %s K=%.0f L=%.0f U=%.0f | DP_PDE=%.6f QL_BN=%.6f rel=%.3f%%",
+        option_type.value,
+        strike,
+        lower_barrier,
+        upper_barrier,
+        dp_pde,
+        ql_bn,
+        abs(dp_pde - ql_bn) / dp_pde * 100.0,
+    )
+    assert np.isclose(dp_pde, ql_bn, rtol=0.02, atol=2e-3), (
+        f"DP_PDE {dp_pde:.6f} vs QL_BN {ql_bn:.6f}"
+    )
+
+
+_DOUBLE_BARRIER_AMERICAN_KI_SCENARIOS = [
+    pytest.param(OptionType.CALL, 100.0, 85.0, 120.0, id="am_dki_call"),
+    pytest.param(OptionType.PUT, 100.0, 85.0, 120.0, id="am_dki_put"),
+    pytest.param(OptionType.CALL, 100.0, 90.0, 130.0, id="am_dki_call_wide"),
+    pytest.param(OptionType.PUT, 95.0, 80.0, 125.0, id="am_dki_put_otm"),
+]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "option_type,strike,lower_barrier,upper_barrier",
+    _DOUBLE_BARRIER_AMERICAN_KI_SCENARIOS,
+)
+def test_double_barrier_american_ki_vs_quantlib(option_type, strike, lower_barrier, upper_barrier):
+    """American double knock-in (continuous): DP PDE_FD two-surface vs QL binomial CRR.
+
+    The post-knock-in vanilla American is smooth on the lattice, so QL
+    converges quickly here; 5k steps and a tight 0.5% band suffice.
+    """
+    dp_pde = _dp_double_barrier_pde_price(
+        action=BarrierAction.IN,
+        option_type=option_type,
+        strike=strike,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        exercise_type=ExerciseType.AMERICAN,
+    )
+    ql_bn = _ql_double_barrier_american_price(
+        action=BarrierAction.IN,
+        option_type=option_type,
+        strike=strike,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        binom_steps=5_000,
+    )
+    logger.info(
+        "American DKI %s K=%.0f L=%.0f U=%.0f | DP_PDE=%.6f QL_BN=%.6f rel=%.3f%%",
+        option_type.value,
+        strike,
+        lower_barrier,
+        upper_barrier,
+        dp_pde,
+        ql_bn,
+        abs(dp_pde - ql_bn) / dp_pde * 100.0,
+    )
+    assert np.isclose(dp_pde, ql_bn, rtol=5e-3, atol=1e-3), (
+        f"DP_PDE {dp_pde:.6f} vs QL_BN {ql_bn:.6f}"
+    )
 
 
 # ── European barrier + discrete dividends: DP PDE vs QL FD ───────────────
