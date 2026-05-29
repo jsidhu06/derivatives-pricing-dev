@@ -15,6 +15,11 @@ Current scope
 - Single barrier (no double-barrier)
 - GBM dynamics (no jumps or stochastic volatility)
 
+See also
+--------
+- ``double_barrier_analytical.py`` — Kunitomo-Ikeda analytical pricing for
+  *double*-barrier options.
+
 References
 ----------
 Reiner, E. and Rubinstein, M. (1991). "Breaking Down the Barriers",

@@ -59,6 +59,7 @@ from .binomial import (
 from .bsm import _BSMEuropeanValuation
 from .asian_analytical import _AnalyticalAsianValuation
 from .barrier_analytical import _AnalyticalBarrierValuation
+from .double_barrier_analytical import _AnalyticalDoubleBarrierValuation
 from .pde import (
     _FDEuropeanValuation,
     _FDAmericanValuation,
@@ -111,6 +112,16 @@ _BARRIER_REGISTRY: dict[tuple[PricingMethod, ExerciseType], type] = {
     (PricingMethod.BINOMIAL, ExerciseType.AMERICAN): _BinomialBarrierValuation,
     (PricingMethod.PDE_FD, ExerciseType.EUROPEAN): _FDBarrierValuation,
     (PricingMethod.PDE_FD, ExerciseType.AMERICAN): _FDBarrierValuation,
+}
+
+# Maps (PricingMethod, ExerciseType) → implementation class for double-barrier
+# option specs.  BSM routes to the Kunitomo-Ikeda analytical engine (European
+# only, continuous, flat curves, no rebate, no discrete divs); PDE_FD picks
+# up everything else (American, discrete monitoring, rebates, discrete divs).
+_DOUBLE_BARRIER_REGISTRY: dict[tuple[PricingMethod, ExerciseType], type] = {
+    (PricingMethod.BSM, ExerciseType.EUROPEAN): _AnalyticalDoubleBarrierValuation,
+    (PricingMethod.PDE_FD, ExerciseType.EUROPEAN): _FDDoubleBarrierValuation,
+    (PricingMethod.PDE_FD, ExerciseType.AMERICAN): _FDDoubleBarrierValuation,
 }
 
 # Maps GreekCalculationMethod → (required PricingMethod, capability_flag_name,
@@ -456,7 +467,7 @@ class OptionValuation:
             if fixing_dates[0] < underlying.pricing_date:
                 raise ValidationError("Asian fixing schedule must not start before pricing_date.")
 
-        elif isinstance(spec, BarrierSpec):
+        elif isinstance(spec, _BaseBarrierSpec):
             mon_dates = self._barrier_monitoring_dates()
             if mon_dates is not None and mon_dates[0] < underlying.pricing_date:
                 raise ValidationError(
@@ -714,7 +725,7 @@ class OptionValuation:
         float
             Value change per day.
         """
-        # BSM analytical barrier theta: use the Black-Scholes PDE identity
+        # BSM analytical (single- and double-barrier) theta: use the Black-Scholes PDE identity
         # (θ = rV − (r−q)Sδ − ½σ²S²γ) via the engine impl rather than a
         # forward-difference time bump (the former has better accuracy).
         # Only applies on auto-select; an explicit NUMERICAL request or a user-supplied
@@ -723,7 +734,7 @@ class OptionValuation:
             greek_calc_method is None
             and time_bump_days is None
             and self._pricing_method is PricingMethod.BSM
-            and isinstance(self._spec, BarrierSpec)
+            and isinstance(self._spec, _BaseBarrierSpec)
             and not self._barrier_triggered_at_inception()
         ):
             return float(self._impl.theta())
@@ -741,7 +752,7 @@ class OptionValuation:
         if method is not GreekCalculationMethod.NUMERICAL:
             return float(self._impl.theta())
 
-        def _ko_theta_at_expiry(spec: BarrierSpec) -> float:
+        def _ko_theta_at_expiry(spec: _BaseBarrierSpec) -> float:
             # Per-day θ of the AT_EXPIRY rebate cashflow R·df_r(T):
             # the discount factor unwinds at rate r, so θ = r·pv/365.
             T = self._maturity_year_fraction()
@@ -830,7 +841,7 @@ class OptionValuation:
         if method is not GreekCalculationMethod.NUMERICAL:
             return float(self._impl.rho())
 
-        def _ko_rho_at_expiry(spec: BarrierSpec) -> float:
+        def _ko_rho_at_expiry(spec: _BaseBarrierSpec) -> float:
             # Central-diff ρ of the AT_EXPIRY rebate cashflow R·df_r(T)
             # via a parallel zero-rate bump on the discount curve.  Scaled
             # by 0.01 to express per-1%-rate-move (consistent with engine ρ).
@@ -971,13 +982,15 @@ class OptionValuation:
         spec = self._spec
 
         if isinstance(spec, DoubleBarrierSpec):
-            # Double-barrier pricing currently lives in the PDE_FD engine only.
-            if self._pricing_method is not PricingMethod.PDE_FD:
+            impl_cls = _DOUBLE_BARRIER_REGISTRY.get((self._pricing_method, spec.exercise_type))
+            if impl_cls is None:
                 raise UnsupportedFeatureError(
-                    "Double-barrier option pricing is currently only supported via "
-                    f"PricingMethod.PDE_FD; got {self._pricing_method.name}."
+                    f"Double-barrier options with {spec.exercise_type.name} exercise "
+                    f"do not support {self._pricing_method.name} pricing. "
+                    "Supported: PricingMethod.BSM (European only, Kunitomo-Ikeda) "
+                    "and PricingMethod.PDE_FD (European and American)."
                 )
-            return _FDDoubleBarrierValuation(self)
+            return impl_cls(self)
 
         if isinstance(spec, BarrierSpec):
             impl_cls = _BARRIER_REGISTRY.get((self._pricing_method, spec.exercise_type))
@@ -1161,7 +1174,7 @@ class OptionValuation:
         self,
         greek: str,
         bump_kwargs: dict[str, float | None],
-        ko_at_expiry_rebate_value: Callable[[BarrierSpec], float] | None = None,
+        ko_at_expiry_rebate_value: Callable[[_BaseBarrierSpec], float] | None = None,
     ) -> float | None:
         """Return the OV-level short-circuit value for a NUMERICAL greek on a
         barrier spec triggered at inception, or ``None`` if no short-circuit
@@ -1432,12 +1445,14 @@ class OptionValuation:
                 f"(bump-and-revalue), got {greek_calc_method.name}."
             )
 
-        # Barrier options have engine-native Greeks (TREE / GRID) and numerical
-        # bump-and-revalue, but closed-form analytical Greeks are not currently
-        # supported on the BSM analytical engine — _AnalyticalBarrierValuation
-        # does not expose per-greek methods. Reject ANALYTICAL explicitly.
+        # Barrier options (single and double) have engine-native Greeks
+        # (TREE / GRID) and numerical bump-and-revalue, but closed-form
+        # analytical Greeks are not currently supported on the BSM analytical
+        # engines — neither _AnalyticalBarrierValuation nor
+        # _AnalyticalDoubleBarrierValuation expose per-greek methods. Reject
+        # ANALYTICAL explicitly.
         if (
-            isinstance(self._spec, BarrierSpec)
+            isinstance(self._spec, _BaseBarrierSpec)
             and greek_calc_method is GreekCalculationMethod.ANALYTICAL
         ):
             raise UnsupportedFeatureError(
@@ -1566,7 +1581,7 @@ class OptionValuation:
         """
         if method is not GreekCalculationMethod.NUMERICAL:
             return
-        if not isinstance(self._spec, BarrierSpec):
+        if not isinstance(self._spec, _BaseBarrierSpec):
             return
         if engine_constraint is not None and self._pricing_method is not engine_constraint:
             return
@@ -1592,8 +1607,10 @@ class OptionValuation:
         # Asian options: no engine-native Greeks implemented — always bump-and-revalue.
         if isinstance(self._spec, AsianSpec):
             return GreekCalculationMethod.NUMERICAL
-        if self._pricing_method is PricingMethod.BSM and not isinstance(self._spec, BarrierSpec):
-            # Analytical Greeks not available for barriers
+        if self._pricing_method is PricingMethod.BSM and not isinstance(
+            self._spec, _BaseBarrierSpec
+        ):
+            # Analytical Greeks not available for single- or double-barrier specs.
             return GreekCalculationMethod.ANALYTICAL
         if tree_capable and self._pricing_method is PricingMethod.BINOMIAL:
             return GreekCalculationMethod.TREE
@@ -1687,28 +1704,42 @@ class OptionValuation:
         )
 
     def _resolve_barrier_spot_bump(self, epsilon: float) -> float:
-        """Cap ``epsilon`` so a central spot bump cannot cross the barrier.
+        """Cap ``epsilon`` so a central spot bump cannot cross any barrier.
 
         Safe to call unconditionally from any greek method: returns
         ``epsilon`` unchanged for non-barrier specs.  For barrier specs,
-        an unconstrained bump of ``s0 ± epsilon`` may cross the barrier
-        on one side, putting the bumped option in a different (knocked-
-        out vs alive) regime than the unbumped option.  The resulting
-        numerical greek then averages two regimes and is biased —
-        sometimes by an order of magnitude.
+        an unconstrained bump of ``s0 ± epsilon`` may cross a barrier on
+        one side, putting the bumped option in a different (knocked-out
+        vs alive) regime than the unbumped option.  The resulting numerical
+        greek then averages two regimes and is biased — sometimes by an
+        order of magnitude.
 
-        The returned bump is ``min(epsilon, max_fraction * |spot - barrier|)``
-        where ``max_fraction = _BARRIER_BUMP_MAX_FRACTION``.
+        Single-barrier: gap is the distance to the one barrier on the
+        appropriate side (DOWN: s0 - H; UP: H - s0).
+        Double-barrier: gap is the distance to the *closer* of L or U, so
+        neither bumped spot crosses either barrier.
+
+        The returned bump is
+        ``min(epsilon, max_fraction * gap)`` with
+        ``max_fraction = _BARRIER_BUMP_MAX_FRACTION``.
         """
         spec = self._spec
-        if not isinstance(spec, BarrierSpec):
-            return epsilon
         s0 = float(self._underlying.initial_value)
-        barrier = float(spec.barrier)
-        if spec.direction is BarrierDirection.DOWN:
-            gap = s0 - barrier
+
+        if isinstance(spec, BarrierSpec):
+            barrier = float(spec.barrier)
+            gap = s0 - barrier if spec.direction is BarrierDirection.DOWN else barrier - s0
+            barrier_label = f"{spec.direction.name} barrier H={barrier:g}"
+        elif isinstance(spec, DoubleBarrierSpec):
+            lower = float(spec.lower_barrier)
+            upper = float(spec.upper_barrier)
+            gap_lo = s0 - lower
+            gap_up = upper - s0
+            gap = min(gap_lo, gap_up)
+            barrier_label = f"double barrier [L={lower:g}, U={upper:g}]"
         else:
-            gap = barrier - s0
+            return epsilon
+
         if gap <= 0:
             # Inception-triggered; let the engine handle it.
             return epsilon
@@ -1716,11 +1747,9 @@ class OptionValuation:
         if epsilon <= max_bump:
             return epsilon
         logger.warning(
-            "Numerical greek bump epsilon=%g would cross %s barrier H=%g "
-            "(spot=%g); shrinking to %g.",
+            "Numerical greek bump epsilon=%g would cross %s (spot=%g); shrinking to %g.",
             epsilon,
-            spec.direction.name,
-            barrier,
+            barrier_label,
             s0,
             max_bump,
         )

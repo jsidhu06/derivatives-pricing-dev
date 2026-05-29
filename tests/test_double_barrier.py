@@ -47,7 +47,23 @@ logger = logging.getLogger(__name__)
 
 
 class TestDoubleBarrierAgainstBoyleTian:
-    """Continuous double knock-out call PVs vs Boyle-Tian (1998)."""
+    """Continuous double knock-out call PVs vs Boyle-Tian (1998).
+
+    Both engines that price double barriers are compared side-by-side:
+
+    * ``BSM`` — Kunitomo-Ikeda (1992) analytical infinite-series closed form;
+    * ``PDE_FD`` — Crank-Nicolson on a log-spot grid truncated at both barriers.
+
+    The paper reports "N/A" for closed-form double-knock-out values, so the
+    reference column here is **Boyle-Tian's own explicit FD at 5000 steps**.
+    Both our engines are therefore compared against a third
+    numerical reference (BT98's 5000-step modified-explicit scheme), so each
+    carries its own discretisation residual *plus* the paper's: K-I's
+    deviation reflects how closely BT98's FD itself approximated the K-I
+    limit, and our PDE_FD's deviation reflects two FD schemes' agreement at
+    different resolutions.  Tolerances absorb the 4dp paper rounding plus
+    this two-method gap.
+    """
 
     PRICING_DATE = dt.datetime(2025, 1, 1)
     STRIKE = 100.0
@@ -55,6 +71,15 @@ class TestDoubleBarrierAgainstBoyleTian:
     RATE = 0.10
     LOWER_BARRIER = 90.0
     UPPER_BARRIER = 140.0
+
+    # Per-engine tolerances against Boyle-Tian's *FD* reference.
+    # Both engines come in within ±3e-4 of paper across the sweep, so a 1e-3
+    # atol comfortably absorbs paper rounding plus the BT98-FD-vs-our-engine
+    # gap on either side.
+    _TOLS: dict[PricingMethod, dict[str, float]] = {
+        PricingMethod.BSM: dict(rtol=0.0, atol=1.0e-3),
+        PricingMethod.PDE_FD: dict(rtol=0.0, atol=1.0e-3),
+    }
 
     @classmethod
     def _market_data(cls) -> MarketData:
@@ -85,7 +110,7 @@ class TestDoubleBarrierAgainstBoyleTian:
         return maturity
 
     @classmethod
-    def _double_ko_call_pv(cls, spot: float, t_years: float) -> float:
+    def _double_ko_call_pv(cls, spot: float, t_years: float, method: PricingMethod) -> float:
         spec = DoubleBarrierSpec(
             option_type=OptionType.CALL,
             exercise_type=ExerciseType.EUROPEAN,
@@ -96,7 +121,7 @@ class TestDoubleBarrierAgainstBoyleTian:
             action=BarrierAction.OUT,
             monitoring=BarrierMonitoring.CONTINUOUS,
         )
-        valuation = OptionValuation(cls._underlying(spot), spec, PricingMethod.PDE_FD)
+        valuation = OptionValuation(cls._underlying(spot), spec, method)
         return float(valuation.present_value())
 
     # ── Tables 2 & 3: S0 = 95, double-KO call across maturities ──────────
@@ -112,18 +137,22 @@ class TestDoubleBarrierAgainstBoyleTian:
         self, t_years: float, paper_pv: float, request: pytest.FixtureRequest
     ):
         """DKO call at S0=95 matches the paper across 1y / 1mo / half-month."""
-        pv = self._double_ko_call_pv(95.0, t_years)
+        engine_pvs: dict[PricingMethod, float] = {
+            method: self._double_ko_call_pv(95.0, t_years, method)
+            for method in (PricingMethod.BSM, PricingMethod.PDE_FD)
+        }
         logger.info(
-            "BT98 DoubleKO maturity %s | T=%.4fy paper=%.4f dp_fd=%.4f diff=%.4f",
+            "BT98 DoubleKO maturity %s | T=%.4fy paper=%.4f dp_an=%.4f dp_fd=%.4f",
             request.node.callspec.id,
             t_years,
             paper_pv,
-            pv,
-            abs(pv - paper_pv),
+            engine_pvs[PricingMethod.BSM],
+            engine_pvs[PricingMethod.PDE_FD],
         )
-        assert np.isclose(pv, paper_pv, rtol=0.0, atol=2.0e-3), (
-            f"DKO call T={t_years:.4f}y: got {pv:.6f}, expected {paper_pv:.4f}"
-        )
+        for method, pv in engine_pvs.items():
+            assert np.isclose(pv, paper_pv, **self._TOLS[method]), (
+                f"{method.name} DKO call T={t_years:.4f}y: got {pv:.6f}, expected {paper_pv:.4f}"
+            )
 
     # ── Table 5: T = 1y, double-KO call as spot approaches the lower barrier ─
     @pytest.mark.parametrize(
@@ -141,18 +170,22 @@ class TestDoubleBarrierAgainstBoyleTian:
         self, spot: float, paper_pv: float, request: pytest.FixtureRequest
     ):
         """DKO call (T=1y) matches Table 5 as spot nears the lower barrier (90)."""
-        pv = self._double_ko_call_pv(spot, 1.0)
+        engine_pvs: dict[PricingMethod, float] = {
+            method: self._double_ko_call_pv(spot, 1.0, method)
+            for method in (PricingMethod.BSM, PricingMethod.PDE_FD)
+        }
         logger.info(
-            "BT98 DoubleKO Table5 %s | spot=%.1f paper=%.4f dp_fd=%.4f diff=%.4f",
+            "BT98 DoubleKO Table5 %s | spot=%.1f paper=%.4f dp_an=%.4f dp_fd=%.4f",
             request.node.callspec.id,
             spot,
             paper_pv,
-            pv,
-            abs(pv - paper_pv),
+            engine_pvs[PricingMethod.BSM],
+            engine_pvs[PricingMethod.PDE_FD],
         )
-        assert np.isclose(pv, paper_pv, rtol=0.0, atol=3.0e-3), (
-            f"DKO call S0={spot}: got {pv:.6f}, expected {paper_pv:.4f}"
-        )
+        for method, pv in engine_pvs.items():
+            assert np.isclose(pv, paper_pv, **self._TOLS[method]), (
+                f"{method.name} DKO call S0={spot}: got {pv:.6f}, expected {paper_pv:.4f}"
+            )
 
 
 class TestDoubleBarrierMonitoringFrequencyAgainstTian:
@@ -277,10 +310,25 @@ class TestDoubleBarrierGreeksAgainstBoyleTian:
         K = 100, sigma = 25%, r = 10%, q = 0, T = 1 yr,
         lower barrier L = 90, upper barrier U = 140,
 
-    as spot approaches the lower barrier.  Only PDE_FD prices double barriers,
-    and its grid Greeks come for free from the same backward solve.  The paper
-    reports annualized theta; the library theta is per-day, so the comparison
-    scales by 365.
+    as spot approaches the lower barrier.  Both double-barrier engines are
+    compared:
+
+    * ``BSM`` — Kunitomo-Ikeda (1992) closed-form PV; delta and gamma come
+      from central-difference bump-and-revalue around the K-I price, theta
+      from the Black-Scholes PDE identity
+      ``Θ = rV − (r−q)SΔ − ½σ²S²Γ``.
+    * ``PDE_FD`` — grid greeks read straight off the backward solve; theta
+      also via the same BS-PDE identity (with parabolic-Lagrange at-spot
+      interpolation for ``V``).
+
+    The paper reports "N/A" for closed-form double-knock-out greeks, so the
+    reference column here is **Boyle-Tian's own explicit FD at 5000 steps**.
+    Both our engines therefore compare against a third numerical reference,
+    yet each lands within ~2e-3 of paper across the sweep — essentially the
+    4dp paper rounding floor.
+
+    The paper reports annualized theta; the library theta is per-day, so the
+    comparison scales by 365.
     """
 
     PRICING_DATE = dt.datetime(2025, 1, 1)
@@ -302,12 +350,14 @@ class TestDoubleBarrierGreeksAgainstBoyleTian:
         90.2: (0.3232, -0.0119, 0.1064),
     }
 
-    # Per-greek tolerances.  Our grid Greeks track the paper to ~1e-4, so these
-    # are comfortably loose (gamma/theta are small in magnitude, hence atol).
+    # Per-greek tolerances, shared across both engines.  All three greeks
+    # sit essentially at the paper's 4dp rounding floor — delta/gamma via
+    # GRID (FD) or central-difference bump (BSM), theta via the Black-
+    # Scholes PDE identity ``Θ = rV − (r−q)SΔ − ½σ²S²Γ`` on both engines.
     _TOLS: dict[str, dict[str, float]] = {
-        "delta": dict(rtol=1.0e-2, atol=1.0e-3),
-        "gamma": dict(rtol=1.5e-2, atol=5.0e-4),
-        "theta": dict(rtol=1.5e-2, atol=3.0e-3),
+        "delta": dict(rtol=2.0e-3, atol=5.0e-4),
+        "gamma": dict(rtol=5.0e-3, atol=2.0e-4),
+        "theta": dict(rtol=5.0e-3, atol=2.0e-3),
     }
 
     @classmethod
@@ -342,9 +392,9 @@ class TestDoubleBarrierGreeksAgainstBoyleTian:
         )
 
     @classmethod
-    def _engine_greek(cls, spot: float, greek: str) -> float:
-        """Return a single PDE_FD greek; theta annualized (×365) like the paper."""
-        valuation = OptionValuation(cls._underlying(spot), cls._spec(), PricingMethod.PDE_FD)
+    def _engine_greek(cls, spot: float, method: PricingMethod, greek: str) -> float:
+        """Return a single greek; theta annualized (×365) like the paper."""
+        valuation = OptionValuation(cls._underlying(spot), cls._spec(), method)
         value = float(getattr(valuation, greek)())
         if greek == "theta":
             value *= 365.0
@@ -359,18 +409,24 @@ class TestDoubleBarrierGreeksAgainstBoyleTian:
     def test_double_ko_call_greek_matches_paper(self, spot: float, greek: str):
         """DKO call (delta/gamma/theta) matches Boyle-Tian as spot nears L=90."""
         paper_value = self._PAPER_GREEKS[spot][["delta", "gamma", "theta"].index(greek)]
-        value = self._engine_greek(spot, greek)
+        engine_values: dict[PricingMethod, float] = {
+            method: self._engine_greek(spot, method, greek)
+            for method in (PricingMethod.BSM, PricingMethod.PDE_FD)
+        }
         logger.info(
-            "BT98 DoubleKO Greeks spot=%.2f %-5s | paper=%.4f dp_fd=%.4f diff=%.4f",
+            "BT98 DoubleKO Greeks spot=%.2f %-5s | paper=%.4f dp_an=%.4f dp_fd=%.4f",
             spot,
             greek,
             paper_value,
-            value,
-            abs(value - paper_value),
+            engine_values[PricingMethod.BSM],
+            engine_values[PricingMethod.PDE_FD],
         )
-        assert np.isclose(value, paper_value, **self._TOLS[greek]), (
-            f"{greek} mismatch at spot={spot}: got {value:.4f}, expected {paper_value:.4f}"
-        )
+        tol = self._TOLS[greek]
+        for method, value in engine_values.items():
+            assert np.isclose(value, paper_value, **tol), (
+                f"{method.name} {greek} mismatch at spot={spot}: "
+                f"got {value:.4f}, expected {paper_value:.4f}"
+            )
 
 
 @pytest.mark.slow
