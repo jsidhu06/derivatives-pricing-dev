@@ -64,8 +64,8 @@ def _kunitomo_ikeda_dko_no_rebate(
     strike: float,
     lower: float,
     upper: float,
-    r: float,
-    q: float,
+    df_r: float,
+    df_q: float,
     sigma: float,
     time_to_maturity: float,
     option_type: OptionType,
@@ -81,6 +81,12 @@ def _kunitomo_ikeda_dko_no_rebate(
       * ``(lo, hi) = (L,  min(K, U))`` for the PUT.
 
     Caller must ensure ``L < spot < U`` (corridor not breached at inception).
+
+    Discount factors are the primary inputs (consistent with how the
+    valuation context exposes them via ``DiscountCurve.df``).  The flat-
+    equivalent rates ``r`` and ``q`` are derived internally for ``μ`` and the
+    drift; the discount factors themselves feed the outer
+    ``S·df_q·Σ_S − K·df_r·Σ_K`` scaling.
     """
     # Early-out: payoff is identically zero given the surviving corridor.
     if option_type is OptionType.CALL and strike >= upper:
@@ -95,6 +101,9 @@ def _kunitomo_ikeda_dko_no_rebate(
         lo = lower
         hi = min(upper, strike)
 
+    # Flat-equivalent rates back-derived from the discount factors.
+    r = -np.log(df_r) / time_to_maturity
+    q = -np.log(df_q) / time_to_maturity
     b = r - q
     sigma_sq = sigma * sigma
     sigma_sqrt_T = sigma * np.sqrt(time_to_maturity)
@@ -141,9 +150,6 @@ def _kunitomo_ikeda_dko_no_rebate(
         sum_K += R_3 * (norm.cdf(d_1 - sigma_sqrt_T) - norm.cdf(d_2 - sigma_sqrt_T)) - R_4 * (
             norm.cdf(d_3 - sigma_sqrt_T) - norm.cdf(d_4 - sigma_sqrt_T)
         )
-
-    df_r = np.exp(-r * time_to_maturity)
-    df_q = np.exp(-q * time_to_maturity)
 
     if option_type is OptionType.CALL:
         return float(max(spot * df_q * sum_S - strike * df_r * sum_K, 0.0))
@@ -202,10 +208,8 @@ class _AnalyticalDoubleBarrierValuation:
         T = ctx._maturity_year_fraction()
 
         df_r = float(ctx.discount_curve.df(T))
-        r = -np.log(df_r) / T
         dividend_curve = underlying.dividend_curve
         df_q = float(dividend_curve.df(T)) if dividend_curve is not None else 1.0
-        q = -np.log(df_q) / T
 
         L = float(spec.lower_barrier)
         U = float(spec.upper_barrier)
@@ -220,8 +224,8 @@ class _AnalyticalDoubleBarrierValuation:
             strike=float(spec.strike),
             lower=L,
             upper=U,
-            r=r,
-            q=q,
+            df_r=df_r,
+            df_q=df_q,
             sigma=sigma,
             time_to_maturity=T,
             option_type=spec.option_type,
