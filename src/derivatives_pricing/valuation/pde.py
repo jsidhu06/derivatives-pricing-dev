@@ -1838,56 +1838,111 @@ def _build_double_barrier_discrete_grid(
     total = hi_target - lo_target
     explicit = method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL)
 
-    # Choose the target spacing, then snap so the corridor holds an integer
-    # number of intervals (enables exact half-step placement of *both*
-    # barriers — ``step = corridor / N`` is Boyle-Tian's rescaled Δy*).
+    # We aim to return ``spot_steps + 1`` nodes (``spot_steps`` intervals)
+    # exactly, matching the convention of ``_build_log_grid``.  Two regimes:
     #
-    # - CN / IMPLICIT (unconditionally stable): ``step ≈ total / spot_steps``,
-    #   so the full-domain wings below give ≈ ``spot_steps`` total intervals.
-    # - Explicit on a log grid: Hull's trinomial spacing ``σ√(3Δt)`` keeps the
-    #   middle transition probability non-negative (``λ = step/(σ√Δt) ≈ √3``);
-    #   the step is dt-driven, not spot_steps-driven (mirrors ``_build_log_grid``).
-    if explicit and log:
-        step_target = volatility * np.sqrt(3.0 * time_to_maturity / time_steps)
-    else:
-        step_target = total / spot_steps
-    n_corridor = max(1, int(round(corridor / step_target)))
-    step = corridor / n_corridor
+    # 1. ``EXPLICIT + log``: dz is fixed by Hull's trinomial spacing
+    #    ``σ√(3Δt)`` (kept ≥ ``σ√Δt`` for non-negative transition probabilities).
+    #    spot_steps is treated as an **upper bound**: if the natural wings
+    #    would overflow, shrink them proportionally; otherwise leave them
+    #    natural (padding would just inflate the far-field domain without
+    #    accuracy benefit).
+    # 2. **All other schemes** (CN, IMPLICIT, or any spot-grid explicit): dz
+    #    is free, so spot_steps is treated as an **exact** target.  Pick the
+    #    corridor interval count ``m`` so that minimum wings + ``m`` ≤
+    #    ``spot_steps - 1`` (reducing ``m`` is monotone in feasibility:
+    #    enlarging dz shrinks both the corridor count and the required
+    #    wings), then distribute leftover intervals between the two wings.
+    #
+    # In both regimes the corridor is held to an *integer* number of
+    # intervals (``step = corridor / m``); anchoring the lower barrier
+    # half-way between nodes then puts the upper barrier half-way
+    # automatically (Boyle-Tian rescaled Δy*).
+    target_sum = spot_steps - 1  # = n_below + m + n_above (gives spot_steps intervals)
+
+    def _min_wings(step_try: float) -> tuple[int, int]:
+        """Minimum wing counts to cover [lo_target, hi_target] given step."""
+        nb = max(1, int(math.ceil((a_lo - lo_target) / step_try - 0.5 - 1.0e-12)))
+        na = max(1, int(math.ceil((hi_target - a_hi) / step_try - 0.5 - 1.0e-12)))
+        return nb, na
 
     if explicit and log:
+        # Hull-spacing regime: dz fixed by stability.  spot_steps is honored
+        # exactly; if Hull's m plus the wings needed to cover ``smax_mult *
+        # max(spot, strike, U)`` would overflow the budget, shrink wings
+        # proportionally; if it would underflow, pad wings symmetrically so
+        # the artificial far-field boundary sits further out (free reduction
+        # of Dirichlet BC leakage).
         sigma_sqrt_dt = volatility * np.sqrt(time_to_maturity / time_steps)
+        hull_step = volatility * np.sqrt(3.0 * time_to_maturity / time_steps)
+        m = max(1, int(round(corridor / hull_step)))
+        step = corridor / m
         lam = step / sigma_sqrt_dt
         if lam < 1.0:
             raise StabilityError(
                 f"Explicit discrete double-barrier scheme is unstable: "
                 f"lambda = step/(sigma*sqrt(dt)) = {lam:.3f} < 1 "
-                f"(corridor {corridor:.4f} forces {n_corridor} intervals). "
+                f"(corridor {corridor:.4f} forces {m} intervals). "
                 f"Increase time_steps, or use CRANK_NICOLSON / IMPLICIT."
             )
+        nb_nat = max(1, int(round((a_lo - lo_target) / step)))
+        na_nat = max(1, int(round((hi_target - a_hi) / step)))
+        if nb_nat + m + na_nat > target_sum:
+            # Cap-shrink wings proportionally; preserves Hull spacing.
+            wing_budget = max(2, target_sum - m)
+            wing = nb_nat + na_nat
+            n_below = max(1, int(round(wing_budget * nb_nat / wing)))
+            n_above = max(1, wing_budget - n_below)
+        else:
+            # Pad wings symmetrically with the leftover budget.
+            extras = target_sum - (nb_nat + m + na_nat)
+            n_below = nb_nat + extras // 2
+            n_above = na_nat + (extras - extras // 2)
+    else:
+        # Variable-dz regime: honor spot_steps exactly.  Pick m near
+        # ``corridor * spot_steps / total``, reduce if minimum wings won't
+        # fit, then distribute leftover intervals between the wings.
+        step_target = total / spot_steps
+        m = max(1, int(round(corridor / step_target)))
+        # Monotonicity: ``min_wings(m) + m`` is non-decreasing in ``m``
+        # (smaller dz → more wing intervals AND more corridor intervals),
+        # so reducing m strictly shrinks the required sum.  Loop is bounded
+        # by ~1-2 iterations in practice for sensible parameter ranges.
+        while m > 1:
+            nb_min, na_min = _min_wings(corridor / m)
+            if nb_min + m + na_min <= target_sum:
+                break
+            m -= 1
+        step = corridor / m
+        nb_min, na_min = _min_wings(step)
+        extras = target_sum - (nb_min + m + na_min)
+        if extras >= 0:
+            # Distribute extras symmetrically (asymmetric by 1 if odd).
+            n_below = nb_min + extras // 2
+            n_above = na_min + (extras - extras // 2)
+        else:
+            # Pathological edge case (m == 1 still doesn't fit) — shrink
+            # wings proportionally, sacrificing far-field coverage.
+            wing_budget = max(2, target_sum - m)
+            denom = max(1, nb_min + na_min)
+            n_below = max(1, int(round(wing_budget * nb_min / denom)))
+            n_above = max(1, wing_budget - n_below)
 
-    # Wing interval counts.  Default: extend to the far-field target on each
-    # side.  Explicit may then exceed the ``spot_steps`` budget (dt-driven
-    # step can be small), so cap the total at ``spot_steps`` by shrinking the
-    # wings proportionally — the corridor's half-step resolution is preserved.
-    n_below = max(1, int(round((a_lo - lo_target) / step)))
-    n_above = max(1, int(round((hi_target - a_hi) / step)))
-    if explicit and (n_below + n_corridor + n_above) > spot_steps:
-        budget = max(2, spot_steps - n_corridor)
-        wing = n_below + n_above
-        n_below = max(1, int(round(budget * n_below / wing)))
-        n_above = max(1, budget - n_below)
     if not log:
-        # Spot grids have a hard floor at 0; cap the lower wing so a_min > 0.
-        n_below = min(n_below, max(1, int(math.floor(a_lo / step - 0.5 - 1.0e-12))))
+        # Spot grids have a hard floor at 0; cap the lower wing so
+        # ``a_min = a_lo - (n_below + 0.5) * step > 0``.  Donate any slack
+        # to the upper wing so the total interval count is preserved.
+        max_nb = max(1, int(math.floor(a_lo / step - 0.5 - 1.0e-12)))
+        if n_below > max_nb:
+            n_above += n_below - max_nb
+            n_below = max_nb
 
     # Anchor the lower barrier half-way between nodes ``n_below`` and
     # ``n_below + 1``: ``a_lo = a_min + (n_below + 0.5) * step``.  The corridor
     # is an exact multiple of the step, so the upper barrier lands half-way too.
     a_min = a_lo - (n_below + 0.5) * step
-    a_max = a_hi + (n_above + 0.5) * step
-
-    n_total = n_below + n_corridor + n_above + 1
-    axis = np.linspace(a_min, a_max, n_total + 1)
+    n_intervals = n_below + m + n_above + 1
+    axis = a_min + step * np.arange(n_intervals + 1, dtype=float)
     S = np.exp(axis) if log else axis
     return axis, S, step
 

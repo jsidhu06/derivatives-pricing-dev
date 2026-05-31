@@ -306,15 +306,18 @@ class PDEParams:
         """Create PDE params tuned for *double*-barrier pricing.
 
         Same scheme selection as :meth:`for_barriers` (CRANK_NICOLSON for
-        continuous, EXPLICIT_HULL for discrete), but with a finer default grid
-        for **discrete** monitoring.  A discretely-monitored double barrier
-        injects a knock-out reset at *both* barriers on every observation date,
-        so the value surface carries fresh discontinuities at each end of the
-        corridor; theta in particular needs more spatial/temporal resolution
-        than the single-barrier discrete default to settle.  ``spot_steps`` and
-        ``time_steps`` are therefore lifted (1200x3000 -> 2000x6000), which on
-        the ``EXPLICIT_HULL`` scheme is still cheap (a single vectorised
-        matrix-vector multiply per step, no PSOR iteration).
+        continuous, EXPLICIT_HULL for discrete), but with a finer default
+        ``time_steps`` for **discrete** monitoring.  A discretely-monitored
+        double barrier injects a knock-out reset at *both* barriers on every
+        observation date, so the value surface carries fresh discontinuities at
+        each end of the corridor; theta in particular needs more temporal
+        resolution than the single-barrier discrete default to settle.
+        ``time_steps`` is therefore lifted (3000 -> 6000); ``spot_steps``
+        stays at 1000 (Hull's stability-pinned ``dz`` already places ~130
+        nodes inside a typical 1.5x corridor, and the wings to the
+        ``smax_mult * max(spot, strike, U)`` far-field round out the budget).
+        ``EXPLICIT_HULL`` makes the higher ``time_steps`` cheap (single
+        vectorised matrix-vector multiply per step, no PSOR iteration).
 
         For **continuous** monitoring the corridor-truncated Crank-Nicolson grid
         already resolves PVs and greeks to ~1e-4 on the ``for_barriers``
@@ -324,7 +327,7 @@ class PDEParams:
         Any keyword accepted by the constructor overrides the chosen defaults.
         """
         richer = (
-            dict(spot_steps=2000, time_steps=6000)
+            dict(spot_steps=1000, time_steps=6000)
             if monitoring is BarrierMonitoring.DISCRETE
             else {}
         )
