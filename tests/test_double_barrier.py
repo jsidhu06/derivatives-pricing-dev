@@ -36,17 +36,670 @@ from derivatives_pricing.enums import (
     ExerciseType,
     GreekCalculationMethod,
     OptionType,
+    PDEMethod,
     PricingMethod,
     RebateTiming,
 )
+from derivatives_pricing.exceptions import ConfigurationError, ValidationError
 from derivatives_pricing.market_environment import MarketData
 from derivatives_pricing.rates import DiscountCurve
 from derivatives_pricing.valuation import OptionValuation, UnderlyingData
 from derivatives_pricing.valuation.contracts import DoubleBarrierSpec, VanillaSpec
-from derivatives_pricing.valuation.params import PDEParams
+from derivatives_pricing.valuation.params import PDEParams, PDESpaceGrid
+from derivatives_pricing.valuation.pde import _build_double_barrier_discrete_grid
 from derivatives_pricing.utils import calculate_year_fraction
 
+from helpers import MATURITY, PRICING_DATE, SPOT, STRIKE, VOL
+
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DoubleBarrierSpec validation
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Double-barrier analogue of ``TestBarrierSpecValidation`` in test_barrier.py.
+# Covers the shared barrier validation surface (option_type/exercise_type/
+# action/monitoring enum checks, strike/rebate non-negativity, knock-in rebate
+# timing, monitoring schedule plumbing) plus the rules unique to the double
+# spec (``lower_barrier < upper_barrier``).
+
+
+def _double_barrier_spec(
+    *,
+    option_type: OptionType = OptionType.CALL,
+    exercise_type: ExerciseType = ExerciseType.EUROPEAN,
+    strike: float = STRIKE,
+    maturity: dt.datetime = MATURITY,
+    lower_barrier: float = 80.0,
+    upper_barrier: float = 120.0,
+    action: BarrierAction = BarrierAction.OUT,
+    monitoring: BarrierMonitoring = BarrierMonitoring.CONTINUOUS,
+    **kwargs,
+) -> DoubleBarrierSpec:
+    """Construct a ``DoubleBarrierSpec`` with sensible defaults for testing."""
+    return DoubleBarrierSpec(
+        option_type=option_type,
+        exercise_type=exercise_type,
+        strike=strike,
+        maturity=maturity,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        action=action,
+        monitoring=monitoring,
+        **kwargs,
+    )
+
+
+class TestDoubleBarrierSpecValidation:
+    """Test ``DoubleBarrierSpec.__post_init__`` validation."""
+
+    def test_valid_construction(self):
+        spec = _double_barrier_spec()
+        assert spec.option_type is OptionType.CALL
+        assert spec.action is BarrierAction.OUT
+        assert spec.monitoring is BarrierMonitoring.CONTINUOUS
+        assert spec.rebate == 0.0
+        assert spec.strike == float(STRIKE)
+        assert spec.lower_barrier == 80.0
+        assert spec.upper_barrier == 120.0
+
+    def test_strike_coerced_to_float(self):
+        spec = _double_barrier_spec(strike=100)
+        assert isinstance(spec.strike, float)
+
+    def test_barriers_coerced_to_float(self):
+        spec = _double_barrier_spec(lower_barrier=80, upper_barrier=120)
+        assert isinstance(spec.lower_barrier, float)
+        assert isinstance(spec.upper_barrier, float)
+
+    def test_invalid_option_type(self):
+        with pytest.raises(ConfigurationError, match="option_type"):
+            DoubleBarrierSpec(
+                option_type="call",  # type: ignore
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=100,
+                maturity=MATURITY,
+                lower_barrier=80.0,
+                upper_barrier=120.0,
+                action=BarrierAction.OUT,
+            )
+
+    def test_invalid_action(self):
+        with pytest.raises(ConfigurationError, match="action"):
+            DoubleBarrierSpec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=100,
+                maturity=MATURITY,
+                lower_barrier=80.0,
+                upper_barrier=120.0,
+                action="out",  # type: ignore
+            )
+
+    def test_negative_strike(self):
+        with pytest.raises(ValidationError, match="strike.*>= 0"):
+            _double_barrier_spec(strike=-1.0)
+
+    def test_non_finite_strike(self):
+        with pytest.raises(ValidationError, match="strike.*finite"):
+            _double_barrier_spec(strike=float("inf"))
+
+    # ── Double-barrier-specific: corridor ordering ───────────────────────
+
+    @pytest.mark.parametrize(
+        "lower,upper",
+        [
+            pytest.param(100.0, 100.0, id="equal"),
+            pytest.param(120.0, 80.0, id="inverted"),
+            pytest.param(100.0, 99.99, id="upper_slightly_below_lower"),
+        ],
+    )
+    def test_lower_must_be_strictly_below_upper(self, lower, upper):
+        with pytest.raises(ValidationError, match="strictly less than"):
+            _double_barrier_spec(lower_barrier=lower, upper_barrier=upper)
+
+    def test_lower_barrier_must_be_positive(self):
+        with pytest.raises(ValidationError, match="lower_barrier.*> 0"):
+            _double_barrier_spec(lower_barrier=0.0)
+
+    def test_negative_lower_barrier(self):
+        with pytest.raises(ValidationError, match="lower_barrier.*> 0"):
+            _double_barrier_spec(lower_barrier=-10.0)
+
+    def test_upper_barrier_must_be_positive(self):
+        # Caught by the ``upper > 0`` check before the corridor-ordering check.
+        with pytest.raises(ValidationError, match="upper_barrier.*> 0"):
+            _double_barrier_spec(upper_barrier=0.0)
+
+    def test_negative_upper_barrier(self):
+        with pytest.raises(ValidationError, match="upper_barrier.*> 0"):
+            _double_barrier_spec(upper_barrier=-10.0)
+
+    # ── Rebate ───────────────────────────────────────────────────────────
+
+    def test_negative_rebate(self):
+        with pytest.raises(ValidationError, match="rebate.*>= 0"):
+            _double_barrier_spec(rebate=-1.0)
+
+    def test_knock_in_rebate_at_hit_rejected(self):
+        with pytest.raises(ValidationError, match="Knock-in rebate"):
+            _double_barrier_spec(
+                action=BarrierAction.IN,
+                rebate=5.0,
+                rebate_timing=RebateTiming.AT_HIT,
+            )
+
+    def test_knock_in_rebate_at_expiry_ok(self):
+        spec = _double_barrier_spec(
+            action=BarrierAction.IN,
+            rebate=5.0,
+            rebate_timing=RebateTiming.AT_EXPIRY,
+        )
+        assert spec.rebate == 5.0
+
+    # ── Monitoring schedule plumbing ────────────────────────────────────
+
+    def test_continuous_rejects_num_observations(self):
+        with pytest.raises(ValidationError, match="CONTINUOUS"):
+            _double_barrier_spec(
+                monitoring=BarrierMonitoring.CONTINUOUS,
+                num_observations=50,
+            )
+
+    def test_continuous_rejects_monitoring_dates(self):
+        dates = [PRICING_DATE + dt.timedelta(days=i * 30) for i in range(1, 5)]
+        with pytest.raises(ValidationError, match="CONTINUOUS"):
+            _double_barrier_spec(
+                monitoring=BarrierMonitoring.CONTINUOUS,
+                monitoring_dates=dates,
+            )
+
+    def test_discrete_requires_schedule_source(self):
+        with pytest.raises(ValidationError, match="exactly one"):
+            _double_barrier_spec(monitoring=BarrierMonitoring.DISCRETE)
+
+    def test_discrete_rejects_both_sources(self):
+        dates = [PRICING_DATE + dt.timedelta(days=i * 30) for i in range(1, 5)]
+        with pytest.raises(ValidationError, match="exactly one"):
+            _double_barrier_spec(
+                monitoring=BarrierMonitoring.DISCRETE,
+                num_observations=50,
+                monitoring_dates=dates,
+            )
+
+    def test_discrete_num_observations_valid(self):
+        spec = _double_barrier_spec(
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=50,
+        )
+        assert spec.num_observations == 50
+
+    def test_discrete_num_observations_too_small(self):
+        with pytest.raises(ValidationError, match="num_observations"):
+            _double_barrier_spec(
+                monitoring=BarrierMonitoring.DISCRETE,
+                num_observations=0,
+            )
+
+    def test_discrete_monitoring_dates_valid(self):
+        dates = [PRICING_DATE + dt.timedelta(days=i * 30) for i in range(1, 10)]
+        spec = _double_barrier_spec(
+            monitoring=BarrierMonitoring.DISCRETE,
+            monitoring_dates=dates,
+        )
+        assert len(spec.monitoring_dates) == 9
+
+    def test_discrete_monitoring_dates_beyond_maturity(self):
+        dates = [MATURITY + dt.timedelta(days=10)]
+        with pytest.raises(ValidationError, match="beyond maturity"):
+            _double_barrier_spec(
+                monitoring=BarrierMonitoring.DISCRETE,
+                monitoring_dates=dates,
+            )
+
+    def test_discrete_monitoring_dates_not_ascending(self):
+        dates = [
+            PRICING_DATE + dt.timedelta(days=60),
+            PRICING_DATE + dt.timedelta(days=30),
+        ]
+        with pytest.raises(ValidationError, match="ascending"):
+            _double_barrier_spec(
+                monitoring=BarrierMonitoring.DISCRETE,
+                monitoring_dates=dates,
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# In/Out parity:  V_DKI + V_DKO  ==  V_vanilla   (European only)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Single-barrier analogue: ``TestBarrierInOutParity`` in test_barrier.py.
+#
+# Note on tautology: both of our engines compute the European DKI via the
+# in-out parity reconstruction itself (BSM: ``V_KI = V_van − V_KO`` in
+# ``_AnalyticalDoubleBarrierValuation.present_value``; PDE_FD European:
+# ``V_DKI = V_vanilla + R·df_T − V_DKO`` in the engine).  So the arithmetic
+# constraint ``DKI + DKO == vanilla`` is satisfied by construction.  This
+# class is therefore *not* a cross-engine correctness check — it's a:
+#   (a) end-to-end pipeline / regression check (catches breaks in vanilla
+#       routing, KI assembly, or rebate accounting if anyone refactors), and
+#   (b) machine-verified documentation of the relationship.
+# American DKI uses the two-surface coupled solver (no parity), so this
+# class restricts to European exercise.
+
+
+_PARITY_PRICING_DATE = dt.datetime(2025, 1, 1)
+_PARITY_MATURITY = _PARITY_PRICING_DATE + dt.timedelta(days=365)
+
+
+def _parity_underlying(spot: float = SPOT, vol: float = VOL) -> UnderlyingData:
+    market = MarketData(
+        _PARITY_PRICING_DATE,
+        DiscountCurve.flat(0.05, end_time=2.0),
+        currency="USD",
+        day_count_convention=DayCountConvention.ACT_365F,
+    )
+    return UnderlyingData(
+        initial_value=spot,
+        volatility=vol,
+        market_data=market,
+        dividend_curve=DiscountCurve.flat(0.02, end_time=2.0),
+    )
+
+
+def _parity_double_spec(
+    *,
+    option_type: OptionType,
+    action: BarrierAction,
+    lower_barrier: float = 85.0,
+    upper_barrier: float = 125.0,
+) -> DoubleBarrierSpec:
+    return DoubleBarrierSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=STRIKE,
+        maturity=_PARITY_MATURITY,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        action=action,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+    )
+
+
+def _parity_vanilla_spec(option_type: OptionType) -> VanillaSpec:
+    return VanillaSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=STRIKE,
+        maturity=_PARITY_MATURITY,
+    )
+
+
+class TestDoubleBarrierInOutParity:
+    """``V_DKI + V_DKO == V_vanilla`` end-to-end on both engines (European).
+
+    For our engines this relationship holds by construction (see module
+    note above); the test serves as a regression catcher and pipeline
+    soundness check.
+    """
+
+    @pytest.mark.parametrize(
+        "option_type,lower,upper",
+        [
+            pytest.param(OptionType.CALL, 85.0, 125.0, id="call_tight"),
+            pytest.param(OptionType.CALL, 70.0, 140.0, id="call_wide"),
+            pytest.param(OptionType.PUT, 85.0, 125.0, id="put_tight"),
+            pytest.param(OptionType.PUT, 70.0, 140.0, id="put_wide"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "pricing_method,params",
+        [
+            pytest.param(PricingMethod.BSM, None, id="bsm_an"),
+            pytest.param(
+                PricingMethod.PDE_FD,
+                PDEParams(spot_steps=400, time_steps=400, space_grid=PDESpaceGrid.LOG_SPOT),
+                id="pde_fd",
+            ),
+        ],
+    )
+    def test_in_out_parity(self, option_type, lower, upper, pricing_method, params):
+        """``DKI + DKO == vanilla`` across (call/put) × (tight/wide corridor) × (BSM/PDE_FD)."""
+        ud = _parity_underlying()
+
+        pv_in = OptionValuation(
+            ud,
+            _parity_double_spec(
+                option_type=option_type,
+                action=BarrierAction.IN,
+                lower_barrier=lower,
+                upper_barrier=upper,
+            ),
+            pricing_method,
+            params=params,
+        ).present_value()
+        pv_out = OptionValuation(
+            ud,
+            _parity_double_spec(
+                option_type=option_type,
+                action=BarrierAction.OUT,
+                lower_barrier=lower,
+                upper_barrier=upper,
+            ),
+            pricing_method,
+            params=params,
+        ).present_value()
+        pv_vanilla = OptionValuation(
+            ud,
+            _parity_vanilla_spec(option_type),
+            pricing_method,
+            params=params,
+        ).present_value()
+
+        # BSM matches to machine precision (literal arithmetic); PDE_FD
+        # carries the small ε from re-solving the vanilla on a different
+        # grid (corridor-truncated vs full).
+        rtol = 1e-10 if pricing_method is PricingMethod.BSM else 5e-3
+        assert np.isclose(pv_in + pv_out, pv_vanilla, rtol=rtol, atol=1e-4), (
+            f"In/out parity violated on {pricing_method.name}: "
+            f"in={pv_in:.6f} + out={pv_out:.6f} = {pv_in + pv_out:.6f} "
+            f"vs vanilla={pv_vanilla:.6f}"
+        )
+
+    @pytest.mark.parametrize("vol", [0.10, 0.30, 0.50])
+    def test_in_out_parity_across_vols(self, vol):
+        """Parity holds across volatility regimes (BSM analytical)."""
+        ud = _parity_underlying(vol=vol)
+        spec_kw = dict(option_type=OptionType.CALL, lower_barrier=85.0, upper_barrier=125.0)
+
+        pv_in = OptionValuation(
+            ud,
+            _parity_double_spec(action=BarrierAction.IN, **spec_kw),
+            PricingMethod.BSM,
+        ).present_value()
+        pv_out = OptionValuation(
+            ud,
+            _parity_double_spec(action=BarrierAction.OUT, **spec_kw),
+            PricingMethod.BSM,
+        ).present_value()
+        pv_vanilla = OptionValuation(
+            ud,
+            _parity_vanilla_spec(OptionType.CALL),
+            PricingMethod.BSM,
+        ).present_value()
+
+        assert np.isclose(pv_in + pv_out, pv_vanilla, rtol=1e-10)
+
+
+class TestDiscreteDoubleBarrierPDEGridPlacement:
+    """Discrete double-barrier PDE grids place **both** barriers between nodes.
+
+    Boyle-Tian's single-barrier half-step placement fixes one barrier midway
+    between nodes; for two barriers the corridor is made an exact integer
+    multiple of the step (``step = corridor / N``) so that anchoring the lower
+    barrier half-way places the upper barrier half-way automatically.  These
+    tests assert that property holds for both barriers, on a uniform spot grid
+    and a uniform log-spot grid, with no node landing on either barrier.
+    """
+
+    LOWER_BARRIER = 95.0
+    UPPER_BARRIER = 140.0
+
+    @staticmethod
+    def _assert_half_step(grid: np.ndarray, barrier: float, *, log: bool) -> None:
+        """Assert ``barrier`` sits exactly midway between two adjacent nodes."""
+        left_idx = int(np.searchsorted(grid, barrier)) - 1
+        assert 0 <= left_idx < grid.size - 1
+        assert not np.any(np.isclose(grid, barrier, atol=1.0e-12))
+        midpoint = (
+            np.sqrt(grid[left_idx] * grid[left_idx + 1])  # geometric mean (log grid)
+            if log
+            else 0.5 * (grid[left_idx] + grid[left_idx + 1])  # arithmetic mean (spot grid)
+        )
+        assert np.isclose(midpoint, barrier, atol=1.0e-12)
+
+    @pytest.mark.parametrize("method", [PDEMethod.EXPLICIT_HULL, PDEMethod.CRANK_NICOLSON])
+    def test_spot_grid_places_both_barriers_at_half_step(self, method):
+        _, S, dS = _build_double_barrier_discrete_grid(
+            lower_barrier=self.LOWER_BARRIER,
+            upper_barrier=self.UPPER_BARRIER,
+            spot=SPOT,
+            strike=STRIKE,
+            volatility=VOL,
+            time_to_maturity=1.0,
+            smax_mult=4.0,
+            spot_steps=200,
+            time_steps=400,
+            method=method,
+            log=False,
+        )
+
+        # Uniform spacing.
+        assert np.allclose(np.diff(S), dS, atol=1.0e-12)
+        self._assert_half_step(S, self.LOWER_BARRIER, log=False)
+        self._assert_half_step(S, self.UPPER_BARRIER, log=False)
+        # Corridor is an exact integer number of steps.
+        n_corridor = (self.UPPER_BARRIER - self.LOWER_BARRIER) / dS
+        assert np.isclose(n_corridor, round(n_corridor), atol=1.0e-9)
+
+    @pytest.mark.parametrize("method", [PDEMethod.EXPLICIT_HULL, PDEMethod.CRANK_NICOLSON])
+    def test_log_grid_places_both_barriers_at_half_step_in_log_space(self, method):
+        Z, S, dz = _build_double_barrier_discrete_grid(
+            lower_barrier=self.LOWER_BARRIER,
+            upper_barrier=self.UPPER_BARRIER,
+            spot=SPOT,
+            strike=STRIKE,
+            volatility=VOL,
+            time_to_maturity=1.0,
+            smax_mult=4.0,
+            spot_steps=200,
+            time_steps=400,
+            method=method,
+            log=True,
+        )
+
+        # Uniform spacing in log space.
+        assert np.allclose(np.diff(Z), dz, atol=1.0e-12)
+
+        for barrier in (self.LOWER_BARRIER, self.UPPER_BARRIER):
+            # Half-way in spot space (geometric mean) and log space (arithmetic).
+            self._assert_half_step(S, barrier, log=True)
+            left_idx = int(np.searchsorted(S, barrier)) - 1
+            assert np.isclose(0.5 * (Z[left_idx] + Z[left_idx + 1]), np.log(barrier), atol=1.0e-12)
+            # Exactly one node sits a half-step above the barrier in log space.
+            y_prime = np.log(barrier) + 0.5 * dz
+            assert np.isclose(Z, y_prime, atol=1.0e-12).sum() == 1
+
+        # Corridor is an exact integer number of log-steps.
+        n_corridor = (np.log(self.UPPER_BARRIER) - np.log(self.LOWER_BARRIER)) / dz
+        assert np.isclose(n_corridor, round(n_corridor), atol=1.0e-9)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Directional / analytical correctness for the K-I engine
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Double-barrier analogue of ``TestBarrierAnalyticalPricing`` in test_barrier.py.
+# Verifies qualitative properties of the closed-form Kunitomo-Ikeda PV that
+# don't require an external reference value:
+#
+#   * 0 ≤ V_DKO ≤ V_vanilla
+#   * V_DKO_call = 0 when K ≥ U  (payoff range empty given the surviving corridor)
+#   * V_DKO_put  = 0 when K ≤ L  (same, mirrored)
+#   * V_DKO decreases with σ (higher vol → more likely to knock out)
+#   * V_DKI increases with σ (higher vol → more likely to activate)
+#   * V_DKO increases as the corridor widens (more room for the payoff to live)
+
+
+_DIRECTIONAL_PRICING_DATE = dt.datetime(2025, 1, 1)
+_DIRECTIONAL_MATURITY = _DIRECTIONAL_PRICING_DATE + dt.timedelta(days=365)
+
+
+def _directional_underlying(*, spot: float = SPOT, vol: float = 0.25) -> UnderlyingData:
+    market = MarketData(
+        _DIRECTIONAL_PRICING_DATE,
+        DiscountCurve.flat(0.05, end_time=2.0),
+        currency="USD",
+        day_count_convention=DayCountConvention.ACT_365F,
+    )
+    return UnderlyingData(
+        initial_value=spot,
+        volatility=vol,
+        market_data=market,
+        dividend_curve=DiscountCurve.flat(0.02, end_time=2.0),
+    )
+
+
+def _directional_double_spec(
+    *,
+    option_type: OptionType = OptionType.CALL,
+    action: BarrierAction = BarrierAction.OUT,
+    strike: float = STRIKE,
+    lower_barrier: float = 85.0,
+    upper_barrier: float = 125.0,
+) -> DoubleBarrierSpec:
+    return DoubleBarrierSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=strike,
+        maturity=_DIRECTIONAL_MATURITY,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        action=action,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+    )
+
+
+def _directional_vanilla_pv(option_type: OptionType, ud: UnderlyingData) -> float:
+    vanilla = VanillaSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=STRIKE,
+        maturity=_DIRECTIONAL_MATURITY,
+    )
+    return float(OptionValuation(ud, vanilla, PricingMethod.BSM).present_value())
+
+
+def _directional_double_pv(spec: DoubleBarrierSpec, ud: UnderlyingData) -> float:
+    return float(OptionValuation(ud, spec, PricingMethod.BSM).present_value())
+
+
+class TestDoubleBarrierAnalyticalPricing:
+    """K-I directional properties for double-barrier options."""
+
+    def test_dko_call_positive_below_vanilla(self):
+        """DKO call with K inside corridor: 0 < V_DKO < V_vanilla."""
+        ud = _directional_underlying()
+        pv = _directional_double_pv(
+            _directional_double_spec(option_type=OptionType.CALL, action=BarrierAction.OUT), ud
+        )
+        pv_vanilla = _directional_vanilla_pv(OptionType.CALL, ud)
+        assert 0.0 < pv < pv_vanilla
+
+    def test_dko_put_positive_below_vanilla(self):
+        """DKO put with K inside corridor: 0 < V_DKO < V_vanilla."""
+        ud = _directional_underlying()
+        pv = _directional_double_pv(
+            _directional_double_spec(option_type=OptionType.PUT, action=BarrierAction.OUT), ud
+        )
+        pv_vanilla = _directional_vanilla_pv(OptionType.PUT, ud)
+        assert 0.0 < pv < pv_vanilla
+
+    def test_dki_call_positive(self):
+        """DKI call: positive (some paths breach the corridor and activate)."""
+        ud = _directional_underlying()
+        pv = _directional_double_pv(
+            _directional_double_spec(option_type=OptionType.CALL, action=BarrierAction.IN), ud
+        )
+        assert pv > 0.0
+
+    @pytest.mark.parametrize(
+        "strike,upper",
+        [
+            pytest.param(125.0, 125.0, id="strike_equals_upper"),
+            pytest.param(140.0, 125.0, id="strike_above_upper"),
+        ],
+    )
+    def test_dko_call_worthless_when_strike_at_or_above_upper(self, strike, upper):
+        """DKO call with K ≥ U: surviving payoff range [max(K,L), U] is empty → 0."""
+        ud = _directional_underlying()
+        pv = _directional_double_pv(
+            _directional_double_spec(
+                option_type=OptionType.CALL,
+                action=BarrierAction.OUT,
+                strike=strike,
+                upper_barrier=upper,
+            ),
+            ud,
+        )
+        assert pv == 0.0
+
+    @pytest.mark.parametrize(
+        "strike,lower",
+        [
+            pytest.param(85.0, 85.0, id="strike_equals_lower"),
+            pytest.param(70.0, 85.0, id="strike_below_lower"),
+        ],
+    )
+    def test_dko_put_worthless_when_strike_at_or_below_lower(self, strike, lower):
+        """DKO put with K ≤ L: surviving payoff range [L, min(K,U)] is empty → 0."""
+        ud = _directional_underlying()
+        pv = _directional_double_pv(
+            _directional_double_spec(
+                option_type=OptionType.PUT,
+                action=BarrierAction.OUT,
+                strike=strike,
+                lower_barrier=lower,
+            ),
+            ud,
+        )
+        assert pv == 0.0
+
+    def test_dko_decreases_with_volatility(self):
+        """Higher σ → more likely to knock out → lower V_DKO."""
+        ud_lo = _directional_underlying(vol=0.15)
+        ud_hi = _directional_underlying(vol=0.40)
+        spec = _directional_double_spec(option_type=OptionType.CALL, action=BarrierAction.OUT)
+        assert _directional_double_pv(spec, ud_hi) < _directional_double_pv(spec, ud_lo)
+
+    def test_dki_increases_with_volatility(self):
+        """Higher σ → more likely to activate → higher V_DKI."""
+        ud_lo = _directional_underlying(vol=0.15)
+        ud_hi = _directional_underlying(vol=0.40)
+        spec = _directional_double_spec(option_type=OptionType.CALL, action=BarrierAction.IN)
+        assert _directional_double_pv(spec, ud_hi) > _directional_double_pv(spec, ud_lo)
+
+    def test_dko_increases_with_corridor_width(self):
+        """Widening the corridor (lower L, higher U) → larger V_DKO."""
+        ud = _directional_underlying()
+        narrow = _directional_double_spec(
+            option_type=OptionType.CALL,
+            action=BarrierAction.OUT,
+            lower_barrier=90.0,
+            upper_barrier=115.0,
+        )
+        wide = _directional_double_spec(
+            option_type=OptionType.CALL,
+            action=BarrierAction.OUT,
+            lower_barrier=75.0,
+            upper_barrier=140.0,
+        )
+        assert _directional_double_pv(wide, ud) > _directional_double_pv(narrow, ud)
+
+    @pytest.mark.parametrize(
+        "spot",
+        [
+            pytest.param(86.0, id="near_L"),
+            pytest.param(124.0, id="near_U"),
+        ],
+    )
+    def test_dko_call_collapses_near_barrier(self, spot):
+        """V_DKO_call → 0 as spot approaches either barrier (KO imminent)."""
+        spec = _directional_double_spec(option_type=OptionType.CALL, action=BarrierAction.OUT)
+        pv_mid = _directional_double_pv(spec, _directional_underlying(spot=100.0))
+        pv_near = _directional_double_pv(spec, _directional_underlying(spot=spot))
+        # Near the barrier the DKO value is much smaller than at mid-corridor.
+        assert pv_near < 0.25 * pv_mid
 
 
 class TestDoubleBarrierAgainstBoyleTian:
