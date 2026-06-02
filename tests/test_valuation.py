@@ -444,7 +444,7 @@ class TestOptionValuation:
 
         with pytest.raises(
             ConfigurationError,
-            match=r"spec must be a VanillaSpec, PayoffSpec, AsianSpec, or BarrierSpec",
+            match=r"spec must be a VanillaSpec, PayoffSpec, AsianSpec, BarrierSpec, or DoubleBarrierSpec",
         ):
             OptionValuation(
                 underlying=ud,

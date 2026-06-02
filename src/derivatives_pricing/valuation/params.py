@@ -196,7 +196,14 @@ class PDEParams:
         ``S_max = smax_mult * max(spot, strike)``. Default: ``4.0``.
     spot_steps
         Number of spatial grid steps. Higher values improve resolution.
-        Default: ``200``.
+        Default: ``200``.  Pass ``None`` to auto-size: for the **explicit
+        family** the spatial grid is then sized to Hull's stable trinomial
+        step ``dz_hull = σ·√(3·Δt)`` (covering the target domain, or — for a
+        continuously-monitored double barrier — pinning ``round(corridor /
+        dz_hull)`` so ``λ ≥ 1`` is guaranteed by construction).  ``None`` under
+        an unconditionally-stable scheme (CN/IMPLICIT) resolves to ``200``.
+        The auto value is frozen once at ``OptionValuation`` construction so it
+        is identical across every bump-and-revalue greek solve.
     time_steps
         Number of time steps. Higher values generally improve stability/accuracy.
         Default: ``200``.
@@ -229,7 +236,7 @@ class PDEParams:
     """
 
     smax_mult: float = 4.0
-    spot_steps: int = 200
+    spot_steps: int | None = 200
     time_steps: int = 200
     omega: float = 1.5
     tol: float = 1e-6
@@ -335,15 +342,22 @@ class PDEParams:
         return cls.for_barriers(monitoring=monitoring, **merged)
 
     def __post_init__(self) -> None:
-        for name in ("spot_steps", "time_steps", "max_iter", "rannacher_steps"):
+        for name in ("time_steps", "max_iter", "rannacher_steps"):
             if type(getattr(self, name)) is not int:
                 raise ValidationError(
                     f"{name} must be an int, got {type(getattr(self, name)).__name__}"
                 )
+        # spot_steps may be None ("auto" — resolved at OptionValuation
+        # construction); validate the int range only when explicitly given.
+        if self.spot_steps is not None:
+            if type(self.spot_steps) is not int:
+                raise ValidationError(
+                    f"spot_steps must be an int or None, got {type(self.spot_steps).__name__}"
+                )
+            if self.spot_steps < 3:
+                raise ValidationError(f"spot_steps must be >= 3, got {self.spot_steps}")
         if self.smax_mult <= 0:
             raise ValidationError(f"smax_mult must be positive, got {self.smax_mult}")
-        if self.spot_steps < 3:
-            raise ValidationError(f"spot_steps must be >= 3, got {self.spot_steps}")
         if self.time_steps < 1:
             raise ValidationError(f"time_steps must be >= 1, got {self.time_steps}")
         if not (1.0 < self.omega < 2.0):

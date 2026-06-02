@@ -65,6 +65,7 @@ from .pde import (
     _FDAmericanValuation,
     _FDBarrierValuation,
     _FDDoubleBarrierValuation,
+    _resolve_pde_spot_steps,
 )
 from ..rates import DiscountCurve
 from ..market_environment import MarketData
@@ -473,6 +474,12 @@ class OptionValuation:
                 raise ValidationError(
                     "Barrier monitoring schedule must not start before pricing_date."
                 )
+
+        # Resolve an "auto" (None) PDE spot_steps to a concrete int *now*, so
+        # the grid *dimensions* (spot_steps/time_steps) stay fixed across the
+        # base solve and bump-and-revalue instances.
+        if isinstance(self._params, PDEParams):
+            self._params = self._freeze_pde_grid(self._params)
 
         # Dispatch to appropriate pricing method implementation
         self._impl = self._build_impl()
@@ -1073,6 +1080,41 @@ class OptionValuation:
         raise ConfigurationError(
             f"pricing_method={pricing_method.name} does not accept valuation params"
         )
+
+    def _freeze_pde_grid(self, params: PDEParams) -> PDEParams:
+        """Resolve an ``auto`` (``None``) ``spot_steps`` to a concrete int once.
+
+        With ``spot_steps=None`` this derives the grid size from the base
+        underlying/spec (see :func:`_resolve_pde_spot_steps`) and pins it on the
+        returned params.  Pinning happens **once**, so every bump-and-revalue
+        child (built with this same params via :meth:`_build_valuation`) shares
+        the same grid *dimensions*: ``spot_steps`` and ``time_steps`` are
+        invariant across the base PV and all greek legs — exactly as they were
+        when callers passed an explicit int.  The step ``dz`` itself is *not*
+        held fixed and need not be: for the explicit family it tracks
+        ``dz_hull = σ·√(3·Δt)``, so a vol bump legitimately re-spaces the grid
+        to keep each leg's solve stable and Hull-spaced.  What must stay
+        invariant is the node *count* — re-resolving it per leg (e.g. 61→62 as
+        ``dz_hull`` shrinks under the bump) is precisely the discretization
+        jitter that would contaminate the finite-difference greek.  No-op when
+        ``spot_steps`` is already an int.  The underlying is guaranteed to be
+        ``UnderlyingData`` here: ``__init__`` rejects any other type for
+        ``PDE_FD`` at construction.
+        """
+        if params.spot_steps is not None:
+            return params
+        underlying = self._underlying
+        spot = float(underlying.initial_value)
+        strike = float(getattr(self._spec, "strike", spot))
+        n = _resolve_pde_spot_steps(
+            spec=self._spec,
+            spot=spot,
+            strike=strike,
+            volatility=float(underlying.volatility),
+            time_to_maturity=self._maturity_year_fraction(),
+            params=params,
+        )
+        return dc_replace(params, spot_steps=n)
 
     def _asian_fixing_dates(self) -> tuple[dt.datetime, ...]:
         """Resolve the contractual Asian fixing schedule as datetimes."""
