@@ -3143,11 +3143,18 @@ def _build_double_barrier_full_grid(
     and ``upper_barrier`` on nodes (so the inactive↔active coupling at each
     barrier is exact).
 
-    ``spot_steps`` controls the *total* node count (~``spot_steps`` intervals);
-    the corridor receives a proportional share.  Returns
-    ``(grid, S, step, j_L, j_U)`` where ``grid`` is the log-axis (LOG_SPOT) or
-    spot-axis (SPOT), ``step`` is ``dz``/``dS``, and ``j_L``/``j_U`` are the
-    lower/upper barrier node indices.
+    ``spot_steps`` is honored exactly: ``len(axis) == spot_steps + 1`` (i.e.
+    ``spot_steps`` intervals).  The corridor receives an integer share ``m``
+    near its proportional weight ``corridor / total``; ``m`` is monotonically
+    reduced if the minimum wings needed to cover ``[lo_target, hi_target]``
+    won't fit in the budget; leftover budget is then distributed between the
+    two wings.
+
+    Returns ``(grid, S, step, j_L, j_U)`` where ``grid`` is the log-axis
+    (LOG_SPOT) or spot-axis (SPOT), ``step`` is ``dz``/``dS``, and
+    ``j_L``/``j_U`` are the lower/upper barrier node indices (so
+    ``axis[j_L] == log(lower_barrier)`` etc. — barriers land *on* nodes
+    here, not half-step between them).
     """
     if log:
         a_lo, a_hi = float(np.log(lower_barrier)), float(np.log(upper_barrier))
@@ -3161,17 +3168,68 @@ def _build_double_barrier_full_grid(
         hi_target = float(smax_mult * ref_hi)
         lo_target = 0.0
 
-    width = a_hi - a_lo
+    corridor = a_hi - a_lo
     total = hi_target - lo_target
-    # Corridor interval count proportional to its share of the full domain.
-    m = max(2, int(round(spot_steps * width / total)))
-    step = width / m
-    n_below = max(1, int(round((a_lo - lo_target) / step)))
-    n_above = max(1, int(round((hi_target - a_hi) / step)))
+
+    # Constraint: ``n_below + m + n_above == spot_steps``
+    # (barriers sit on nodes, so intervals = wings + corridor exactly).
+    target_sum = spot_steps
+
+    def _min_wings(step_try: float) -> tuple[int, int]:
+        """Minimum wings to cover [lo_target, hi_target] given ``step``."""
+        # n_below such that a_lo - n_below*step ≤ lo_target → n_below ≥ (a_lo - lo_target)/step
+        nb = max(1, int(math.ceil((a_lo - lo_target) / step_try - 1.0e-12)))
+        na = max(1, int(math.ceil((hi_target - a_hi) / step_try - 1.0e-12)))
+        return nb, na
+
+    # Initial corridor count: proportional share of the budget.  Floor at 2 so
+    # there's at least one interior corridor node between the two barriers
+    # (the KI inactive surface needs at least one strictly-interior data point).
+    m = max(2, int(round(spot_steps * corridor / total)))
+
+    # Reduce ``m`` monotonically until ``min_wings + m`` fits the budget.
+    # Reducing m enlarges the step (dz = corridor/m), which monotonically
+    # shrinks the required wings, so the feasibility check is monotone-
+    # decreasing in m.  Bounded by a handful of iterations in practice.
+    while m > 2:
+        nb_min, na_min = _min_wings(corridor / m)
+        if nb_min + m + na_min <= target_sum:
+            break
+        m -= 1
+
+    step = corridor / m
+    nb_min, na_min = _min_wings(step)
+
+    extras = target_sum - (nb_min + m + na_min)
+    if extras >= 0:
+        # Distribute leftover budget to wings symmetrically (asymmetric by 1
+        # if odd).  Pushes the far-field boundary further out — free
+        # reduction of Dirichlet BC leakage into the live region.
+        n_below = nb_min + extras // 2
+        n_above = na_min + (extras - extras // 2)
+    else:
+        # Pathological edge case: even m=2 with minimum wings overflows the
+        # budget.  Shrink wings proportionally — domain coverage suffers but
+        # spot_steps and on-node barrier placement are preserved.
+        wing_budget = max(2, target_sum - m)
+        denom = max(1, nb_min + na_min)
+        n_below = max(1, int(round(wing_budget * nb_min / denom)))
+        n_above = max(1, wing_budget - n_below)
+
+    if not log:
+        # Spot grid has a hard floor at 0.  Lower wing must keep
+        # ``a_min = a_lo - n_below * step > 0``.  Donate any slack to the
+        # upper wing so the total interval count is preserved.
+        max_nb = max(1, int(math.floor(a_lo / step - 1.0e-12)))
+        if n_below > max_nb:
+            n_above += n_below - max_nb
+            n_below = max_nb
+
+    # Build the grid.  ``a_lo`` sits on node ``n_below`` exactly; ``a_hi``
+    # on node ``n_below + m`` exactly (since corridor = m * step).
     a_min = a_lo - n_below * step
-    a_max = a_hi + n_above * step
-    n_total = n_below + m + n_above
-    axis = np.linspace(a_min, a_max, n_total + 1)
+    n_intervals = n_below + m + n_above  # = spot_steps
+    axis = a_min + step * np.arange(n_intervals + 1, dtype=float)
     S = np.exp(axis) if log else axis
     return axis, S, step, n_below, n_below + m
 
