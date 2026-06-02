@@ -276,17 +276,28 @@ class PDEParams:
           accuracy for discrete barriers (each small Δt damps the reset
           discontinuities within a few steps).
 
+        The discrete (explicit) default sets ``spot_steps=None`` ("auto"):
+        an explicit scheme's spacing ``dz`` is pinned by stability to Hull's
+        trinomial step ``dz_hull = σ·√(3·Δt)`` and is therefore wholly
+        ``time_steps``-driven, so ``spot_steps`` is not an independent
+        accuracy dial — the engine sizes the grid to cover the domain at
+        ``dz_hull`` (see ``_resolve_pde_spot_steps``).  Continuous (CN) keeps
+        an int passed ``spot_steps`` since CN's ``dz`` is a free accuracy/speed
+        choice with no physical scale.
+
         ``monitoring`` is required (no default) so the dependency is
         explicit at the call site.  Any other keyword argument accepted
         by the constructor can be passed to override individual fields,
-        including ``method``.  Note: if you bump ``spot_steps`` much
-        higher without also bumping ``time_steps``, the runtime CFL
-        check (``_check_explicit_spot_stability``) may warn — keep the
-        ratio roughly ``time_steps ≥ 2 × spot_steps`` for σ ~ 0.25.
+        including ``method``.  Note: this CFL caveat applies only if you
+        *override* ``spot_steps`` with an int under an explicit scheme —
+        bumping it much higher without also bumping ``time_steps`` may trip
+        the runtime check (``_check_explicit_spot_stability``); keep the
+        ratio roughly ``time_steps ≥ 2 × spot_steps`` for σ ~ 0.25.  Leaving
+        the auto default sidesteps this entirely.
         """
         if monitoring is BarrierMonitoring.DISCRETE:
             method = PDEMethod.EXPLICIT_HULL
-            spot_steps, time_steps = 1200, 3000
+            spot_steps, time_steps = None, 3000
             american_solver = PDEEarlyExercise.INTRINSIC
         else:
             method = PDEMethod.CRANK_NICOLSON
@@ -319,12 +330,14 @@ class PDEParams:
         observation date, so the value surface carries fresh discontinuities at
         each end of the corridor; theta in particular needs more temporal
         resolution than the single-barrier discrete default to settle.
-        ``time_steps`` is therefore lifted (3000 -> 6000); ``spot_steps``
-        stays at 1000 (Hull's stability-pinned ``dz`` already places ~130
-        nodes inside a typical 1.5x corridor, and the wings to the
-        ``smax_mult * max(spot, strike, U)`` far-field round out the budget).
-        ``EXPLICIT_HULL`` makes the higher ``time_steps`` cheap (single
-        vectorised matrix-vector multiply per step, no PSOR iteration).
+        ``time_steps`` is therefore lifted (3000 -> 6000).  ``spot_steps``
+        inherits the discrete default ``None`` ("auto"): being explicit, the
+        grid is sized to Hull's stability-pinned ``dz = σ·√(3·Δt)``, which
+        already places plenty of nodes inside a typical corridor and extends
+        wings to the ``smax_mult * max(spot, strike, U)`` far-field — no
+        hand-tuned count needed.  ``EXPLICIT_HULL`` makes the higher
+        ``time_steps`` cheap (single vectorised matrix-vector multiply per
+        step, no PSOR iteration).
 
         For **continuous** monitoring the corridor-truncated Crank-Nicolson grid
         already resolves PVs and greeks to ~1e-4 on the ``for_barriers``
@@ -334,7 +347,7 @@ class PDEParams:
         Any keyword accepted by the constructor overrides the chosen defaults.
         """
         richer = (
-            dict(spot_steps=1000, time_steps=6000)
+            dict(spot_steps=None, time_steps=6000)
             if monitoring is BarrierMonitoring.DISCRETE
             else {}
         )
