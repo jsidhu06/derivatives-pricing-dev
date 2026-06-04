@@ -1815,7 +1815,8 @@ def _resolve_pde_spot_steps(
       This removes the foot-gun where a hand-picked ``spot_steps`` drives
       ``λ = dz / (σ√Δt) < 1`` and the explicit scheme produces negative
       transition probabilities.
-    * **Free far-field (vanilla / single barrier / discrete double, log grid)**
+    * **Free far-field (vanilla / single barrier / double barrier American KI /
+        discrete double, log grid)**
       — the far boundary floats, so cover the target log-span at ``dz_hull``::
 
           spot_steps = ceil(span / dz_hull)
@@ -1928,21 +1929,23 @@ def _build_double_barrier_discrete_grid(
     total = hi_target - lo_target
     explicit = method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL)
 
-    # We aim to return ``spot_steps + 1`` nodes (``spot_steps`` intervals)
-    # exactly, matching the convention of ``_build_log_grid``.  Two regimes:
+    # Both regimes return exactly ``spot_steps + 1`` nodes (``spot_steps``
+    # intervals), matching ``_build_log_grid``.  They differ only in how the
+    # log-step ``dz`` is chosen:
     #
-    # 1. ``EXPLICIT + log``: dz is fixed by Hull's trinomial spacing
-    #    ``σ√(3Δt)`` (kept ≥ ``σ√Δt`` for non-negative transition probabilities).
-    #    spot_steps is treated as an **upper bound**: if the natural wings
-    #    would overflow, shrink them proportionally; otherwise leave them
-    #    natural (padding would just inflate the far-field domain without
-    #    accuracy benefit).
-    # 2. **All other schemes** (CN, IMPLICIT, or any spot-grid explicit): dz
-    #    is free, so spot_steps is treated as an **exact** target.  Pick the
-    #    corridor interval count ``m`` so that minimum wings + ``m`` ≤
-    #    ``spot_steps - 1`` (reducing ``m`` is monotone in feasibility:
-    #    enlarging dz shrinks both the corridor count and the required
-    #    wings), then distribute leftover intervals between the two wings.
+    # 1. ``EXPLICIT + log``: dz is fixed by stability to Hull's trinomial
+    #    spacing ``σ√(3Δt)`` (kept ≥ ``σ√Δt`` for non-negative transition
+    #    probabilities), which pins the corridor count ``m``.  The wings then
+    #    absorb the remaining budget around that fixed dz: shrunk
+    #    proportionally if the coverage wings + ``m`` overflow ``spot_steps``,
+    #    or padded symmetrically — pushing the artificial far-field boundary
+    #    further out — if they underflow.
+    # 2. **All other schemes** (CN, IMPLICIT, or any spot-grid explicit): dz is
+    #    free, so it is chosen to honor ``spot_steps`` exactly.  Pick the
+    #    corridor interval count ``m`` near ``corridor * spot_steps / total``,
+    #    reduce it until minimum wings + ``m`` ≤ ``spot_steps - 1`` (monotone
+    #    in feasibility: enlarging dz shrinks both the corridor count and the
+    #    required wings), then distribute leftover intervals between the wings.
     #
     # In both regimes the corridor is held to an *integer* number of
     # intervals (``step = corridor / m``); anchoring the lower barrier
@@ -3220,8 +3223,12 @@ def _build_double_barrier_full_grid(
     upper_barrier: float,
     spot: float,
     strike: float,
+    volatility: float,
+    time_to_maturity: float,
     smax_mult: float,
     spot_steps: int,
+    time_steps: int,
+    method: PDEMethod,
     log: bool,
 ) -> tuple[np.ndarray, np.ndarray, float, int, int]:
     """Build a *full* grid (extending beyond both barriers) with both barriers
@@ -3232,6 +3239,13 @@ def _build_double_barrier_full_grid(
     ``smax_mult`` far field on both sides while still placing ``lower_barrier``
     and ``upper_barrier`` on nodes (so the inactive↔active coupling at each
     barrier is exact).
+
+    For the explicit family the log stencil needs ``λ = step/(σ√Δt) ≥ 1`` for a
+    non-negative middle transition probability; we raise :class:`StabilityError`
+    otherwise — matching the KO core (:func:`_build_double_barrier_continuous_log_grid`)
+    and the discrete builder — so an unstable explicit KI solve fails fast at
+    grid construction. CN / IMPLICIT are unconditionally stable and
+    unaffected.
 
     ``spot_steps`` is honored exactly: ``len(axis) == spot_steps + 1`` (i.e.
     ``spot_steps`` intervals).  The corridor receives an integer share ``m``
@@ -3288,6 +3302,22 @@ def _build_double_barrier_full_grid(
         m -= 1
 
     step = corridor / m
+
+    # Explicit-family log stencil needs λ = step/(σ√Δt) ≥ 1 for a non-negative
+    # middle transition probability. Mirror the KO core's guard so the KI full
+    # grid fails fast.
+    if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL) and log:
+        sigma_sqrt_dt = volatility * math.sqrt(time_to_maturity / time_steps)
+        lam = step / sigma_sqrt_dt
+        if lam < 1.0:
+            raise StabilityError(
+                f"Explicit double knock-in scheme is unstable: "
+                f"lambda = step/(sigma*sqrt(dt)) = {lam:.3f} < 1 "
+                f"(corridor {corridor:.4f} over {m} intervals gives negative "
+                f"transition probabilities). Reduce spot_steps, increase "
+                f"time_steps, or use CRANK_NICOLSON / IMPLICIT."
+            )
+
     nb_min, na_min = _min_wings(step)
 
     extras = target_sum - (nb_min + m + na_min)
@@ -3405,8 +3435,12 @@ def _fd_double_barrier_ki_core(
             upper_barrier=upper_barrier,
             spot=spot,
             strike=strike,
+            volatility=volatility,
+            time_to_maturity=time_to_maturity,
             smax_mult=smax_mult,
             spot_steps=spot_steps,
+            time_steps=time_steps,
+            method=method,
             log=log_grid,
         )
     else:
