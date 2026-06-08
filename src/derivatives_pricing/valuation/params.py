@@ -197,13 +197,15 @@ class PDEParams:
     spot_steps
         Number of spatial grid steps. Higher values improve resolution.
         Default: ``200``.  Pass ``None`` to auto-size: for the **explicit
-        family** the spatial grid is then sized to Hull's stable trinomial
-        step ``dz_hull = σ·√(3·Δt)`` (covering the target domain, or — for a
-        continuously-monitored double barrier — pinning ``round(corridor /
-        dz_hull)`` so ``λ ≥ 1`` is guaranteed by construction).  ``None`` under
-        an unconditionally-stable scheme (CN/IMPLICIT) resolves to ``200``.
-        The auto value is frozen once at ``OptionValuation`` construction so it
-        is identical across every bump-and-revalue greek solve.
+        family** with a log spatial grid, the spatial step is sized to Hull's
+        stable trinomial ``dz_hull = σ·√(3·Δt)`` (covering the target
+        domain, or — for a continuously-monitored double barrier — pinning
+        ``round(corridor / dz_hull)`` so ``λ ≥ 1`` is guaranteed by
+        construction).  ``None`` under an unconditionally-stable scheme
+        (CN/IMPLICIT) or an explicit family on a level spatial grid resolves
+        to ``200``. The auto value is frozen once at
+        ``OptionValuation`` construction so it is identical across every
+        bump-and-revalue greek solve.
     time_steps
         Number of time steps. Higher values generally improve stability/accuracy.
         Default: ``200``.
@@ -268,32 +270,25 @@ class PDEParams:
           quality on the rest of the time march.
         - ``BarrierMonitoring.DISCRETE`` → ``PDEMethod.EXPLICIT_HULL`` with
           ``american_solver=PDEEarlyExercise.INTRINSIC``.  Discrete
-          monitoring projects ``V(S, t_i) = 0`` past the barrier at every
-          observation date, introducing a fresh step discontinuity each
-          time.  ``EXPLICIT_HULL``'s per-step cost is a single vectorised
-          matrix-vector multiply, so we can crank
-          ``time_steps`` up cheaply.  Time-stepping resolution dominates
-          accuracy for discrete barriers (each small Δt damps the reset
-          discontinuities within a few steps).
+          monitoring projects ``V(S, t_i) = (discounted) rebate`` past the
+          barrier at every observation date, introducing a fresh step discontinuity
+          each time.  ``EXPLICIT_HULL``'s per-step cost is a single vectorised
+          matrix-vector multiply, so we can crank ``time_steps`` up cheaply.
 
-        The discrete (explicit) default sets ``spot_steps=None`` ("auto"):
-        an explicit scheme's spacing ``dz`` is pinned by stability to Hull's
+        The discrete (explicit) default sets ``spot_steps=None`` ("auto")
+        with a log spatial grid: an explicit scheme's spacing ``dz`` is
+        pinned by stability to Hull's
         trinomial step ``dz_hull = σ·√(3·Δt)`` and is therefore wholly
         ``time_steps``-driven, so ``spot_steps`` is not an independent
         accuracy dial — the engine sizes the grid to cover the domain at
-        ``dz_hull`` (see ``_resolve_pde_spot_steps``).  Continuous (CN) keeps
-        an int passed ``spot_steps`` since CN's ``dz`` is a free accuracy/speed
+        ``dz_hull`` (see ``_resolve_pde_spot_steps``). Continuous (CN) passes
+        an int spot_steps`` since CN's ``dz`` is a free accuracy/speed
         choice with no physical scale.
 
         ``monitoring`` is required (no default) so the dependency is
         explicit at the call site.  Any other keyword argument accepted
         by the constructor can be passed to override individual fields,
-        including ``method``.  Note: this CFL caveat applies only if you
-        *override* ``spot_steps`` with an int under an explicit scheme —
-        bumping it much higher without also bumping ``time_steps`` may trip
-        the runtime check (``_check_explicit_spot_stability``); keep the
-        ratio roughly ``time_steps ≥ 2 × spot_steps`` for σ ~ 0.25.  Leaving
-        the auto default sidesteps this entirely.
+        including ``method``.
         """
         if monitoring is BarrierMonitoring.DISCRETE:
             method = PDEMethod.EXPLICIT_HULL
@@ -328,21 +323,18 @@ class PDEParams:
         ``time_steps`` for **discrete** monitoring.  A discretely-monitored
         double barrier injects a knock-out reset at *both* barriers on every
         observation date, so the value surface carries fresh discontinuities at
-        each end of the corridor; theta in particular needs more temporal
+        each end of the corridor; empirically theta in particular needed more temporal
         resolution than the single-barrier discrete default to settle.
         ``time_steps`` is therefore lifted (3000 -> 6000).  ``spot_steps``
         inherits the discrete default ``None`` ("auto"): being explicit, the
-        grid is sized to Hull's stability-pinned ``dz = σ·√(3·Δt)``, which
-        already places plenty of nodes inside a typical corridor and extends
-        wings to the ``smax_mult * max(spot, strike, U)`` far-field — no
-        hand-tuned count needed.  ``EXPLICIT_HULL`` makes the higher
-        ``time_steps`` cheap (single vectorised matrix-vector multiply per
-        step, no PSOR iteration).
+        log spatial grid is sized to Hull's stability-pinned ``dz = σ·√(3·Δt)``.
+        ``EXPLICIT_HULL`` makes the higher ``time_steps`` cheap
+        (single vectorised matrix-vector multiply per step, no PSOR iteration).
 
         For **continuous** monitoring the corridor-truncated Crank-Nicolson grid
-        already resolves PVs and greeks to ~1e-4 on the ``for_barriers``
-        defaults (all ``spot_steps`` sit inside the corridor), so this method
-        deliberately falls through to identical params there.
+        already resolves PVs and greeks to ~1e-4 vs Boyle-Tian (1998) using the
+        ``for_barriers`` defaults (all ``spot_steps`` sit inside the corridor),
+        so this method deliberately falls through to identical params there.
 
         Any keyword accepted by the constructor overrides the chosen defaults.
         """

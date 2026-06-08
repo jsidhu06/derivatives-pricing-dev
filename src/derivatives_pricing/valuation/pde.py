@@ -1802,9 +1802,9 @@ def _resolve_pde_spot_steps(
     """Resolve ``PDEParams.spot_steps`` when the caller left it ``None`` ("auto").
 
     ``None`` means "size the spatial grid for me".  Resolution only does real
-    work for the **explicit family**, where stability fixes the log-step to
-    Hull's trinomial spacing ``dz_hull = σ·√(3·Δt)`` (the ``p_m = 2/3``
-    stencil).  What that pins depends on which boundary is free:
+    work for the **explicit family** with a log spatial grid, where stability
+    fixes the log-step to Hull's trinomial spacing ``dz_hull = σ·√(3·Δt)``
+    (the ``p_m = 2/3`` stencil).  What that pins depends on which boundary is free:
 
     * **Continuous double barrier (log grid)** — *both* ends are pinned at the
       barriers, so the width ``corridor = ln(U / L)`` is fixed and the **count**
@@ -1815,18 +1815,19 @@ def _resolve_pde_spot_steps(
       This removes the foot-gun where a hand-picked ``spot_steps`` drives
       ``λ = dz / (σ√Δt) < 1`` and the explicit scheme produces negative
       transition probabilities.
+
     * **Free far-field (vanilla / single barrier / double barrier American KI /
-        discrete double, log grid)**
-      — the far boundary floats, so cover the target log-span at ``dz_hull``::
+        discrete double)**
+      — at least one boundary floats, so cover the target log-span at ``dz_hull``::
 
           spot_steps = ceil(span / dz_hull)
 
     Unconditionally-stable schemes (CN/IMPLICIT) and spot-space explicit grids
     fall back to :data:`_DEFAULT_AUTO_SPOT_STEPS`.  A non-``None`` ``spot_steps``
-    is always honored verbatim (full back-compat).
+    is always honored verbatim.
 
     Called once, at ``OptionValuation`` construction, so the resolved value is
-    frozen across every bump-and-revalue solve (no grid jitter in the greeks).
+    frozen across every bump-and-revalue solve.
     """
     if params.spot_steps is not None:
         return params.spot_steps
@@ -1844,7 +1845,7 @@ def _resolve_pde_spot_steps(
         and spec.monitoring is BarrierMonitoring.CONTINUOUS
         and params.space_grid is PDESpaceGrid.LOG_SPOT
     ):
-        corridor = float(math.log(spec.upper_barrier) - math.log(spec.lower_barrier))
+        corridor = float(np.log(spec.upper_barrier) - np.log(spec.lower_barrier))
         return max(3, int(round(corridor / dz_hull)))
 
     # Free far-field: cover the target log-span at Hull spacing.
@@ -1860,8 +1861,8 @@ def _resolve_pde_spot_steps(
             if levels:
                 ref_hi = max(ref_hi, *levels)
                 ref_lo = min(ref_lo, *levels)
-        hi_target = math.log(params.smax_mult * ref_hi)
-        lo_target = math.log(max(ref_lo / params.smax_mult, 1.0e-8))
+        hi_target = np.log(params.smax_mult * ref_hi)
+        lo_target = np.log(max(ref_lo / params.smax_mult, 1.0e-8))
         return max(3, int(math.ceil((hi_target - lo_target) / dz_hull)))
 
     # Spot (non-log) explicit grids have no clean dz_hull pin — default.
@@ -2945,6 +2946,18 @@ def _fd_barrier_ki_core(
 
     tau_grid = _build_tau_grid(time_to_maturity, time_steps, extra_taus)
 
+    if method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL) and space_grid is PDESpaceGrid.SPOT:
+        _check_explicit_spot_stability(
+            tau_grid=tau_grid,
+            volatility=volatility,
+            smax=smax,
+            dS=dS,
+            time_to_maturity=time_to_maturity,
+            discount_curve=discount_curve,
+            dividend_curve=dividend_curve,
+            implicit_discounting=method is PDEMethod.EXPLICIT_HULL,
+        )
+
     # ── Barrier index for sub-grid coupling ──────────────────────────
     # Find the grid node closest to the barrier level.
     j_H = int(np.argmin(np.abs(S - barrier)))
@@ -3387,13 +3400,13 @@ def _fd_double_barrier_ki_core(
     Direct generalisation of :func:`_fd_barrier_ki_core` to two barriers:
 
     * **Active** (``V_act``): full-grid vanilla (with early-exercise projection
-      when ``early_exercise``) — the post-knock-in state.
+      when ``early_exercise=True``) — the post-knock-in state.
     * **Inactive** (``V_inact``): the not-yet-knocked-in state.
 
     **Continuous monitoring** — the inactive surface is solved on the corridor
     interior only, with ``V_act`` coupled in as the Dirichlet boundary at
-    *both* barriers (``V_act[j_L]`` below, ``V_act[j_U]`` above; barriers sit on
-    nodes via :func:`_build_double_barrier_full_grid`).  Outside the corridor
+    *both* barriers (``V_act[j_L]`` and below, ``V_act[j_U]`` and above; barriers
+    sit on nodes via :func:`_build_double_barrier_full_grid`).  Outside the corridor
     the inactive surface equals the active surface (already knocked in).
 
     **Discrete monitoring** — both barriers are placed midway between nodes
@@ -3409,9 +3422,6 @@ def _fd_double_barrier_ki_core(
 
     Returns ``(price, S, V_inact_final, V_inact_prev, last_dtau)``.
     """
-    continuous = monitoring is BarrierMonitoring.CONTINUOUS
-    if not continuous and monitoring_taus is None:
-        raise ConfigurationError("monitoring_taus is required for discrete barrier monitoring.")
     _validate_fd_inputs(
         option_type=option_type,
         time_to_maturity=time_to_maturity,
@@ -3426,6 +3436,10 @@ def _fd_double_barrier_ki_core(
         tol=tol,
         max_iter=max_iter,
     )
+
+    continuous = monitoring is BarrierMonitoring.CONTINUOUS
+    if not continuous and monitoring_taus is None:
+        raise ConfigurationError("monitoring_taus is required for discrete barrier monitoring.")
 
     log_grid = space_grid is PDESpaceGrid.LOG_SPOT
     if continuous:
@@ -3459,8 +3473,6 @@ def _fd_double_barrier_ki_core(
             log=log_grid,
         )
 
-    dz = step if log_grid else 0.0
-    dS = step if not log_grid else 0.0
     smin = float(S[0])
     smax = float(S[-1])
     n_nodes = len(S)
@@ -3503,7 +3515,7 @@ def _fd_double_barrier_ki_core(
             tau_grid=tau_grid,
             volatility=volatility,
             smax=smax,
-            dS=dS,
+            dS=step,  # spot-grid branch: step is dS here
             time_to_maturity=time_to_maturity,
             discount_curve=discount_curve,
             dividend_curve=dividend_curve,
@@ -3550,7 +3562,7 @@ def _fd_double_barrier_ki_core(
 
         if log_grid:
             gamma, beta, alpha = _log_operator_coeffs(
-                dz=dz,
+                dz=step,
                 risk_free_rate=r,
                 dividend_rate=q,
                 volatility=volatility,
@@ -3560,7 +3572,7 @@ def _fd_double_barrier_ki_core(
         else:
             gamma, beta, alpha = _spot_operator_coeffs(
                 spot_values=S[1:-1],
-                dS=dS,
+                dS=step,
                 risk_free_rate=r,
                 dividend_rate=q,
                 volatility=volatility,
@@ -3627,7 +3639,6 @@ def _fd_double_barrier_ki_core(
                     psor_not_converged += 1
 
         # ── Inactive surface ──
-        rebate_bv = rebate * df_tT
         if continuous:
             # Corridor sub-grid, coupled to V_act at both barriers.
             if j_inact.size > 0:
@@ -3646,9 +3657,6 @@ def _fd_double_barrier_ki_core(
             # Outside the corridor the option is knocked in → equals active.
             V_inact[: j_L + 1] = V_act[: j_L + 1]
             V_inact[j_U:] = V_act[j_U:]
-            if rebate_bv:  # keep far-field consistent if a rebate is present
-                V_inact[0] = V_act[0]
-                V_inact[-1] = V_act[-1]
         else:
             # Discrete: full-grid continuation solve.  Both far ends lie in a
             # knock-in zone, so use the active surface as a one-step look-ahead
