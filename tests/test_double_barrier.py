@@ -1782,3 +1782,298 @@ class TestDoubleBarrierInceptionTriggeredGreekShortCircuits:
         assert ov_ki.rho(greek_calc_method=greek_method) == ov_vanilla.rho(
             greek_calc_method=greek_method
         )
+
+
+class TestDoubleBarrierKOAgainstZvanVetzalForsyth:
+    """Double knock-out call PVs vs Zvan-Vetzal-Forsyth (2000) Table 2.
+
+    Zvan, Vetzal & Forsyth (2000), "PDE methods for pricing barrier options",
+    *J. Economic Dynamics & Control* 24, Table 2.  A double-KO call struck at
+    100 with corridor ``[95, 125]``, ``S0=100, r=0.10, sigma=0.20, T=0.5``,
+    priced under **continuous / daily (125 obs) / weekly (25 obs)** monitoring,
+    for European / European-with-dividend / American / American-with-dividend.
+    The discrete cash dividend is ``$2`` paid at ``T - t = 0.25``.
+
+    Default ``OptionValuation`` params are used
+    throughout, so the scheme is whatever the factory picks per monitoring:
+    **CN** for continuous, **Explicit-Hull** for discrete.
+    """
+
+    PRICING_DATE = dt.datetime(2025, 1, 1)
+    DAYCOUNT = DayCountConvention.ACT_365F
+    MATURITY = PRICING_DATE + dt.timedelta(days=365 * 0.5)  # ACT/365F -> T = 182.5/365 = 0.5
+    DIV_DATE = PRICING_DATE + dt.timedelta(
+        days=365 * 0.25
+    )  # tau = 91.25/365 = 0.25 -> "T - t = 0.25"
+    SPOT = 100.0
+    STRIKE = 100.0
+    LOWER_BARRIER = 95.0
+    UPPER_BARRIER = 125.0
+    SIGMA = 0.20
+    RATE = 0.10
+    DIVIDEND = 2.0
+    DAILY_OBS = 125  # 0.5yr * 250 trading days/yr -> Δτ = 0.004
+    WEEKLY_OBS = 25  # 0.5yr * 50 weeks/yr (5d/wk)  -> Δτ = 0.020
+
+    _TOL: dict[str, float] = dict(rtol=5.0e-3, atol=0.0)
+
+    @classmethod
+    def _market_data(cls) -> MarketData:
+        return MarketData(
+            cls.PRICING_DATE,
+            DiscountCurve.flat(cls.RATE),
+            currency="USD",
+            day_count_convention=cls.DAYCOUNT,
+        )
+
+    @classmethod
+    def _underlying(cls, with_dividend: bool) -> UnderlyingData:
+        return UnderlyingData(
+            initial_value=cls.SPOT,
+            volatility=cls.SIGMA,
+            market_data=cls._market_data(),
+            discrete_dividends=[(cls.DIV_DATE, cls.DIVIDEND)] if with_dividend else None,
+        )
+
+    @classmethod
+    def _double_ko_call_pv(
+        cls,
+        exercise: ExerciseType,
+        monitoring: BarrierMonitoring,
+        num_obs: int | None,
+        with_dividend: bool,
+    ) -> float:
+        spec = DoubleBarrierSpec(
+            option_type=OptionType.CALL,
+            exercise_type=exercise,
+            strike=cls.STRIKE,
+            maturity=cls.MATURITY,
+            lower_barrier=cls.LOWER_BARRIER,
+            upper_barrier=cls.UPPER_BARRIER,
+            action=BarrierAction.OUT,
+            monitoring=monitoring,
+            num_observations=num_obs,
+        )
+        # Default params on purpose: CN (continuous) / Explicit-Hull (discrete).
+        return float(
+            OptionValuation(
+                cls._underlying(with_dividend), spec, PricingMethod.PDE_FD
+            ).present_value()
+        )
+
+    def test_setup_reproduces_paper_schedule(self):
+        """ACT/360 dates give T=0.5 and the dividend at tau=0.25 exactly."""
+        T = calculate_year_fraction(self.PRICING_DATE, self.MATURITY, self.DAYCOUNT)
+        tau_div = calculate_year_fraction(self.DIV_DATE, self.MATURITY, self.DAYCOUNT)
+        assert np.isclose(T, 0.5)
+        assert np.isclose(tau_div, 0.25)
+
+    @pytest.mark.parametrize(
+        "monitoring,num_obs,exercise,with_div,paper_pv",
+        [
+            # ── Continuous monitoring (CN) ──────────────────────────────────
+            pytest.param(
+                BarrierMonitoring.CONTINUOUS,
+                None,
+                ExerciseType.EUROPEAN,
+                False,
+                2.037,
+                id="continuous-european",
+            ),
+            pytest.param(
+                BarrierMonitoring.CONTINUOUS,
+                None,
+                ExerciseType.EUROPEAN,
+                True,
+                1.915,
+                id="continuous-european-div",
+            ),
+            pytest.param(
+                BarrierMonitoring.CONTINUOUS,
+                None,
+                ExerciseType.AMERICAN,
+                False,
+                5.462,
+                id="continuous-american",
+            ),
+            pytest.param(
+                BarrierMonitoring.CONTINUOUS,
+                None,
+                ExerciseType.AMERICAN,
+                True,
+                4.794,
+                id="continuous-american-div",
+            ),
+            # ── Daily monitoring, 125 obs (Explicit-Hull) ───────────────────
+            pytest.param(
+                BarrierMonitoring.DISCRETE,
+                DAILY_OBS,
+                ExerciseType.EUROPEAN,
+                False,
+                2.485,
+                id="daily-european",
+            ),
+            pytest.param(
+                BarrierMonitoring.DISCRETE,
+                DAILY_OBS,
+                ExerciseType.EUROPEAN,
+                True,
+                2.325,
+                id="daily-european-div",
+            ),
+            pytest.param(
+                BarrierMonitoring.DISCRETE,
+                DAILY_OBS,
+                ExerciseType.AMERICAN,
+                False,
+                5.949,
+                id="daily-american",
+            ),
+            pytest.param(
+                BarrierMonitoring.DISCRETE,
+                DAILY_OBS,
+                ExerciseType.AMERICAN,
+                True,
+                5.201,
+                id="daily-american-div",
+            ),
+            # ── Weekly monitoring, 25 obs (Explicit-Hull) ───────────────────
+            pytest.param(
+                BarrierMonitoring.DISCRETE,
+                WEEKLY_OBS,
+                ExerciseType.EUROPEAN,
+                False,
+                3.012,
+                id="weekly-european",
+            ),
+            pytest.param(
+                BarrierMonitoring.DISCRETE,
+                WEEKLY_OBS,
+                ExerciseType.EUROPEAN,
+                True,
+                2.795,
+                id="weekly-european-div",
+            ),
+            pytest.param(
+                BarrierMonitoring.DISCRETE,
+                WEEKLY_OBS,
+                ExerciseType.AMERICAN,
+                False,
+                6.444,
+                id="weekly-american",
+            ),
+            pytest.param(
+                BarrierMonitoring.DISCRETE,
+                WEEKLY_OBS,
+                ExerciseType.AMERICAN,
+                True,
+                5.610,
+                id="weekly-american-div",
+            ),
+        ],
+    )
+    def test_double_ko_call_vs_zvan_table2(
+        self,
+        monitoring: BarrierMonitoring,
+        num_obs: int | None,
+        exercise: ExerciseType,
+        with_div: bool,
+        paper_pv: float,
+        request: pytest.FixtureRequest,
+    ):
+        """Each Table-2 cell (monitoring × exercise × dividend) matches the paper
+        within appropriate tolerance."""
+        pv = self._double_ko_call_pv(exercise, monitoring, num_obs, with_div)
+        logger.info(
+            "ZVF2000 Table2 %s | paper=%.4f dp=%.4f", request.node.callspec.id, paper_pv, pv
+        )
+        assert np.isclose(pv, paper_pv, **self._TOL), (
+            f"{request.node.callspec.id}: got {pv:.6f}, expected {paper_pv} "
+            f"(Zvan-Vetzal-Forsyth 2000, Table 2)"
+        )
+
+
+class TestDoubleBarrierKONearBarrierAgainstMilevTagliani:
+    """Discrete double-KO call PVs *near the barriers* vs Milev-Tagliani (2010) Table 4.
+
+    Milev & Tagliani (2010), "Numerical valuation of discrete double barrier
+    options", *Journal of Computational and Applied Mathematics* 233, Table 4.
+    A discretely-monitored double-KO call, ``K=100``, corridor ``[95, 125]``,
+    ``sigma=0.20, r=0.10, q=0, T=0.5``, evaluated at spots sitting *on* or a
+    whisker inside each barrier (95 / 95.0001 / 124.9999 / 125) under weekly
+    (25 obs) and daily (125 obs) monitoring.
+
+    Tolerance is **atol-led** (``atol=6e-3, rtol=0``).  Far from the barriers
+    the engine matches the paper to <1e-3, but right on a barrier the discrete
+    near-barrier discretisation leaves a residual that is roughly *absolute*
+    (~0.0015 weekly / ~0.0037 daily — under a cent) rather than proportional to
+    the small PV.
+    """
+
+    PRICING_DATE = dt.datetime(2025, 1, 1)
+    MATURITY = PRICING_DATE + dt.timedelta(days=0.5 * 365)  # ACT/365F -> T = 0.5
+    STRIKE = 100.0
+    LOWER_BARRIER = 95.0
+    UPPER_BARRIER = 125.0
+    SIGMA = 0.20
+    RATE = 0.10
+
+    _TOL: dict[str, float] = dict(rtol=0.0, atol=6.0e-3)
+
+    @classmethod
+    def _underlying(cls, spot: float) -> UnderlyingData:
+        market = MarketData(
+            cls.PRICING_DATE,
+            DiscountCurve.flat(cls.RATE),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+        return UnderlyingData(
+            initial_value=spot,
+            volatility=cls.SIGMA,
+            market_data=market,
+            dividend_curve=DiscountCurve.flat(0.0),
+        )
+
+    @classmethod
+    def _double_ko_call_pv(cls, spot: float, num_obs: int) -> float:
+        spec = DoubleBarrierSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=cls.STRIKE,
+            maturity=cls.MATURITY,
+            lower_barrier=cls.LOWER_BARRIER,
+            upper_barrier=cls.UPPER_BARRIER,
+            action=BarrierAction.OUT,
+            monitoring=BarrierMonitoring.DISCRETE,
+            num_observations=num_obs,
+        )
+        return float(
+            OptionValuation(cls._underlying(spot), spec, PricingMethod.PDE_FD).present_value()
+        )
+
+    @pytest.mark.parametrize(
+        "spot,num_obs,paper_pv",
+        [
+            pytest.param(95.0, 25, 1.04584, id="lower-on-95-weekly"),
+            pytest.param(95.0001, 25, 1.04587, id="lower-inside-95.0001-weekly"),
+            pytest.param(95.0, 125, 0.444389, id="lower-on-95-daily"),
+            pytest.param(95.0001, 125, 0.444426, id="lower-inside-95.0001-daily"),
+            pytest.param(124.9999, 25, 0.707335, id="upper-inside-124.9999-weekly"),
+            pytest.param(125.0, 25, 0.707313, id="upper-on-125-weekly"),
+            pytest.param(124.9999, 125, 0.284356, id="upper-inside-124.9999-daily"),
+            pytest.param(125.0, 125, 0.284337, id="upper-on-125-daily"),
+        ],
+    )
+    def test_double_ko_call_near_barrier_vs_milev_tagliani(
+        self, spot: float, num_obs: int, paper_pv: float, request: pytest.FixtureRequest
+    ):
+        """Each Table-4 near-barrier cell matches the paper within atol."""
+        pv = self._double_ko_call_pv(spot, num_obs)
+        logger.info(
+            "MT2010 Table4 %s | paper=%.6f dp_fd=%.6f", request.node.callspec.id, paper_pv, pv
+        )
+        assert np.isclose(pv, paper_pv, **self._TOL), (
+            f"{request.node.callspec.id}: got {pv:.6f}, expected {paper_pv} "
+            f"(Milev-Tagliani 2010, Table 4)"
+        )
