@@ -1105,7 +1105,7 @@ def test_pde_fd_barrier_european_ki_facade_vs_direct_core_greeks(
 ):
     """European KI facade (parity) and direct two-surface core should agree on PV + greeks.
 
-    The facade path for European KI goes through ``_compute_european_ki_components``
+    The facade path for European KI goes through ``_compute_ki_components``
     (V_KI = V_vanilla − V_KO + rebate PV leg). The direct path calls
     ``_fd_barrier_ki_core(early_exercise=False)`` — the same two-surface coupled
     solver used for American KI but with exercise disabled. Both solve the same

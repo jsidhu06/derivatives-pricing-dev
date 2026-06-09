@@ -152,12 +152,12 @@ class TestEngineLevelCaching:
         assert compute_solve.call_count == 1
 
     def test_fd_barrier_eu_ki_components_solved_once_across_greeks(self):
-        """European KI parity: ``_compute_european_ki_components`` fires once."""
+        """European KI parity: ``_compute_ki_components`` fires once."""
         ov = OptionValuation(_underlying(), _eu_dic_spec(), PricingMethod.PDE_FD)
         with patch.object(
             ov._impl,
-            "_compute_european_ki_components",
-            wraps=ov._impl._compute_european_ki_components,
+            "_compute_ki_components",
+            wraps=ov._impl._compute_ki_components,
         ) as compute_components:
             _call_all_native_greeks(ov)
         assert compute_components.call_count == 1
@@ -255,15 +255,15 @@ class TestThreadSafeCaching:
         assert len(set(results)) == 1
 
     def test_pde_eu_ki_concurrent_greeks_solve_components_once(self):
-        """European KI parity: concurrent greeks fire ``_compute_european_ki_components`` once."""
+        """European KI parity: concurrent greeks fire ``_compute_ki_components`` once."""
         ov = OptionValuation(_underlying(), _eu_dic_spec(), PricingMethod.PDE_FD)
-        original = ov._impl._compute_european_ki_components
+        original = ov._impl._compute_ki_components
 
         def slow(*args, **kwargs):
             time.sleep(self._COMPUTE_SLEEP)
             return original(*args, **kwargs)
 
-        with patch.object(ov._impl, "_compute_european_ki_components", side_effect=slow) as compute:
+        with patch.object(ov._impl, "_compute_ki_components", side_effect=slow) as compute:
             # Mix of greek accessors, all internally needing the KI components.
             targets = [ov.present_value, ov.delta, ov.gamma, ov.theta]
             with ThreadPoolExecutor(max_workers=len(targets) * 2) as pool:
