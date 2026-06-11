@@ -202,7 +202,8 @@ class TestPDEParams:
 
     def test_for_barriers_discrete_defaults_to_explicit_hull(self):
         p = PDEParams.for_barriers(monitoring=BarrierMonitoring.DISCRETE)
-        assert p.spot_steps == 1200
+        # spot_steps=None → auto-sized to Hull's dz = sigma*sqrt(3*dt) at solve time.
+        assert p.spot_steps is None
         assert p.time_steps == 3000
         assert p.space_grid is PDESpaceGrid.LOG_SPOT
         # Discrete monitoring → EXPLICIT_HULL + INTRINSIC.  Per-step
@@ -239,3 +240,49 @@ class TestPDEParams:
     def test_for_barriers_requires_monitoring_kwarg(self):
         with pytest.raises(TypeError):
             PDEParams.for_barriers()  # type: ignore[call-arg]
+
+    def test_for_double_barriers_continuous_matches_for_barriers(self):
+        """Continuous deliberately falls through to identical single-barrier params."""
+        p = PDEParams.for_double_barriers(monitoring=BarrierMonitoring.CONTINUOUS)
+        assert p == PDEParams.for_barriers(monitoring=BarrierMonitoring.CONTINUOUS)
+        assert p.spot_steps == 1200
+        assert p.time_steps == 800
+        assert p.method is PDEMethod.CRANK_NICOLSON
+
+    def test_for_double_barriers_discrete_defaults(self):
+        p = PDEParams.for_double_barriers(monitoring=BarrierMonitoring.DISCRETE)
+        # Same discrete scheme as for_barriers (Explicit-Hull, auto spot_steps,
+        # log grid, intrinsic exercise) but time_steps lifted 3000 -> 6000: the
+        # KO reset at *both* barriers on every observation date needs more
+        # temporal resolution to settle (theta especially).
+        assert p.method is PDEMethod.EXPLICIT_HULL
+        assert p.spot_steps is None
+        assert p.time_steps == 6000
+        assert p.space_grid is PDESpaceGrid.LOG_SPOT
+        assert p.american_solver is PDEEarlyExercise.INTRINSIC
+
+    def test_for_double_barriers_discrete_overrides_win_over_bump(self):
+        """Explicit time_steps/spot_steps overrides beat the discrete 6000/None bump."""
+        p = PDEParams.for_double_barriers(
+            monitoring=BarrierMonitoring.DISCRETE,
+            time_steps=4000,
+            spot_steps=500,
+        )
+        assert p.time_steps == 4000
+        assert p.spot_steps == 500
+        assert p.method is PDEMethod.EXPLICIT_HULL
+
+    def test_for_double_barriers_method_override_wins(self):
+        p = PDEParams.for_double_barriers(
+            monitoring=BarrierMonitoring.DISCRETE,
+            method=PDEMethod.CRANK_NICOLSON,
+        )
+        assert p.method is PDEMethod.CRANK_NICOLSON
+
+    def test_for_double_barriers_rejects_invalid_override(self):
+        with pytest.raises(ValidationError, match="spot_steps must be >= 3"):
+            PDEParams.for_double_barriers(monitoring=BarrierMonitoring.CONTINUOUS, spot_steps=2)
+
+    def test_for_double_barriers_requires_monitoring_kwarg(self):
+        with pytest.raises(TypeError):
+            PDEParams.for_double_barriers()  # type: ignore[call-arg]
