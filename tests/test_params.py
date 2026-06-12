@@ -130,6 +130,12 @@ class TestPDEParams:
         p = PDEParams()
         assert p.smax_mult == 4.0
         assert p.method is PDEMethod.CRANK_NICOLSON
+        # spot_steps defaults to None ("auto"): resolved at OptionValuation
+        # construction — dz = lambda*sigma*sqrt(dt) on log grids, fixed 200 on
+        # spot grids (the default space_grid, so bare defaults behave as before).
+        assert p.spot_steps is None
+        assert p.space_grid is PDESpaceGrid.SPOT
+        assert p.time_steps == 200
 
     def test_rejects_non_positive_smax_mult(self):
         with pytest.raises(ValidationError, match="smax_mult must be positive"):

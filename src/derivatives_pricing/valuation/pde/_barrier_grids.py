@@ -166,13 +166,27 @@ def _build_double_barrier_continuous_log_grid(
 
 
 _DEFAULT_AUTO_SPOT_STEPS = 200
-"""Resolution for ``spot_steps=None`` under an unconditionally-stable scheme.
+"""Fallback / floor for ``spot_steps=None`` resolution.
 
-CN/IMPLICIT have no physical ``dz`` scale (no CFL constraint), so ``None``
-falls back to the library default rather than deriving from ``dz_hull`` (which
-is an *explicit*-stability quantity and, being ``∝ √Δt``, would perversely give
-the coarse-time CN grid *fewer* nodes than the fine-time explicit grid).  Pass
-an explicit int to dial CN accuracy/speed; the barrier factories already do.
+Used verbatim for spot (non-log) grids, used as a *floor* for the
+``λ·σ·√Δt`` auto-sizing on log grids, so the auto grid is never coarser than
+the historical default (the floor only binds for abnormally coarse time grids,
+``time_steps ≲ 25`` at typical vol/maturity).
+"""
+
+_IMPLICIT_AUTO_LAMBDA = 0.5
+"""``λ`` in the auto log-step ``dz = λ·σ·√Δt`` for CN/IMPLICIT.
+
+The explicit family is stability-pinned at Hull's ``λ = √3`` (the ``p_m = 2/3``
+trinomial).  CN/IMPLICIT are unconditionally stable, so ``λ`` here is an
+*accuracy* choice: ``1/2`` gives a grid twice as fine as the explicit stability
+bound (λ=1) at equal ``time_steps`` and — at the barrier-factory calibration
+point (σ=0.2, T=0.5, time_steps=800, smax_mult=4) — backs out ≈1100 steps,
+reproducing the hand-tuned CN factory default of 1200.  Note the coupling
+direction: more ``time_steps`` ⇒ finer space, so auto-CN cost grows
+``O(time_steps^1.5)`` and accuracy improves monotonically (spatial error
+``∝ dz² ∝ Δt`` dominates CN's ``O(Δt²)`` temporal error — inefficient
+asymptotically, never inaccurate).  Pass an int ``spot_steps`` to decouple.
 """
 
 
@@ -187,30 +201,39 @@ def _resolve_pde_spot_steps(
 ) -> int:
     """Resolve ``PDEParams.spot_steps`` when the caller left it ``None`` ("auto").
 
-    ``None`` means "size the spatial grid for me".  Resolution only does real
-    work for the **explicit family** with a log spatial grid, where stability
-    fixes the log-step to Hull's trinomial spacing ``dz_hull = σ·√(3·Δt)``
-    (the ``p_m = 2/3`` stencil).  What that pins depends on which boundary is free:
+    ``None`` means "size the spatial grid for me".  On a **log spatial grid**
+    the auto step is ``dz = λ·σ·√Δt`` with one ``λ`` per scheme family:
+
+    * **Explicit family** — stability pins ``λ = √3``, Hull's trinomial
+      spacing ``dz_hull = σ·√(3·Δt)`` (the ``p_m = 2/3`` stencil).
+    * **CN/IMPLICIT** — unconditionally stable, so
+      ``λ =`` :data:`_IMPLICIT_AUTO_LAMBDA` ``= 1/2`` is an accuracy choice
+      (twice as fine as the explicit stability bound at equal ``time_steps``;
+      see the constant's docstring for the calibration rationale).  The count
+      is floored at :data:`_DEFAULT_AUTO_SPOT_STEPS` so auto is never coarser
+      than the historical default.
+
+    What the step pins depends on which boundary is free:
 
     * **Continuous double barrier (log grid)** — *both* ends are pinned at the
       barriers, so the width ``corridor = ln(U / L)`` is fixed and the **count**
       is solved for::
 
-          spot_steps = round(corridor / dz_hull)      # ⇒ λ ≈ √3, p_m ≈ 2/3
+          spot_steps = round(corridor / dz)      # explicit ⇒ λ ≈ √3, p_m ≈ 2/3
 
-      This removes the foot-gun where a hand-picked ``spot_steps`` drives
-      ``λ = dz / (σ√Δt) < 1`` and the explicit scheme produces negative
-      transition probabilities.
+      For the explicit family this removes the foot-gun where a hand-picked
+      ``spot_steps`` drives ``λ = dz / (σ√Δt) < 1`` and the scheme produces
+      negative transition probabilities (the explicit count is therefore *not*
+      floored — flooring it up would shrink ``dz`` below stability).
 
     * **Free far-field (vanilla / single barrier / double barrier American KI /
         discrete double)**
-      — at least one boundary floats, so cover the target log-span at ``dz_hull``::
+      — at least one boundary floats, so cover the target log-span at ``dz``::
 
-          spot_steps = ceil(span / dz_hull)
+          spot_steps = ceil(span / dz)
 
-    Unconditionally-stable schemes (CN/IMPLICIT) and spot-space explicit grids
-    fall back to :data:`_DEFAULT_AUTO_SPOT_STEPS`.  A non-``None`` ``spot_steps``
-    is always honored verbatim.
+    Spot (non-log) grids fall back to :data:`_DEFAULT_AUTO_SPOT_STEPS`.  A
+    non-``None`` ``spot_steps`` is always honored verbatim.
 
     Called once, at ``OptionValuation`` construction, so the resolved value is
     frozen across every bump-and-revalue solve.
@@ -218,41 +241,40 @@ def _resolve_pde_spot_steps(
     if params.spot_steps is not None:
         return params.spot_steps
 
-    if params.method not in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL):
+    # Spot (non-log) grids fall back to the fixed default.
+    if params.space_grid is not PDESpaceGrid.LOG_SPOT:
         return _DEFAULT_AUTO_SPOT_STEPS
 
-    dz_hull = float(volatility * math.sqrt(3.0 * time_to_maturity / params.time_steps))
-    if dz_hull <= 0.0:
+    explicit = params.method in (PDEMethod.EXPLICIT, PDEMethod.EXPLICIT_HULL)
+    lam = math.sqrt(3.0) if explicit else _IMPLICIT_AUTO_LAMBDA
+    dz_auto = float(lam * volatility * math.sqrt(time_to_maturity / params.time_steps))
+    if dz_auto <= 0.0:
         return _DEFAULT_AUTO_SPOT_STEPS
+
+    # Explicit corridor counts must not be floored upward (smaller dz breaks
+    # stability); CN/IMPLICIT are floored so auto never under-resolves 200.
+    floor = 3 if explicit else _DEFAULT_AUTO_SPOT_STEPS
 
     # Pinned: continuous double barrier on a log grid — width = corridor.
-    if (
-        isinstance(spec, DoubleBarrierSpec)
-        and spec.monitoring is BarrierMonitoring.CONTINUOUS
-        and params.space_grid is PDESpaceGrid.LOG_SPOT
-    ):
+    if isinstance(spec, DoubleBarrierSpec) and spec.monitoring is BarrierMonitoring.CONTINUOUS:
         corridor = float(np.log(spec.upper_barrier) - np.log(spec.lower_barrier))
-        return max(3, int(round(corridor / dz_hull)))
+        return max(floor, int(round(corridor / dz_auto)))
 
-    # Free far-field: cover the target log-span at Hull spacing.
-    if params.space_grid is PDESpaceGrid.LOG_SPOT:
-        ref_hi = max(spot, strike)
-        ref_lo = min(spot, strike)
-        if isinstance(spec, _BaseBarrierSpec):
-            levels = [
-                float(getattr(spec, attr))
-                for attr in ("lower_barrier", "upper_barrier", "barrier")
-                if getattr(spec, attr, None) is not None
-            ]
-            if levels:
-                ref_hi = max(ref_hi, *levels)
-                ref_lo = min(ref_lo, *levels)
-        hi_target = np.log(params.smax_mult * ref_hi)
-        lo_target = np.log(max(ref_lo / params.smax_mult, 1.0e-8))
-        return max(3, int(math.ceil((hi_target - lo_target) / dz_hull)))
-
-    # Spot (non-log) explicit grids have no clean dz_hull pin — default.
-    return _DEFAULT_AUTO_SPOT_STEPS
+    # Free far-field: cover the target log-span at the auto spacing.
+    ref_hi = max(spot, strike)
+    ref_lo = min(spot, strike)
+    if isinstance(spec, _BaseBarrierSpec):
+        levels = [
+            float(getattr(spec, attr))
+            for attr in ("lower_barrier", "upper_barrier", "barrier")
+            if getattr(spec, attr, None) is not None
+        ]
+        if levels:
+            ref_hi = max(ref_hi, *levels)
+            ref_lo = min(ref_lo, *levels)
+    hi_target = np.log(params.smax_mult * ref_hi)
+    lo_target = np.log(max(ref_lo / params.smax_mult, 1.0e-8))
+    return max(floor, int(math.ceil((hi_target - lo_target) / dz_auto)))
 
 
 def _build_double_barrier_discrete_grid(

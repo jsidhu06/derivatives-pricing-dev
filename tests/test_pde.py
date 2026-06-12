@@ -42,6 +42,7 @@ from derivatives_pricing.valuation.pde import (
     _FDDoubleBarrierValuation,
     _fd_barrier_ki_core,
     _fd_double_barrier_ki_core,
+    _resolve_pde_spot_steps,
 )
 from helpers import (
     flat_curve,
@@ -1859,3 +1860,126 @@ def test_american_barrier_vega_pde_scheme_grid_consistency(
     assert np.isclose(vega_cn_spot, vega_cn_log, rtol=vega_rtol, atol=vega_atol), (
         f"vega CN_LOG={vega_cn_log:.6f} vs CN_SPOT={vega_cn_spot:.6f}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# spot_steps=None ("auto") resolution
+# ─────────────────────────────────────────────────────────────────────────────
+class TestResolvePdeSpotSteps:
+    """Unit tests for ``_resolve_pde_spot_steps``.
+
+    Auto log-step is ``dz = lambda * sigma * sqrt(dt)`` — lambda = sqrt(3)
+    (Hull, stability-pinned) for the explicit family, lambda = 1/2 (accuracy
+    choice, floored at 200) for CN/IMPLICIT.  Spot (non-log) grids fall back
+    to the fixed default 200.  Reference numbers below use sigma=0.2, T=0.5,
+    spot=strike=100, smax_mult=4 => vanilla log-span = ln(16) ~= 2.772589.
+    """
+
+    SPOT = 100.0
+    STRIKE = 100.0
+    VOL = 0.20
+    TTM = 0.5
+
+    def _resolve(self, params, spec_obj=None):
+        if spec_obj is None:
+            spec_obj = VanillaSpec(
+                option_type=OptionType.CALL,
+                exercise_type=ExerciseType.EUROPEAN,
+                strike=self.STRIKE,
+                maturity=MATURITY,
+            )
+        return _resolve_pde_spot_steps(
+            spec=spec_obj,
+            spot=self.SPOT,
+            strike=self.STRIKE,
+            volatility=self.VOL,
+            time_to_maturity=self.TTM,
+            params=params,
+        )
+
+    def _dko_spec(self):
+        return DoubleBarrierSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=self.STRIKE,
+            maturity=MATURITY,
+            lower_barrier=95.0,
+            upper_barrier=125.0,
+            action=BarrierAction.OUT,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+
+    def test_int_spot_steps_honored_verbatim(self):
+        p = PDEParams(spot_steps=500, space_grid=PDESpaceGrid.LOG_SPOT)
+        assert self._resolve(p) == 500
+
+    def test_bare_defaults_resolve_to_200(self):
+        """Bare PDEParams() (CN + SPOT grid) keeps the historical 200 grid."""
+        assert self._resolve(PDEParams()) == 200
+
+    def test_cn_spot_grid_falls_back_to_200(self):
+        p = PDEParams(spot_steps=None, time_steps=800, space_grid=PDESpaceGrid.SPOT)
+        assert self._resolve(p) == 200
+
+    def test_cn_log_auto_uses_half_lambda(self):
+        """dz = 0.5*0.2*sqrt(0.5/800) = 0.0025 -> ceil(ln(16)/dz) = 1110."""
+        p = PDEParams(spot_steps=None, time_steps=800, space_grid=PDESpaceGrid.LOG_SPOT)
+        assert self._resolve(p) == 1110
+
+    def test_cn_log_auto_floored_at_200(self):
+        """Absurdly coarse time grid (4 steps) backs out ~79 -> floored to 200."""
+        p = PDEParams(spot_steps=None, time_steps=4, space_grid=PDESpaceGrid.LOG_SPOT)
+        assert self._resolve(p) == 200
+
+    def test_cn_log_auto_refines_with_time_steps(self):
+        """Auto-CN grids scale with sqrt(time_steps): 4x steps -> 2x finer space."""
+        p_1x = PDEParams(spot_steps=None, time_steps=800, space_grid=PDESpaceGrid.LOG_SPOT)
+        p_4x = PDEParams(spot_steps=None, time_steps=3200, space_grid=PDESpaceGrid.LOG_SPOT)
+        n_1x, n_4x = self._resolve(p_1x), self._resolve(p_4x)
+        assert np.isclose(n_4x / n_1x, 2.0, rtol=2.0e-3)
+
+    def test_explicit_hull_log_auto_unchanged(self):
+        """dz_hull = 0.2*sqrt(3*0.5/3000) ~= 0.0044721 -> ceil(ln(16)/dz) = 620."""
+        p = PDEParams(
+            spot_steps=None,
+            time_steps=3000,
+            method=PDEMethod.EXPLICIT_HULL,
+            space_grid=PDESpaceGrid.LOG_SPOT,
+        )
+        assert self._resolve(p) == 620
+
+    def test_cn_log_barrier_level_widens_span(self):
+        """An UP barrier at 150 stretches the covered span: ln(600/25) -> 1272 steps."""
+        barrier_spec = BarrierSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=self.STRIKE,
+            maturity=MATURITY,
+            barrier=150.0,
+            direction=BarrierDirection.UP,
+            action=BarrierAction.OUT,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+        p = PDEParams(spot_steps=None, time_steps=800, space_grid=PDESpaceGrid.LOG_SPOT)
+        assert self._resolve(p, spec_obj=barrier_spec) == 1272
+
+    def test_cn_continuous_double_barrier_corridor_floored(self):
+        """Corridor ln(125/95)/0.0025 ~= 110 -> floored to 200 (CN is stable; finer is safe)."""
+        p = PDEParams(spot_steps=None, time_steps=800, space_grid=PDESpaceGrid.LOG_SPOT)
+        assert self._resolve(p, spec_obj=self._dko_spec()) == 200
+
+    def test_cn_continuous_double_barrier_corridor_unfloored_when_fine(self):
+        """time_steps=80000 -> dz=2.5e-4 -> round(corridor/dz) = 1098 (> floor)."""
+        p = PDEParams(spot_steps=None, time_steps=80_000, space_grid=PDESpaceGrid.LOG_SPOT)
+        assert self._resolve(p, spec_obj=self._dko_spec()) == 1098
+
+    def test_explicit_continuous_double_barrier_corridor_not_floored(self):
+        """Explicit corridor counts stay stability-pinned (~61), NOT floored to 200:
+        flooring the count up would shrink dz below Hull spacing and break lambda >= 1."""
+        p = PDEParams(
+            spot_steps=None,
+            time_steps=3000,
+            method=PDEMethod.EXPLICIT_HULL,
+            space_grid=PDESpaceGrid.LOG_SPOT,
+        )
+        assert self._resolve(p, spec_obj=self._dko_spec()) == 61

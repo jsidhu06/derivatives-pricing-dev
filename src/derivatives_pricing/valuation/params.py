@@ -196,16 +196,19 @@ class PDEParams:
         ``S_max = smax_mult * max(spot, strike)``. Default: ``4.0``.
     spot_steps
         Number of spatial grid steps. Higher values improve resolution.
-        Default: ``200``.  Pass ``None`` to auto-size: for the **explicit
-        family** with a log spatial grid, the spatial step is sized to Hull's
-        stable trinomial ``dz_hull = σ·√(3·Δt)`` (covering the target
-        domain, or — for a continuously-monitored double barrier — pinning
+        Default: ``None`` ("auto").  On a **log spatial grid** auto sizes the
+        step to ``dz = λ·σ·√Δt`` with one ``λ`` per scheme family: the
+        **explicit family** is stability-pinned at Hull's trinomial
+        ``λ = √3`` (``dz_hull = σ·√(3·Δt)``; covering the target domain, or —
+        for a continuously-monitored double barrier — pinning
         ``round(corridor / dz_hull)`` so ``λ ≥ 1`` is guaranteed by
-        construction).  ``None`` under an unconditionally-stable scheme
-        (CN/IMPLICIT) or an explicit family on a level spatial grid resolves
-        to ``200``. The auto value is frozen once at
-        ``OptionValuation`` construction so it is identical across every
-        bump-and-revalue greek solve.
+        construction), while **CN/IMPLICIT** use the accuracy choice
+        ``λ = 1/2`` (twice as fine as the explicit stability bound at equal
+        ``time_steps``), floored at ``200``.  A **spot (non-log) grid**
+        falls back to the fixed default ``200``.  The auto value is
+        frozen once at ``OptionValuation`` construction so it is identical
+        across every bump-and-revalue greek solve.  Pass an int to take full
+        manual control.
     time_steps
         Number of time steps. Higher values generally improve stability/accuracy.
         Default: ``200``.
@@ -238,7 +241,7 @@ class PDEParams:
     """
 
     smax_mult: float = 4.0
-    spot_steps: int | None = 200
+    spot_steps: int | None = None
     time_steps: int = 200
     omega: float = 1.5
     tol: float = 1e-6
