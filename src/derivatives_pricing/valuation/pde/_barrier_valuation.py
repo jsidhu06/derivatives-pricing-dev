@@ -8,6 +8,7 @@ flavour-specific hooks.
 """
 
 from __future__ import annotations
+from abc import abstractmethod
 from typing import TYPE_CHECKING
 
 import logging
@@ -93,17 +94,17 @@ class _FDBarrierValuationBase(_FDGridGreeksMixin):
     # ------------------------------------------------------------------ #
     # Subclass hooks                                                     #
     # ------------------------------------------------------------------ #
+    @abstractmethod
     def _ko_core(self, **kwargs) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the knock-out core solver for this barrier flavour."""
-        raise NotImplementedError
 
+    @abstractmethod
     def _ki_core(self, **kwargs) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the American two-surface knock-in core solver."""
-        raise NotImplementedError
 
+    @abstractmethod
     def _barrier_solve_args(self) -> dict:
         """Return the barrier-specific kwargs merged into :meth:`_base_solve_args`."""
-        raise NotImplementedError
 
     # ------------------------------------------------------------------ #
     # Shared resolution helpers                                          #

@@ -7,6 +7,7 @@ European/American subclasses plug into ``OptionValuation``.
 """
 
 from __future__ import annotations
+from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -335,10 +336,10 @@ def _fd_core(
     return price, S, V, V_prev, last_dtau
 
 
-class _FDGridGreeksMixin:
+class _FDGridGreeksMixin(ABC):
     """Mixin providing delta/gamma/theta extracted from the PDE solution grid.
 
-    Subclasses must define ``_solve()`` returning
+    Abstract: subclasses must implement ``_solve()`` returning
     ``(price, S, V, V_prev, last_dtau)``.
     """
 
@@ -454,9 +455,9 @@ class _FDGridGreeksMixin:
             return parabolic
         return cubic
 
-    def _solve(
-        self,
-    ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]: ...
+    @abstractmethod
+    def _solve(self) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, float]:
+        """Return the memoised PDE solve result ``(price, S, V, V_prev, last_dtau)``."""
 
     def _grid_greeks_data(
         self,
