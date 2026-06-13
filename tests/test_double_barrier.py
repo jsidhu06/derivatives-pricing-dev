@@ -1,26 +1,24 @@
-"""Double-barrier PDE_FD pricing tests against Boyle-Tian (1998) reference values.
+"""Tests for double-barrier option pricing.
 
-Boyle & Tian (1998) "An explicit finite difference approach to the pricing of
-barrier options", Applied Mathematical Finance, 5:1, 17-43.
+Covers: DoubleBarrierSpec validation, in/out parity (DKI = vanilla - DKO),
+Boyle-Tian half-step grid placement for discrete monitoring, analytical
+(Kunitomo-Ikeda) directional properties, inception-triggered PV and Greek
+short-circuits (corridor already breached), and continuous / discrete double
+knock-out PVs and Greeks swept across monitoring frequency, discrete dividends,
+and near-barrier spots.  Both engines that price double barriers are exercised:
+``BSM`` (Kunitomo-Ikeda closed form) and ``PDE_FD``.
 
-``TestDoubleBarrierAgainstBoyleTian`` covers continuous-monitoring double
-knock-out CALLS with the paper's standard corridor:
-
-    K = 100, sigma = 25%, r = 10% (continuously compounded), q = 0,
-    lower barrier L = 90, upper barrier U = 140.
-
-``TestDoubleBarrierMonitoringFrequencyAgainstTian`` covers *discretely*
-monitored double knock-out calls across six monitoring frequencies — the
-double-barrier analogue of the paper's Table 8 single-barrier DOC sweep.
-
-Reference values are the paper's converged finite-difference figures (4dp).
-Our PDE_FD engine (Crank-Nicolson on a log-spot grid truncated at both
-barriers for continuous monitoring; Boyle-Tian half-step placement of both
-barriers on a full grid for discrete monitoring) is itself validated to
-~1e-6 against QuantLib's ``AnalyticDoubleBarrierEngine`` (see
-``scripts/double_barrier_example.py``), so the tolerances here absorb the
-paper's 4dp rounding plus the small difference between its modified-explicit
-scheme and ours.
+Reference values are drawn from:
+- Boyle & Tian (1998), "An explicit finite difference approach to the pricing
+  of barrier options", *Applied Mathematical Finance* 5(1), 17-43 — continuous
+  double-KO PVs/Greeks and the discrete monitoring-frequency sweeps.
+- Kunitomo & Ikeda (1992) — analytical double-barrier closed form (BSM engine).
+- Zvan, Vetzal & Forsyth (2000), "PDE methods for pricing barrier options",
+  *J. Economic Dynamics & Control* 24 — European and American double-KO
+  with discrete dividends and discrete monitoring (Table 2).
+- Milev & Tagliani (2010), "Numerical valuation of discrete double barrier
+  options", *J. Computational and Applied Mathematics* 233 — near-barrier
+  discrete European double-KO PVs (Table 4).
 """
 
 import datetime as dt
@@ -847,10 +845,9 @@ class TestDoubleBarrierAgainstBoyleTian:
 class TestDoubleBarrierMonitoringFrequencyAgainstTian:
     """Discretely-monitored double-KO call PVs across monitoring frequencies.
 
-    The double-barrier analogue of Boyle-Tian's Table 8 single-barrier DOC
-    sweep: same setup (S0 = K = 100, sigma = 20%, T = 0.5 yr, r = 10%, q = 0,
-    lower barrier H = 95) but with an added upper barrier U = 140, making the
-    contract a double knock-out call.  Tian's reference PVs sweep six
+    Compared against the double knock-out rows of Boyle-Tian's Table 8,
+    S0 = K = 100, sigma = 20%, T = 0.5 yr, r = 10%, q = 0,
+    corridor [lower H = 95, upper U = 140].  Tian's reference PVs sweep six
     monitoring frequencies under the Cheuk-Vorst (1994) convention
     (1 yr = 4 q = 12 m = 52 w = 250 trading days = 1000 trading hours), here
     scaled to the half-year maturity.
@@ -958,9 +955,8 @@ class TestDoubleBarrierMonitoringFrequencyAgainstTian:
 
 class TestDoubleBarrierGreeksAgainstBoyleTian:
     """Continuous double knock-out call Greeks vs Boyle-Tian (1998).
-
-    The double-barrier analogue of the paper's Table 6 single-barrier DOC
-    Greeks, using the same corridor and spot sweep as the Table 5 PV test
+    Compared against the double knock-out Greeks in the paper's Table 6,
+    using the same corridor and spot sweep as the Table 5 PV test.
     (``TestDoubleBarrierAgainstBoyleTian.test_double_ko_call_near_lower_barrier``):
 
         K = 100, sigma = 25%, r = 10%, q = 0, T = 1 yr,
@@ -1089,21 +1085,20 @@ class TestDoubleBarrierGreeksAgainstBoyleTian:
 class TestDoubleBarrierGreeksFrequencyAgainstTian:
     """Discretely-monitored double-KO call Greeks across monitoring frequencies.
 
-    The double-barrier analogue of Boyle-Tian's Table 9 single-barrier DOC
-    Greeks sweep — same scenario as the Table-8-style PV sweep
-    (``TestDoubleBarrierMonitoringFrequencyAgainstTian``):
+    Compared against the double knock-out Greeks in Boyle-Tian's Table 9 —
+    same scenario as the Table 8 PV sweep (``TestDoubleBarrierMonitoringFrequencyAgainstTian``):
 
         S0 = K = 100, sigma = 20%, T = 0.5 yr, r = 10%, q = 0,
         lower barrier H = 95, upper barrier U = 140,
 
     swept across continuous / daily / weekly / monthly / quarterly monitoring
     (Cheuk-Vorst 1994 frequencies scaled to the half-year maturity).  Only
-    PDE_FD prices double barriers; its grid Greeks come from the same backward
+    PDE_FD prices discrete double barriers; its grid Greeks come from the same backward
     solve.  The paper reports annualized theta, so the comparison scales by 365.
 
     No params are passed: the test relies on the engine's **default** params
     for double barriers (``PDEParams.for_double_barriers``), which lifts the
-    discrete grid to ``spot_steps=2000, time_steps=6000``.  This doubles as a
+    discrete grid to ``spot_steps=None, time_steps=6000``.  This doubles as a
     check that the default delivers paper-grade greeks without the caller
     tuning the grid — discrete-monitoring theta is the most resolution-
     sensitive figure (the knock-out resets inject a fresh discontinuity at
