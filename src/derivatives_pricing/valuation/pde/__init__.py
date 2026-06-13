@@ -30,50 +30,49 @@ Layout
 - ``_barrier_valuation``: barrier valuation classes
 """
 
+# ── Cross-module API ─────────────────────────────────────────────────────────
+# The package's actual contract: imported by ``valuation.core`` for the
+# (PricingMethod, ExerciseType) registry and the construction-time grid freeze.
+from ._core import (
+    _FDEuropeanValuation,
+    _FDAmericanValuation,
+)
+from ._barrier_valuation import (
+    _FDBarrierValuation,
+    _FDDoubleBarrierValuation,
+)
+from ._barrier_grids import (
+    _resolve_pde_spot_steps,
+)
+
+# ── Internals re-exported for white-box tests ─────────
+# NOT part of the cross-module contract — implementation details that the test
+# suite deliberately reach into.
+# New white-box access should import straight from the defining submodule instead
+# (e.g. ``from ...pde._barrier_cores import _fd_barrier_ko_core``).
 from ._kernels import (
     _build_log_grid,
     _build_spot_grid,
 )
-from ._core import (
-    _fd_core,
-    _FDGridGreeksMixin,
-    _FDValuationBase,
-    _FDEuropeanValuation,
-    _FDAmericanValuation,
-)
 from ._barrier_grids import (
     _build_double_barrier_discrete_grid,
-    _build_double_barrier_full_grid,
-    _resolve_pde_spot_steps,
 )
 from ._barrier_cores import (
-    _fd_barrier_ko_core,
     _fd_barrier_ki_core,
-    _fd_double_barrier_ko_core,
     _fd_double_barrier_ki_core,
-)
-from ._barrier_valuation import (
-    _FDBarrierValuationBase,
-    _FDBarrierValuation,
-    _FDDoubleBarrierValuation,
 )
 
 __all__ = [
-    "_build_log_grid",
-    "_build_spot_grid",
-    "_fd_core",
-    "_FDGridGreeksMixin",
-    "_FDValuationBase",
+    # cross-module API
     "_FDEuropeanValuation",
     "_FDAmericanValuation",
-    "_build_double_barrier_discrete_grid",
-    "_build_double_barrier_full_grid",
-    "_resolve_pde_spot_steps",
-    "_fd_barrier_ko_core",
-    "_fd_barrier_ki_core",
-    "_fd_double_barrier_ko_core",
-    "_fd_double_barrier_ki_core",
-    "_FDBarrierValuationBase",
     "_FDBarrierValuation",
     "_FDDoubleBarrierValuation",
+    "_resolve_pde_spot_steps",
+    # internals exposed for tests
+    "_build_log_grid",
+    "_build_spot_grid",
+    "_build_double_barrier_discrete_grid",
+    "_fd_barrier_ki_core",
+    "_fd_double_barrier_ki_core",
 ]
