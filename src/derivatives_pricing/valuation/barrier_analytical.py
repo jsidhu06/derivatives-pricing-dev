@@ -6,7 +6,6 @@ Implements closed-form barrier pricing for all 8 standard barrier types:
 Supports:
 - Continuous monitoring (default)
 - Discrete monitoring via Broadie-Glasserman-Kou continuity correction
-- Non-flat rate and dividend term structures
 - Rebates: paid at hit (knock-out) or at expiry (knock-in / knock-out)
 
 Current scope
@@ -14,6 +13,8 @@ Current scope
 - European exercise only
 - Single barrier (no double-barrier)
 - GBM dynamics (no jumps or stochastic volatility)
+- Flat-equivalent rates only: the discount and dividend curves are sampled at
+  maturity and collapsed to constant ``r = -ln(df(T)) / T`` (and likewise q).
 
 See also
 --------
