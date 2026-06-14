@@ -41,7 +41,6 @@ from scipy.stats import norm
 from ..enums import (
     BarrierAction,
     BarrierMonitoring,
-    ExerciseType,
     OptionType,
     PricingMethod,
 )
@@ -172,11 +171,6 @@ class _AnalyticalDoubleBarrierValuation:
 
         spec = self.spec
 
-        if spec.exercise_type is not ExerciseType.EUROPEAN:
-            raise UnsupportedFeatureError(
-                "Kunitomo-Ikeda analytical pricing is European only "
-                f"(got {spec.exercise_type.name}). Use PricingMethod.PDE_FD."
-            )
         if spec.monitoring is not BarrierMonitoring.CONTINUOUS:
             raise UnsupportedFeatureError(
                 "Kunitomo-Ikeda analytical pricing requires continuous monitoring "

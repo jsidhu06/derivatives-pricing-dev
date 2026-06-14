@@ -38,7 +38,11 @@ from derivatives_pricing.enums import (
     PricingMethod,
     RebateTiming,
 )
-from derivatives_pricing.exceptions import ConfigurationError, ValidationError
+from derivatives_pricing.exceptions import (
+    ConfigurationError,
+    UnsupportedFeatureError,
+    ValidationError,
+)
 from derivatives_pricing.market_environment import MarketData
 from derivatives_pricing.rates import DiscountCurve
 from derivatives_pricing.valuation import OptionValuation, UnderlyingData
@@ -2080,3 +2084,71 @@ class TestDoubleBarrierKONearBarrierAgainstMilevTagliani:
             f"{request.node.callspec.id}: got {pv:.6f}, expected {paper_pv} "
             f"(Milev-Tagliani 2010, Table 4)"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analytical (Kunitomo-Ikeda) unsupported-envelope guards
+# ─────────────────────────────────────────────────────────────────────────────
+class TestDoubleBarrierUnsupportedAnalytical:
+    """``PricingMethod.BSM`` rejects double barriers outside the K-I envelope.
+
+    K-I supports European, continuous, no-rebate, no-discrete-dividend double
+    barriers only.  American is caught by the registry (no ``(BSM, AMERICAN)``
+    entry); the rest by ``_AnalyticalDoubleBarrierValuation.__init__``.  Each
+    must raise ``UnsupportedFeatureError`` and point the user at ``PDE_FD``.
+    """
+
+    @staticmethod
+    def _underlying(*, discrete_dividends=None) -> UnderlyingData:
+        mkt = MarketData(
+            PRICING_DATE,
+            DiscountCurve.flat(0.05),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+        return UnderlyingData(
+            initial_value=SPOT,
+            volatility=VOL,
+            market_data=mkt,
+            discrete_dividends=discrete_dividends,
+        )
+
+    @staticmethod
+    def _spec(**overrides) -> DoubleBarrierSpec:
+        kwargs = dict(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=STRIKE,
+            maturity=MATURITY,
+            lower_barrier=85.0,
+            upper_barrier=125.0,
+            action=BarrierAction.OUT,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+        kwargs.update(overrides)
+        return DoubleBarrierSpec(**kwargs)
+
+    def test_american_rejected_by_registry(self):
+        """(BSM, American) has no registry entry → clear UnsupportedFeatureError."""
+        spec = self._spec(exercise_type=ExerciseType.AMERICAN)
+        with pytest.raises(UnsupportedFeatureError, match=r"AMERICAN exercise.+BSM"):
+            OptionValuation(self._underlying(), spec, PricingMethod.BSM)
+
+    def test_discrete_monitoring_rejected(self):
+        """K-I has no two-barrier continuity correction → discrete is rejected."""
+        spec = self._spec(monitoring=BarrierMonitoring.DISCRETE, num_observations=12)
+        with pytest.raises(UnsupportedFeatureError, match=r"continuous monitoring"):
+            OptionValuation(self._underlying(), spec, PricingMethod.BSM)
+
+    def test_rebate_rejected(self):
+        """K-I has no rebate term → a positive rebate is rejected."""
+        spec = self._spec(rebate=5.0, rebate_timing=RebateTiming.AT_EXPIRY)
+        with pytest.raises(UnsupportedFeatureError, match=r"does not support rebates"):
+            OptionValuation(self._underlying(), spec, PricingMethod.BSM)
+
+    def test_discrete_dividends_rejected(self):
+        """K-I assumes a continuous yield → discrete cash dividends are rejected."""
+        div_date = PRICING_DATE + (MATURITY - PRICING_DATE) / 2
+        ud = self._underlying(discrete_dividends=[(div_date, 2.0)])
+        with pytest.raises(UnsupportedFeatureError, match=r"discrete\s+dividends"):
+            OptionValuation(ud, self._spec(), PricingMethod.BSM)
