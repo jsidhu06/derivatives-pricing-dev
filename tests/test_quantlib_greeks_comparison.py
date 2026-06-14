@@ -1574,11 +1574,12 @@ def _dp_double_barrier_greeks(
     strike: float,
     lower_barrier: float,
     upper_barrier: float,
+    pricing_method: PricingMethod = PricingMethod.PDE_FD,
     r_curve: DiscountCurve | None = None,
     q_curve: DiscountCurve | None = None,
     greeks: tuple[str, ...] = _QL_BARRIER_COMPARABLE_GREEKS,
 ) -> dict[str, float]:
-    """Compute double-barrier Greeks via DP PDE_FD (the only DP double engine)."""
+    """Compute double-barrier Greeks via DP (PDE_FD, or BSM Kunitomo-Ikeda)."""
     ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
     rc = r_curve if r_curve is not None else DiscountCurve.flat(_BARRIER_RATE, end_time=ttm)
     qc = q_curve if q_curve is not None else DiscountCurve.flat(_BARRIER_DIV, end_time=ttm)
@@ -1599,7 +1600,7 @@ def _dp_double_barrier_greeks(
         action=action,
         monitoring=BarrierMonitoring.CONTINUOUS,
     )
-    ov = OptionValuation(ud, spec, PricingMethod.PDE_FD)
+    ov = OptionValuation(ud, spec, pricing_method)
     return _dp_barrier_greeks_from_valuation(ov, greeks=greeks)
 
 
@@ -1706,6 +1707,22 @@ def test_double_barrier_greeks_european_vs_quantlib(
         r_curve=r_curve,
         q_curve=q_curve,
     )
+    # Analytical (Kunitomo-Ikeda) greeks — flat curves only: K-I collapses the
+    # curve to a flat-equivalent, so its greeks would diverge from a
+    # term-structure-aware binomial under non-flat curves.
+    dp_an = (
+        _dp_double_barrier_greeks(
+            exercise_type=ExerciseType.EUROPEAN,
+            action=action,
+            option_type=option_type,
+            strike=strike,
+            lower_barrier=lower_barrier,
+            upper_barrier=upper_barrier,
+            pricing_method=PricingMethod.BSM,
+        )
+        if r_curve is None
+        else None
+    )
     ql_ref = _ql_scaled_greeks(
         _ql_double_barrier_option(
             exercise_type=ExerciseType.EUROPEAN,
@@ -1723,13 +1740,14 @@ def test_double_barrier_greeks_european_vs_quantlib(
 
     for greek in ("delta", "gamma", "theta"):
         logger.info(
-            "European double-barrier %s %s %s K=%.0f L=%.0f U=%.0f | DP_PDE=%s QL_BN=%s",
+            "European double-barrier %s %s %s K=%.0f L=%.0f U=%.0f | DP_AN=%s DP_PDE=%s QL_BN=%s",
             action.value,
             option_type.value,
             greek,
             strike,
             lower_barrier,
             upper_barrier,
+            _fmt_greek_value(dp_an[greek]) if dp_an is not None else "n/a",
             _fmt_greek_value(dp_pde[greek]),
             _fmt_greek_value(ql_ref[greek]),
         )
@@ -1745,6 +1763,23 @@ def test_double_barrier_greeks_european_vs_quantlib(
     else:
         tols = {"delta": 1e-2, "gamma": 2e-2, "theta": 2e-2}
         atol = 3e-3
+    if dp_an is not None:
+        # K-I greeks (bump-and-revalue) vs the binomial reference; delta carries
+        # a slightly wider rtol since the tiny DKO deltas amplify the residual.
+        assert_greeks_close(
+            lhs=dp_an,
+            rhs=ql_ref,
+            tols={"delta": 1e-2, "gamma": 1e-2, "theta": 1e-2},
+            log_prefix=(
+                f"DoubleBarrier EU AN {action.value} {option_type.value} "
+                f"K={strike:.0f} L={lower_barrier:.0f} U={upper_barrier:.0f}"
+            ),
+            lhs_name="DP_AN",
+            rhs_name="QL_BN",
+            skip_missing_rhs=True,
+            atol=2e-4,
+            logger=None,
+        )
     assert_greeks_close(
         lhs=dp_pde,
         rhs=ql_ref,

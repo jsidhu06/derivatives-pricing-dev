@@ -2111,6 +2111,36 @@ def _dp_double_barrier_pde_price(
     return _dp_price(ud, spec, PricingMethod.PDE_FD)
 
 
+def _dp_double_barrier_analytical_price(
+    *,
+    action: BarrierAction,
+    option_type: OptionType,
+    strike: float,
+    lower_barrier: float,
+    upper_barrier: float,
+    r_curve: DiscountCurve | None = None,
+    q_curve: DiscountCurve | None = None,
+) -> float:
+    """Our Kunitomo-Ikeda analytical double-barrier PV (``PricingMethod.BSM``).
+
+    European, continuous, no rebate / discrete dividends; flat-equivalent rates
+    derived from the discount factors at T (same envelope as QL's analytic
+    engine).
+    """
+    ud = _barrier_underlying_data(r_curve=r_curve, q_curve=q_curve)
+    spec = DoubleBarrierSpec(
+        option_type=option_type,
+        exercise_type=ExerciseType.EUROPEAN,
+        strike=strike,
+        maturity=_BARRIER_MATURITY,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        action=action,
+        monitoring=BarrierMonitoring.CONTINUOUS,
+    )
+    return _dp_price(ud, spec, PricingMethod.BSM)
+
+
 _DOUBLE_BARRIER_SCENARIOS = [
     # Flat curves → vs QL analytic.
     pytest.param(
@@ -2192,15 +2222,25 @@ _DOUBLE_BARRIER_SCENARIOS = [
 def test_double_barrier_european_vs_quantlib(
     action, option_type, strike, lower_barrier, upper_barrier, r_curve, q_curve
 ):
-    """European double-barrier (continuous): DP PDE_FD vs QuantLib.
+    """European double-barrier (continuous): DP PDE_FD and analytical vs QuantLib.
 
-    Flat curves are compared against QL's AnalyticDoubleBarrierEngine
-    (constant-rate Ikeda-Kunitomo).  Non-flat curves are compared against
-    QL's BinomialCRRDoubleBarrierEngine, which (unlike the analytic engine)
-    rolls back through the term structure and so handles time-varying rates
-    like our PDE.
+    DP analytical (Kunitomo-Ikeda) vs QL's AnalyticDoubleBarrierEngine: the same
+    closed form, and both collapse a curved term structure to the same
+    flat-equivalent df(T), so they agree to ~machine precision on every scenario.
+    DP PDE_FD vs QL analytic: flat curves match tightly; non-flat curves carry a
+    wider band since the analytic engine flattens the term structure while our
+    PDE rolls back through it.
     """
     dp_pde = _dp_double_barrier_pde_price(
+        action=action,
+        option_type=option_type,
+        strike=strike,
+        lower_barrier=lower_barrier,
+        upper_barrier=upper_barrier,
+        r_curve=r_curve,
+        q_curve=q_curve,
+    )
+    dp_an = _dp_double_barrier_analytical_price(
         action=action,
         option_type=option_type,
         strike=strike,
@@ -2220,15 +2260,21 @@ def test_double_barrier_european_vs_quantlib(
         q_curve=q_curve,
     )
     logger.info(
-        "DoubleBarrier %s %s K=%.0f L=%.0f U=%.0f %s | DP_PDE=%.6f QL_AN=%.6f",
+        "DoubleBarrier %s %s K=%.0f L=%.0f U=%.0f %s | DP_AN=%.6f DP_PDE=%.6f QL_AN=%.6f",
         action.value,
         option_type.value,
         strike,
         lower_barrier,
         upper_barrier,
         "nonflat" if r_curve is not None else "flat",
+        dp_an,
         dp_pde,
         ql_analytic,
+    )
+    # Analytic vs analytic: same Ikeda-Kunitomo formula, same flat-equivalent
+    # collapse of the curve, so machine-precision agreement on every scenario.
+    assert np.isclose(dp_an, ql_analytic, rtol=1.0e-8, atol=1.0e-9), (
+        f"DP_AN {dp_an:.6f} vs QL_AN {ql_analytic:.6f}"
     )
     if r_curve is not None:
         # The analytic engine collapses the term structure to a flat
