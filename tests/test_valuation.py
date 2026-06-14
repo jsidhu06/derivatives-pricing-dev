@@ -1189,14 +1189,14 @@ class TestAsUnderlyingData:
     def _setup(self) -> None:
         self.md = MarketData(
             dt.datetime(2025, 1, 1),
-            DiscountCurve.flat(0.05, end_time=1.0),
+            DiscountCurve.flat(0.05),
             currency="USD",
         )
         self.sim_cfg = SimulationConfig(paths=1_000, end_date=dt.datetime(2026, 1, 1), num_steps=10)
 
     def test_gbm_attributes_preserved(self) -> None:
         """Converted UnderlyingData retains all GBM attributes."""
-        div_curve = DiscountCurve.flat(0.02, end_time=1.0)
+        div_curve = DiscountCurve.flat(0.02)
         divs = [(dt.datetime(2025, 6, 1), 1.50)]
         gbm = GBMProcess(
             self.md,

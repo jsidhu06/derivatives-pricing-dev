@@ -2348,7 +2348,7 @@ class TestBinomialBarrierStencilGuard:
         # Spot 72.4 with UP barrier 73 → step-2 up-up node lands ~exactly
         # on the barrier under Boyle-Lau alignment.  American put deep ITM
         # so early-exercise locks pv = K - S = 7.6, true delta = -1, gamma 0.
-        curve = DiscountCurve.flat(0.05, end_time=2.0)
+        curve = DiscountCurve.flat(0.05)
         self.md = MarketData(
             PRICING_DATE,
             curve,

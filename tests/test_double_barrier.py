@@ -293,7 +293,7 @@ _PARITY_MATURITY = _PARITY_PRICING_DATE + dt.timedelta(days=365)
 def _parity_underlying(spot: float = SPOT, vol: float = VOL) -> UnderlyingData:
     market = MarketData(
         _PARITY_PRICING_DATE,
-        DiscountCurve.flat(0.05, end_time=2.0),
+        DiscountCurve.flat(0.05),
         currency="USD",
         day_count_convention=DayCountConvention.ACT_365F,
     )
@@ -301,7 +301,7 @@ def _parity_underlying(spot: float = SPOT, vol: float = VOL) -> UnderlyingData:
         initial_value=spot,
         volatility=vol,
         market_data=market,
-        dividend_curve=DiscountCurve.flat(0.02, end_time=2.0),
+        dividend_curve=DiscountCurve.flat(0.02),
     )
 
 
@@ -540,7 +540,7 @@ _DIRECTIONAL_MATURITY = _DIRECTIONAL_PRICING_DATE + dt.timedelta(days=365)
 def _directional_underlying(*, spot: float = SPOT, vol: float = 0.25) -> UnderlyingData:
     market = MarketData(
         _DIRECTIONAL_PRICING_DATE,
-        DiscountCurve.flat(0.05, end_time=2.0),
+        DiscountCurve.flat(0.05),
         currency="USD",
         day_count_convention=DayCountConvention.ACT_365F,
     )
@@ -548,7 +548,7 @@ def _directional_underlying(*, spot: float = SPOT, vol: float = 0.25) -> Underly
         initial_value=spot,
         volatility=vol,
         market_data=market,
-        dividend_curve=DiscountCurve.flat(0.02, end_time=2.0),
+        dividend_curve=DiscountCurve.flat(0.02),
     )
 
 
@@ -1460,7 +1460,7 @@ class TestDoubleBarrierInceptionTriggeredPV:
     @pytest.mark.parametrize(
         "rebate,rebate_timing,expected_pv_fn",
         [
-            pytest.param(5.0, RebateTiming.AT_HIT, lambda _df_r: 5.0, id="at_hit_rebate"),
+            pytest.param(5.0, RebateTiming.AT_HIT, lambda _: 5.0, id="at_hit_rebate"),
             pytest.param(
                 5.0,
                 RebateTiming.AT_EXPIRY,
