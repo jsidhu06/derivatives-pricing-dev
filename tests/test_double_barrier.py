@@ -394,11 +394,15 @@ class TestDoubleBarrierInOutParity:
             params=params,
         ).present_value()
 
-        # BSM matches to machine precision (literal arithmetic); PDE_FD
-        # carries the small ε from re-solving the vanilla on a different
-        # grid (corridor-truncated vs full).
-        rtol = 1e-10 if pricing_method is PricingMethod.BSM else 5e-3
-        assert np.isclose(pv_in + pv_out, pv_vanilla, rtol=rtol, atol=1e-4), (
+        # Both engines match to ~machine precision.  BSM: literal arithmetic
+        # (V_KI = V_van − V_KO).  PDE_FD: the engine builds V_DKI from a
+        # *full-grid* vanilla solve minus the DKO solve, and with an explicit
+        # spot_steps every spec resolves to the identical grid.
+        # (NB: this exactness needs the explicit spot_steps above — under
+        # spot_steps=None the vanilla and double-barrier specs auto-resolve to
+        # different grids and the residual would grow to grid-truncation size.)
+        rtol = 1e-12
+        assert np.isclose(pv_in + pv_out, pv_vanilla, rtol=rtol, atol=1e-9), (
             f"In/out parity violated on {pricing_method.name}: "
             f"in={pv_in:.6f} + out={pv_out:.6f} = {pv_in + pv_out:.6f} "
             f"vs vanilla={pv_vanilla:.6f}"

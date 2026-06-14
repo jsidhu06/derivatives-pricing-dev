@@ -209,6 +209,24 @@ class PDEParams:
         frozen once at ``OptionValuation`` construction so it is identical
         across every bump-and-revalue greek solve.  Pass an int to take full
         manual control.
+    parity_vanilla_spot_steps
+        Spatial node count for the **vanilla leg** of European knock-in parity
+        pricing (``V_KI = V_vanilla - V_KO``).  That leg lives on the *full*
+        free-far-field domain rather than the barrier-truncated KO grid, so it
+        warrants its own resolution.  Default: ``None`` (auto / library-managed)
+        — most users leave it there:
+
+        - With ``spot_steps=None`` and a knock-in spec, ``OptionValuation``
+          resolves a separate vanilla-appropriate free-far-field count here
+          (frozen once, like ``spot_steps``) so the vanilla leg is not starved
+          by the corridor-pinned KO count.
+        - With an explicit ``spot_steps`` and ``None`` here, the vanilla leg
+          reuses ``spot_steps``.
+
+        Set an explicit int to override the vanilla-leg resolution directly
+        (finer manual control); your value is then honored verbatim and frozen.
+        Ignored for non-knock-in specs (knock-outs are a single solve with no
+        vanilla leg).
     time_steps
         Number of time steps. Higher values generally improve stability/accuracy.
         Default: ``200``.
@@ -242,6 +260,7 @@ class PDEParams:
 
     smax_mult: float = 4.0
     spot_steps: int | None = None
+    parity_vanilla_spot_steps: int | None = None
     time_steps: int = 200
     omega: float = 1.5
     tol: float = 1e-6
@@ -364,6 +383,18 @@ class PDEParams:
                 )
             if self.spot_steps < 3:
                 raise ValidationError(f"spot_steps must be >= 3, got {self.spot_steps}")
+        # parity_vanilla_spot_steps is auto-managed (set by OptionValuation's
+        # grid freeze for auto-grid knock-ins); validate like spot_steps if set.
+        if self.parity_vanilla_spot_steps is not None:
+            if type(self.parity_vanilla_spot_steps) is not int:
+                raise ValidationError(
+                    "parity_vanilla_spot_steps must be an int or None, got "
+                    f"{type(self.parity_vanilla_spot_steps).__name__}"
+                )
+            if self.parity_vanilla_spot_steps < 3:
+                raise ValidationError(
+                    f"parity_vanilla_spot_steps must be >= 3, got {self.parity_vanilla_spot_steps}"
+                )
         if self.smax_mult <= 0:
             raise ValidationError(f"smax_mult must be positive, got {self.smax_mult}")
         if self.time_steps < 1:

@@ -1106,15 +1106,43 @@ class OptionValuation:
         underlying = self._underlying
         spot = float(underlying.initial_value)
         strike = float(getattr(self._spec, "strike", spot))
+        volatility = float(underlying.volatility)
+        ttm = self._maturity_year_fraction()
         n = _resolve_pde_spot_steps(
             spec=self._spec,
             spot=spot,
             strike=strike,
-            volatility=float(underlying.volatility),
-            time_to_maturity=self._maturity_year_fraction(),
+            volatility=volatility,
+            time_to_maturity=ttm,
             params=params,
         )
-        return dc_replace(params, spot_steps=n)
+        # Knock-ins are priced by in-out parity; the vanilla leg lives on the
+        # full free-far-field domain, not the (corridor-pinned) barrier grid, so
+        # resolve a separate vanilla node count for it — frozen here once, like
+        # ``spot_steps``, to keep bump-and-revalue greeks jitter-free.  Resolved
+        # against a vanilla view of the spec (no barrier levels), so it picks up
+        # the free-far-field branch rather than the corridor pin.  A caller who
+        # set ``parity_vanilla_spot_steps`` explicitly is honored verbatim.
+        parity_n = params.parity_vanilla_spot_steps
+        if (
+            parity_n is None
+            and isinstance(self._spec, _BaseBarrierSpec)
+            and self._spec.action is BarrierAction.IN
+        ):
+            parity_n = _resolve_pde_spot_steps(
+                spec=VanillaSpec(
+                    option_type=self._spec.option_type,
+                    exercise_type=self._spec.exercise_type,
+                    strike=self._spec.strike,
+                    maturity=self._spec.maturity,
+                ),
+                spot=spot,
+                strike=strike,
+                volatility=volatility,
+                time_to_maturity=ttm,
+                params=params,
+            )
+        return dc_replace(params, spot_steps=n, parity_vanilla_spot_steps=parity_n)
 
     def _asian_fixing_dates(self) -> tuple[dt.datetime, ...]:
         """Resolve the contractual Asian fixing schedule as datetimes."""

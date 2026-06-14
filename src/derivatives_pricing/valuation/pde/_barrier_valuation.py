@@ -277,6 +277,12 @@ class _FDBarrierValuationBase(_FDGridGreeksMixin):
     ]:
         solve_args = self._base_solve_args()
         ko_result = self._ko_core(**solve_args)
+        # The vanilla parity leg lives on the full free-far-field domain, so it
+        # gets its own frozen node count when the grid is auto (see
+        # ``OptionValuation._freeze_pde_grid``); fall back to the barrier grid's
+        # ``spot_steps`` when no separate count was frozen (explicit spot_steps,
+        # or schemes/grids where auto resolved both the same way).
+        vanilla_spot_steps = self.pde_params.parity_vanilla_spot_steps or solve_args["spot_steps"]
         van_result = _fd_core(
             spot=solve_args["spot"],
             strike=solve_args["strike"],
@@ -287,7 +293,7 @@ class _FDBarrierValuationBase(_FDGridGreeksMixin):
             dividend_schedule=solve_args["dividend_schedule"],
             option_type=self._spec.option_type,
             smax_mult=solve_args["smax_mult"],
-            spot_steps=solve_args["spot_steps"],
+            spot_steps=int(vanilla_spot_steps),
             time_steps=solve_args["time_steps"],
             early_exercise=False,
             method=solve_args["method"],

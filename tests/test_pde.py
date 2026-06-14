@@ -18,6 +18,7 @@ from derivatives_pricing.enums import (
     BarrierAction,
     BarrierDirection,
     BarrierMonitoring,
+    DayCountConvention,
     ExerciseType,
     GreekCalculationMethod,
     OptionType,
@@ -1983,3 +1984,124 @@ class TestResolvePdeSpotSteps:
             space_grid=PDESpaceGrid.LOG_SPOT,
         )
         assert self._resolve(p, spec_obj=self._dko_spec()) == 61
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-grid knock-in: separate (frozen) vanilla-leg node count
+# ─────────────────────────────────────────────────────────────────────────────
+class TestKnockInParityVanillaSpotSteps:
+    """Auto-grid European KI prices the vanilla parity leg on its own grid.
+
+    European KI is priced by in-out parity (V_KI = V_vanilla - V_KO).  The
+    vanilla leg lives on the full free-far-field domain, not the corridor-
+    truncated KO grid, so under ``spot_steps=None`` ``OptionValuation`` freezes a
+    separate ``parity_vanilla_spot_steps`` for it (see ``_freeze_pde_grid``).
+    Without it, a continuous double-KI's vanilla leg inherits the corridor-
+    pinned / 200-floored count and is badly under-resolved.
+    """
+
+    PD = dt.datetime(2025, 1, 1)
+    MAT = PD + dt.timedelta(days=365)
+    SPOT = STRIKE = 100.0
+    VOL = 0.20
+    LOWER, UPPER = 85.0, 125.0
+
+    def _ud(self):
+        mkt = MarketData(
+            self.PD,
+            DiscountCurve.flat(0.05),
+            currency="USD",
+            day_count_convention=DayCountConvention.ACT_365F,
+        )
+        return UnderlyingData(
+            initial_value=self.SPOT,
+            volatility=self.VOL,
+            market_data=mkt,
+            dividend_curve=DiscountCurve.flat(0.02),
+        )
+
+    def _dspec(self, action):
+        return DoubleBarrierSpec(
+            option_type=OptionType.CALL,
+            exercise_type=ExerciseType.EUROPEAN,
+            strike=self.STRIKE,
+            maturity=self.MAT,
+            lower_barrier=self.LOWER,
+            upper_barrier=self.UPPER,
+            action=action,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+        )
+
+    @staticmethod
+    def _auto():
+        return PDEParams(spot_steps=None, time_steps=400, space_grid=PDESpaceGrid.LOG_SPOT)
+
+    def test_freeze_resolves_separate_vanilla_count_for_ki(self):
+        """KI freezes a larger free-far-field vanilla count than the corridor pin."""
+        ov = OptionValuation(
+            self._ud(), self._dspec(BarrierAction.IN), PricingMethod.PDE_FD, params=self._auto()
+        )
+        assert ov._params.spot_steps == 200  # corridor count floored
+        assert ov._params.parity_vanilla_spot_steps == 555  # free-far-field over ln(16)
+
+    def test_freeze_no_vanilla_count_for_ko(self):
+        """KO is a single solve — no parity vanilla leg, so the field stays None."""
+        ov = OptionValuation(
+            self._ud(), self._dspec(BarrierAction.OUT), PricingMethod.PDE_FD, params=self._auto()
+        )
+        assert ov._params.parity_vanilla_spot_steps is None
+
+    def test_explicit_spot_steps_leaves_vanilla_count_none(self):
+        """Explicit spot_steps is honored verbatim on every leg (field stays None)."""
+        expl = PDEParams(spot_steps=400, time_steps=400, space_grid=PDESpaceGrid.LOG_SPOT)
+        ov = OptionValuation(
+            self._ud(), self._dspec(BarrierAction.IN), PricingMethod.PDE_FD, params=expl
+        )
+        assert ov._params.spot_steps == 400
+        assert ov._params.parity_vanilla_spot_steps is None
+
+    def test_user_set_vanilla_count_honored_with_auto_spot_steps(self):
+        """An explicit parity_vanilla_spot_steps survives the auto-grid freeze."""
+        params = PDEParams(
+            spot_steps=None,
+            parity_vanilla_spot_steps=640,
+            time_steps=400,
+            space_grid=PDESpaceGrid.LOG_SPOT,
+        )
+        ov = OptionValuation(
+            self._ud(), self._dspec(BarrierAction.IN), PricingMethod.PDE_FD, params=params
+        )
+        assert ov._params.spot_steps == 200  # corridor still auto-resolved
+        assert ov._params.parity_vanilla_spot_steps == 640  # user value not clobbered
+
+    def test_user_set_vanilla_count_honored_with_explicit_spot_steps(self):
+        """parity_vanilla_spot_steps overrides the vanilla leg independently of spot_steps."""
+        params = PDEParams(
+            spot_steps=300,
+            parity_vanilla_spot_steps=900,
+            time_steps=400,
+            space_grid=PDESpaceGrid.LOG_SPOT,
+        )
+        ov = OptionValuation(
+            self._ud(), self._dspec(BarrierAction.IN), PricingMethod.PDE_FD, params=params
+        )
+        assert ov._params.spot_steps == 300
+        assert ov._params.parity_vanilla_spot_steps == 900
+
+    def test_auto_ki_accurate_against_bsm(self):
+        """Auto-grid double-KI tracks the Kunitomo-Ikeda closed form to <2e-4 rel.
+
+        Pre-fix the vanilla leg ran at the 200-floored corridor count and the
+        relative error was ~5.8e-3; resolving it at the free-far-field count
+        brings it to ~9e-5.
+        """
+        ud = self._ud()
+        truth = OptionValuation(
+            ud, self._dspec(BarrierAction.IN), PricingMethod.BSM
+        ).present_value()
+        pv = OptionValuation(
+            ud, self._dspec(BarrierAction.IN), PricingMethod.PDE_FD, params=self._auto()
+        ).present_value()
+        assert np.isclose(pv, truth, rtol=2e-4, atol=0.0), (
+            f"auto double-KI {pv:.6f} vs BSM {truth:.6f} (rel {abs(pv - truth) / truth:.2e})"
+        )
