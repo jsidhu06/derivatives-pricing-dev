@@ -730,13 +730,17 @@ class TestDoubleBarrierAgainstBoyleTian:
     LOWER_BARRIER = 90.0
     UPPER_BARRIER = 140.0
 
-    # Per-engine tolerances against Boyle-Tian's *FD* reference.
-    # Both engines come in within ±3e-4 of paper across the sweep, so a 1e-3
-    # atol comfortably absorbs paper rounding plus the BT98-FD-vs-our-engine
-    # gap on either side.
+    # Per-engine tolerances against Boyle-Tian's *FD* reference (quoted 4dp).
+    # Two-part error budget, so a combined atol + rtol band is appropriate:
+    #   * atol 2e-4 — absorbs the paper's 4dp rounding (±5e-5, absolute, dominant
+    #     at small PVs) plus the small-PV scheme gap, with headroom;
+    #   * rtol 2e-3 — covers the proportional BT98-FD-vs-our-engine gap (≤3.4e-4
+    #     relative across both sweeps), ~6x headroom.
+    # Both engines land well inside (BSM is Kunitomo-Ikeda analytical; PDE_FD
+    # adds a tiny FD-vs-FD gap).
     _TOLS: dict[PricingMethod, dict[str, float]] = {
-        PricingMethod.BSM: dict(rtol=0.0, atol=1.0e-3),
-        PricingMethod.PDE_FD: dict(rtol=0.0, atol=1.0e-3),
+        PricingMethod.BSM: dict(rtol=2.0e-3, atol=2.0e-4),
+        PricingMethod.PDE_FD: dict(rtol=2.0e-3, atol=2.0e-4),
     }
 
     @classmethod
