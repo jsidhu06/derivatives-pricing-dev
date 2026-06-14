@@ -541,11 +541,13 @@ class OptionValuation:
         Parameters
         ----------
         epsilon
-            Spot bump size used by central-difference numerical delta.
-            Ignored for analytical, tree, pathwise, and likelihood-ratio methods.
-            If ``None``, defaults to ``spot / 100``. For barrier options the
-            bump is automatically shrunk if it would otherwise cross the
-            barrier.
+            Spot bump for central-difference NUMERICAL delta; defaults to
+            ``spot / 100`` when ``None``. For barrier options the bump is
+            automatically shrunk if it would otherwise cross the barrier.
+            Passing ``epsilon`` when the resolved method is not NUMERICAL
+            raises ``ValidationError`` (the analytical/tree/grid/pathwise/LR
+            paths take no bump) — remove it, or pass
+            ``greek_calc_method=NUMERICAL`` to opt into bump-and-revalue.
         greek_calc_method
             Greek computation method. When ``None``, the method is selected
             automatically from pricing-engine capabilities.
@@ -599,8 +601,11 @@ class OptionValuation:
         Parameters
         ----------
         epsilon
-            Spot bump size used for finite-difference estimation when required.
-            If ``None``, defaults to ``spot / 100``.
+            Spot bump for NUMERICAL gamma — and for the central-difference of
+            pathwise delta when ``greek_calc_method=PATHWISE``; defaults to
+            ``spot / 100`` when ``None``. For barriers it is shrunk to avoid
+            crossing the barrier. Passing it with any other resolved method
+            (analytical/tree/grid/LR) raises ``ValidationError``.
         greek_calc_method
             Greek computation method. Supports analytical/tree methods where
             available, pathwise finite-difference for Monte Carlo, or numerical.
@@ -667,8 +672,9 @@ class OptionValuation:
         Parameters
         ----------
         epsilon
-            Volatility bump used by central-difference numerical vega.
-            If ``None``, defaults to ``0.01`` (a 1 vol-point bump).
+            Volatility bump for central-difference NUMERICAL vega; defaults to
+            ``0.01`` (a 1 vol-point bump) when ``None``. Passing it when the
+            resolved method is not NUMERICAL raises ``ValidationError``.
         greek_calc_method
             Greek computation method. Supports analytical, pathwise, and
             likelihood-ratio methods where available; otherwise numerical.
@@ -724,8 +730,9 @@ class OptionValuation:
             Greek computation method. Tree/analytical theta is used when available;
             otherwise bump-and-revalue is used.
         time_bump_days
-            Calendar day bump applied to the pricing date for numerical theta.
-            If ``None``, defaults to ``1.0``.
+            Calendar-day bump applied to the pricing date for NUMERICAL theta;
+            defaults to ``1.0`` (``7.0`` for barrier specs). Passing it when the
+            resolved method is not NUMERICAL raises ``ValidationError``.
 
         Returns
         -------
@@ -826,7 +833,9 @@ class OptionValuation:
             otherwise finite-difference bump-and-revalue is used.
         rate_bump
             Absolute parallel bump in the continuously-compounded risk-free
-            zero-rate curve for numerical rho. If ``None``, defaults to ``0.01``.
+            zero-rate curve for NUMERICAL rho; defaults to ``0.01`` when
+            ``None``. Passing it when the resolved method is not NUMERICAL
+            raises ``ValidationError``.
 
         Returns
         -------
@@ -1055,7 +1064,7 @@ class OptionValuation:
                 # first — discrete double barriers want a finer default grid.
                 if isinstance(spec, DoubleBarrierSpec):
                     return PDEParams.for_double_barriers(monitoring=spec.monitoring)
-                if isinstance(spec, _BaseBarrierSpec):
+                if isinstance(spec, BarrierSpec):
                     return PDEParams.for_barriers(monitoring=spec.monitoring)
                 return PDEParams()
             return None
