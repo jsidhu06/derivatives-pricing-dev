@@ -318,7 +318,7 @@ class PDEParams:
             american_solver = PDEEarlyExercise.INTRINSIC
         else:
             method = PDEMethod.CRANK_NICOLSON
-            spot_steps, time_steps = 1200, 800
+            spot_steps, time_steps = None, 800
             american_solver = PDEEarlyExercise.GAUSS_SEIDEL
 
         defaults = cls(
@@ -346,7 +346,13 @@ class PDEParams:
         ("auto"):
 
         - **Continuous** → ``CRANK_NICOLSON``, ``time_steps=800``, ``spot_steps=None``.
-        The auto ``λ=½·σ·√Δt`` step keeps ``dz`` balanced to ``Δt``.
+        The auto ``λ=½·σ·√Δt`` step keeps ``dz`` balanced to ``Δt``.  ``spot_steps``
+        is left auto rather than pinned because a hand-pinned fine grid can imbalance
+        space-vs-time and makes near-barrier American gamma oscillate (even
+        wrong-sign).  The trade-off is mid-corridor PV precision — the balanced
+        grid is spatially coarser, so an American double-KO PV can sit ~0.2-0.3%
+        off a fully-converged solve.  For tighter PV raise ``time_steps`` (auto
+        grows ``spot_steps`` in lockstep, keeping gamma stable).
         - **Discrete** → ``EXPLICIT_HULL`` with ``INTRINSIC`` early exercise and
           ``time_steps=6000``.  A discretely-monitored double barrier injects a
           knock-out reset at *both* barriers on every observation date, so the

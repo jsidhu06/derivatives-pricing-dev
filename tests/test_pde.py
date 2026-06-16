@@ -1350,17 +1350,19 @@ def test_pde_fd_double_barrier_equivalence_american(option_type):
     FD schemes instead: the CN production default, an IMPLICIT solve, and
     EXPLICIT_HULL should agree on PV **and** greeks.
 
-    CN and IMPLICIT share the same fine 1200-node corridor grid (only the time
-    scheme differs) so they agree tightly.  EXPLICIT_HULL is stability-capped on
-    the corridor-truncated continuous grid (``dz = corridor/spot_steps`` needs
-    ``λ = dz/(σ√Δt) ≥ 1``), throttling its spatial resolution to
-    ``≈ corridor·√(time_steps)/(σ√T)`` (~105 nodes even at 6000 time steps), so
-    it tracks the CN reference a little less tightly (especially gamma) — but
-    still closely.
+    CN and IMPLICIT share the same auto (~200-node, floored) corridor grid —
+    only the time scheme differs — so they agree tightly.  EXPLICIT_HULL is
+    stability-capped on the corridor-truncated continuous grid
+    (``dz = corridor/spot_steps`` needs ``λ = dz/(σ√Δt) ≥ 1``), throttling its
+    spatial resolution to ``≈ corridor·√(time_steps)/(σ√T)`` (~105 nodes even at
+    6000 time steps).  Both grids are deliberately coarse-but-balanced (the
+    continuous double-barrier default uses auto spot_steps to avoid the
+    near-barrier gamma oscillation a hand-pinned fine grid produces).
+    For tighter PV a caller raises ``time_steps`` — auto then grows spot_steps in
+    lockstep., keeping gamma stable — rather than pinning a fine ``spot_steps``.)
     """
     spot, strike, sigma, rate, div = 100.0, 100.0, 0.25, 0.05, 0.02
     lower, upper = 85.0, 120.0
-    ttm = calculate_year_fraction(PRICING_DATE, MATURITY)
 
     md = MarketData(PRICING_DATE, DiscountCurve.flat(rate), currency="USD")
     ud = UnderlyingData(
@@ -1401,14 +1403,12 @@ def test_pde_fd_double_barrier_equivalence_american(option_type):
         )
     )
     # EXPLICIT_HULL: keep spot_steps one under the corridor stability cap.
-    ex_time_steps = 6000
-    corridor = np.log(upper / lower)
-    ex_spot_steps = int(corridor / (sigma * np.sqrt(ttm / ex_time_steps))) - 1
     explicit = greeks(
         PDEParams.for_double_barriers(
-            monitoring=BarrierMonitoring.DISCRETE,  # → EXPLICIT_HULL + INTRINSIC
-            spot_steps=ex_spot_steps,
-            time_steps=ex_time_steps,
+            monitoring=BarrierMonitoring.CONTINUOUS,
+            method=PDEMethod.EXPLICIT_HULL,
+            time_steps=3000,
+            american_solver=PDEEarlyExercise.INTRINSIC,
         )
     )
 
@@ -1423,15 +1423,17 @@ def test_pde_fd_double_barrier_equivalence_american(option_type):
             g["theta"],
         )
 
-    # IMPLICIT shares CN's fine spatial grid (only the time scheme differs), so
-    # they agree to ~1e-3 on PV and ~1e-5 on greeks — a tight band.
+    # IMPLICIT shares CN's auto ~200-node spatial grid (only the time scheme
+    # differs), so they agree to ~1e-3 on PV and ~1e-5 on greeks — a tight band.
     assert np.isclose(implicit["pv"], cn["pv"], rtol=2e-3, atol=5e-4)
     assert np.isclose(implicit["delta"], cn["delta"], rtol=5e-3, atol=5e-4)
     assert np.isclose(implicit["gamma"], cn["gamma"], rtol=2e-2, atol=5e-4)
     assert np.isclose(implicit["theta"], cn["theta"], rtol=2e-2, atol=5e-4)
-    # EXPLICIT_HULL is spatially throttled by stability (~105 corridor nodes vs
-    # CN's 1200), so it tracks a touch less tightly (~0.07% PV) but still close.
-    assert np.isclose(explicit["pv"], cn["pv"], rtol=2e-3, atol=1e-3)
+    # EXPLICIT_HULL is spatially throttled by stability (~105 corridor nodes) and
+    # CN's auto grid is coarse-but-balanced (~200); the two bracket the converged
+    # truth from opposite sides, so PV differs ~0.35% (wider band) while the
+    # greeks still track closely.
+    assert np.isclose(explicit["pv"], cn["pv"], rtol=5e-3, atol=1e-3)
     assert np.isclose(explicit["delta"], cn["delta"], rtol=1e-2, atol=1e-3)
     assert np.isclose(explicit["gamma"], cn["gamma"], rtol=5e-2, atol=1e-3)
     assert np.isclose(explicit["theta"], cn["theta"], rtol=3e-2, atol=1e-3)
