@@ -1242,11 +1242,24 @@ class OptionValuation:
             currency=spec.currency,
             contract_size=spec.contract_size,
         )
+        # A triggered KI is a plain vanilla, so price it on a vanilla-appropriate
+        # grid rather than inherit the barrier's (corridor-pinned) spot_steps.
+        # For an auto-grid knock-in the freeze already resolved that count into
+        # ``parity_vanilla_spot_steps`` (same value used by the in-out parity
+        # leg); swap it in.  Explicit spot_steps (parity_vanilla_spot_steps is
+        # None) is honored verbatim.
+        params = self._params
+        if isinstance(params, PDEParams) and params.parity_vanilla_spot_steps is not None:
+            params = dc_replace(
+                params,
+                spot_steps=params.parity_vanilla_spot_steps,
+                parity_vanilla_spot_steps=None,
+            )
         return OptionValuation(
             underlying=self._underlying,
             spec=vanilla_spec,
             pricing_method=self._pricing_method,
-            params=self._params,
+            params=params,
         )
 
     def _resolve_barrier_inception_triggered_greek(

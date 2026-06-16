@@ -340,33 +340,43 @@ class PDEParams:
     ) -> PDEParams:
         """Create PDE params tuned for *double*-barrier pricing.
 
-        Same scheme selection as :meth:`for_barriers` (CRANK_NICOLSON for
-        continuous, EXPLICIT_HULL for discrete), but with a finer default
-        ``time_steps`` for **discrete** monitoring.  A discretely-monitored
-        double barrier injects a knock-out reset at *both* barriers on every
-        observation date, so the value surface carries fresh discontinuities at
-        each end of the corridor; empirically theta in particular needed more temporal
-        resolution than the single-barrier discrete default to settle.
-        ``time_steps`` is therefore lifted (3000 -> 6000).  ``spot_steps``
-        inherits the discrete default ``None`` ("auto"): being explicit, the
-        log spatial grid is sized to Hull's stability-pinned ``dz = σ·√(3·Δt)``.
-        ``EXPLICIT_HULL`` makes the higher ``time_steps`` cheap
-        (single vectorised matrix-vector multiply per step, no PSOR iteration).
 
-        For **continuous** monitoring the corridor-truncated Crank-Nicolson grid
-        already resolves PVs and greeks to ~1e-4 vs Boyle-Tian (1998) using the
-        ``for_barriers`` defaults (all ``spot_steps`` sit inside the corridor),
-        so this method deliberately falls through to identical params there.
+        Scheme selection mirrors single barriers (CRANK_NICOLSON for continuous,
+        EXPLICIT_HULL for discrete) but both monitoring modes use ``spot_steps=None``
+        ("auto"):
+
+        - **Continuous** → ``CRANK_NICOLSON``, ``time_steps=800``, ``spot_steps=None``.
+        The auto ``λ=½·σ·√Δt`` step keeps ``dz`` balanced to ``Δt``.
+        - **Discrete** → ``EXPLICIT_HULL`` with ``INTRINSIC`` early exercise and
+          ``time_steps=6000``.  A discretely-monitored double barrier injects a
+          knock-out reset at *both* barriers on every observation date, so the
+          surface carries fresh discontinuities at each end of the corridor;
+          empirically theta needed more temporal resolution than the
+          single-barrier discrete default to settle, hence the higher
+          ``time_steps``.  ``EXPLICIT_HULL`` makes that cheap (one vectorised
+          matrix-vector multiply per step, no PSOR), and its auto ``spot_steps``
+          tracks Hull's stability-pinned ``dz = σ·√(3·Δt)``.
 
         Any keyword accepted by the constructor overrides the chosen defaults.
         """
-        richer = (
-            dict(spot_steps=None, time_steps=6000)
-            if monitoring is BarrierMonitoring.DISCRETE
-            else {}
+        if monitoring is BarrierMonitoring.DISCRETE:
+            method = PDEMethod.EXPLICIT_HULL
+            spot_steps, time_steps = None, 6000
+            american_solver = PDEEarlyExercise.INTRINSIC
+        else:
+            method = PDEMethod.CRANK_NICOLSON
+            spot_steps, time_steps = None, 800
+            american_solver = PDEEarlyExercise.GAUSS_SEIDEL
+
+        defaults = cls(
+            spot_steps=spot_steps,
+            time_steps=time_steps,
+            space_grid=PDESpaceGrid.LOG_SPOT,
+            method=method,
+            american_solver=american_solver,
         )
-        merged = {**richer, **overrides}  # explicit overrides win over the bump
-        return cls.for_barriers(monitoring=monitoring, **merged)
+
+        return dc_replace(defaults, **overrides) if overrides else defaults
 
     def __post_init__(self) -> None:
         for name in ("time_steps", "max_iter", "rannacher_steps"):

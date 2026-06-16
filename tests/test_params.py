@@ -247,13 +247,18 @@ class TestPDEParams:
         with pytest.raises(TypeError):
             PDEParams.for_barriers()  # type: ignore[call-arg]
 
-    def test_for_double_barriers_continuous_matches_for_barriers(self):
-        """Continuous deliberately falls through to identical single-barrier params."""
+    def test_for_double_barriers_continuous_defaults(self):
+        """Continuous double barriers are decoupled from for_barriers: CN with
+        auto spot_steps (not the single-barrier pinned 1200, which imbalances
+        time-vs-space and corrupts near-barrier American gamma)."""
         p = PDEParams.for_double_barriers(monitoring=BarrierMonitoring.CONTINUOUS)
-        assert p == PDEParams.for_barriers(monitoring=BarrierMonitoring.CONTINUOUS)
-        assert p.spot_steps == 1200
-        assert p.time_steps == 800
         assert p.method is PDEMethod.CRANK_NICOLSON
+        assert p.spot_steps is None
+        assert p.time_steps == 800
+        assert p.space_grid is PDESpaceGrid.LOG_SPOT
+        assert p.american_solver is PDEEarlyExercise.GAUSS_SEIDEL
+        # decoupled: continuous double no longer equals the single-barrier params
+        assert p != PDEParams.for_barriers(monitoring=BarrierMonitoring.CONTINUOUS)
 
     def test_for_double_barriers_discrete_defaults(self):
         p = PDEParams.for_double_barriers(monitoring=BarrierMonitoring.DISCRETE)
